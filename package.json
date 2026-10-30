@@ -1,0 +1,48 @@
+{
+  "name": "dsh-auto-research",
+  "version": "0.1.0",
+  "description": "Evidence-scored, fork-and-flush and RSI-top research batches as a DeepSeek Harness SubagentProvider, isolated with LayerFS",
+  "icon": "./icon.svg",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./package.json": "./package.json",
+    "./src/*": "./src/*",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "src",
+    "icon.svg",
+    "cordis.patch.yml",
+    "locale",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "subagent",
+    "research",
+    "rsi-top",
+    "fork-and-flush",
+    "layerfs",
+    "auto-research"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.2.1-alpha.4 <0.3.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

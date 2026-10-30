@@ -1,0 +1,24 @@
+# dsh-auto-research. The first row contributes the `auto-research`
+# SubagentProvider and the coordinator prompt section; the second exposes one
+# activation as the `subagent_auto_research` tool. Provider-managed depth keeps
+# the tool visible while each provider enforces its own recursion budget.
+- insert:
+    - id: subagent-auto-research
+      name: 'dsh-auto-research'
+      config:
+        providerName: auto-research
+        rounds: 1
+        branches: 4
+        explorationMinutes: 30
+        exploitationMinutes: 30
+        rsiTop: true
+        forkAndFlush: false
+        shareContext: false
+        sharingIntervalMinutes: 10
+
+    - id: tool-subagent-auto-research
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: auto-research
+        toolName: subagent_auto_research
+        maxDepth: provider-managed
