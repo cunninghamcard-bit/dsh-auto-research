@@ -243,27 +243,6 @@ export class AutoResearchProvider {
 
     const originalManifest = await inventory(workspaceRoot)
     const selectionFile = join(runtimeRoot, 'LATEST.json')
-    let sourceWorkspace = workspaceRoot
-    if (await pathExists(selectionFile)) {
-      let latest = null
-      try {
-        latest = await readJson(selectionFile)
-      } catch {
-        throw new Error(`Previous run selection is not valid JSON: ${selectionFile}`)
-      }
-      if (latest?.original_manifest && !jsonEqual(latest.original_manifest, originalManifest)) {
-        throw new Error('Original workspace changed since the last method run. Select/reconcile the intended starting workspace before continuing; all branches preserved.')
-      }
-      if (typeof latest?.leader_workspace === 'string') {
-        const candidate = latest.leader_workspace
-        if (isAbsolute(candidate)
-          && isContained(join(runtimeRoot, 'runs'), candidate)
-          && await pathExists(candidate)) {
-          const candidateStat = await fsp.stat(candidate).catch(() => null)
-          if (candidateStat?.isDirectory()) sourceWorkspace = candidate
-        }
-      }
-    }
 
     const layerfsConfig = this.config.layerfs
     const layerfsSettings = layerfsConfig?.client ? null : resolveLayerfsConfig(process.env, layerfsConfig)
@@ -282,6 +261,41 @@ export class AutoResearchProvider {
       env: process.env,
       ...(layerfsConfig ? { layerfs: layerfsConfig } : {}),
     })
+    let sourceWorkspace = workspaceRoot
+    let initialState = null
+    try {
+      if (await pathExists(selectionFile)) {
+        let latest = null
+        try {
+          latest = await readJson(selectionFile)
+        } catch {
+          throw new Error(`Previous run selection is not valid JSON: ${selectionFile}`)
+        }
+        if (latest?.original_manifest && !jsonEqual(latest.original_manifest, originalManifest)) {
+          throw new Error('Original workspace changed since the last method run. Select/reconcile the intended starting workspace before continuing; all branches preserved.')
+        }
+        let adopted = false
+        if (typeof latest?.leader_workspace === 'string') {
+          const candidate = latest.leader_workspace
+          if (isAbsolute(candidate)
+            && isContained(join(runtimeRoot, 'runs'), candidate)
+            && await pathExists(candidate)) {
+            const candidateStat = await fsp.stat(candidate).catch(() => null)
+            if (candidateStat?.isDirectory()) {
+              sourceWorkspace = candidate
+              adopted = true
+            }
+          }
+        }
+        if (!adopted && typeof latest?.leader_branch === 'string' && manager.kind === 'layerfs') {
+          initialState = await manager.adopt(latest.leader_branch, 'initial')
+          sourceWorkspace = initialState.path
+        }
+      }
+    } catch (error) {
+      await manager.close().catch(() => {})
+      throw error
+    }
     const evaluator = new FrozenEvaluator({ plan, output, logger: this.ctx.logger ?? null })
     let runner
     try {
@@ -296,6 +310,7 @@ export class AutoResearchProvider {
           subagents: this.ctx.subagents,
           workspaceManager: manager,
           evaluator,
+          ...(initialState ? { initialState } : {}),
           parent: request.parent,
           signal: request.signal,
           workerProvider,

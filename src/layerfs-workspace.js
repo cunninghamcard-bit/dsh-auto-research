@@ -442,6 +442,18 @@ export class LayerFSBackend {
     return { id, backend: this.name, path, branch, handle: mount }
   }
 
+  async adopt(branch, id) {
+    if (typeof branch !== 'string' || branch.length === 0) {
+      throw new Error('LayerFS adopt requires a saved branch name')
+    }
+    const mount = await this.client.workspace.mount(branch)
+    const path = mount?.path ?? mount?.workspace?.path
+    if (typeof path !== 'string' || path.length === 0) {
+      throw new Error('LayerFS workspace.mount returned no path')
+    }
+    return { id, backend: this.name, path, branch, handle: mount }
+  }
+
   async commit(state, { message = 'auto-research: verified state' } = {}) {
     if (!state?.handle) return
     await this.client.workspace.commit(state.handle, message)
@@ -482,6 +494,13 @@ export class WorkspaceManager {
 
   async fork(parent, id) {
     return this.backend.fork(parent, id)
+  }
+
+  async adopt(branch, id) {
+    if (typeof this.backend.adopt !== 'function') {
+      throw new Error('This workspace backend cannot adopt an existing branch')
+    }
+    return this.backend.adopt(branch, id)
   }
 
   async commit(state, options) {

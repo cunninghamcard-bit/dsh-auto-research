@@ -137,11 +137,11 @@
 | `LEADER.json` | 选中的候选 |
 | `RESULT.json` | 批次边界结果 |
 
-`<checkout>/.auto-research-methods/LATEST.json` 记录选中的工作区与原始清单。下一批只在原始工作区仍匹配时从该 leader 开始；否则停止并要求协调者先对齐起点。
+`<checkout>/.auto-research-methods/LATEST.json` 记录选中的工作区、其 LayerFS 分支与原始清单。下一批只在原始工作区仍匹配时从该 leader 开始；否则停止并要求协调者先对齐起点。使用 LayerFS 时，若之前的挂载路径已不可用，会重新挂载保存的分支。
 
 ## LayerFS 集成
 
-存在 `DSH_LAYERFS_PROJECT` 与 `DSH_LAYERFS_SDK`（或 `config.layerfs` 提供）时，分支使用 `branch.fork`、`workspace.mount`、`workspace.commit` 与 `workspace.unmount`。验证通过的状态会提交；被拒绝或不完整的状态以 `discard: true` 卸载。没有绑定项目时，使用全量拷贝快照后端与内容寻址检查点对象。
+存在 `DSH_LAYERFS_PROJECT` 与 `DSH_LAYERFS_SDK`（或 `config.layerfs` 提供）时，分支使用 `branch.fork`、`workspace.mount`、`workspace.commit` 与 `workspace.unmount`。验证通过的状态会提交；科学上被拒绝的探针以 `discard: true` 卸载，而 provider 失败与超时的工作会作为未验证状态提交并保留以供审阅。没有绑定项目时，使用全量拷贝快照后端与内容寻址检查点对象。
 
 provider 读取 `DSH_LAYERFS_PROJECT`、`DSH_LAYERFS_SDK`、`DSH_LAYERFS_OPERATOR`、`DSH_LAYERFS_STORE_PATH`、`DSH_LAYERFS_HOME`。显式 `config.layerfs` 优先于环境变量。
 

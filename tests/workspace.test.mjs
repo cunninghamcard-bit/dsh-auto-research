@@ -215,6 +215,29 @@ describe('LayerFS backend', () => {
     })
   })
 
+  it('adopts a saved LayerFS branch and refuses adoption on snapshot backends', async () => {
+    await withTemp(async root => {
+      const actions = []
+      const output = join(root, 'out')
+      const backend = new LayerFSBackend({
+        client: fakeLayerfs(root, actions),
+        project: 'p',
+        output,
+        runId: 'run-1',
+      })
+      const adopted = await backend.adopt('ar-run-1-round-1-continue-1', 'initial')
+      assert.equal(adopted.branch, 'ar-run-1-round-1-continue-1')
+      assert.match(adopted.path, /ar-run-1-round-1-continue-1/)
+      assert.deepEqual(actions, [['mount', 'ar-run-1-round-1-continue-1']])
+      const snapshotOutput = join(root, 'snapshot')
+      const snapshotManager = new WorkspaceManager(
+        new SnapshotBackend({ output: snapshotOutput }),
+        { output: snapshotOutput },
+      )
+      await assert.rejects(snapshotManager.adopt('branch', 'initial'), /cannot adopt/)
+    })
+  })
+
   it('rejects incomplete LayerFS clients and parent branches', async () => {
     assert.throws(() => new LayerFSBackend({ client: {}, output: '/tmp' }), /requires branch.fork/)
     const backend = new LayerFSBackend({ client: fakeLayerfs('/tmp', []), output: '/tmp' })

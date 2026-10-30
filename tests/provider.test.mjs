@@ -58,6 +58,36 @@ async function fixture(root, { plan = {}, worker = null, config = {} } = {}) {
   return { cwd, subagents, provider, plan: value }
 }
 
+
+function fakeLayerfs(root, actions) {
+  const mounts = join(root, 'mounts')
+  return {
+    branch: {
+      async fork(name, from) {
+        actions.push(['fork', name, from])
+        await mkdir(join(mounts, name), { recursive: true })
+      },
+    },
+    workspace: {
+      async mount(name) {
+        actions.push(['mount', name])
+        const path = join(mounts, name)
+        await mkdir(path, { recursive: true })
+        return { sandbox: 'sandbox-1', path }
+      },
+      async commit(handle, message) {
+        actions.push(['commit', handle.sandbox, message])
+      },
+      async unmount(handle, discard) {
+        actions.push(['unmount', handle.sandbox, discard])
+      },
+    },
+    async close() {
+      actions.push(['close'])
+    },
+  }
+}
+
 describe('provider parsing helpers', () => {
   it('extracts text blocks from prompt content', () => {
     assert.equal(extractPromptText('plain'), 'plain')
@@ -308,6 +338,37 @@ describe('AutoResearchProvider', () => {
       await disposing
       assert.equal(result.stopReason, 'aborted')
       assert.match(result.output[0].text, /STOPPED/)
+    })
+  })
+
+  it('remounts the saved LayerFS leader branch on the next batch', async () => {
+    await withTemp(async root => {
+      const actions = []
+      const client = fakeLayerfs(root, actions)
+      const { cwd, provider } = await fixture(root, {
+        config: { layerfs: { client, project: 'p' } },
+      })
+      const first = await provider.start({
+        cwd,
+        prompt: [],
+        parent: { id: 'p' },
+        signal: new AbortController().signal,
+      })
+      await first.result
+      await first.dispose()
+      const latest = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'LATEST.json'), 'utf8'))
+      assert.match(latest.leader_branch, /-round-1-continue-1$/)
+      const before = actions.length
+      const second = await provider.start({
+        cwd,
+        prompt: [],
+        parent: { id: 'p' },
+        signal: new AbortController().signal,
+      })
+      const result = await second.result
+      assert.equal(result.stopReason, 'completed')
+      assert.deepEqual(actions[before], ['mount', latest.leader_branch])
+      await second.dispose()
     })
   })
 

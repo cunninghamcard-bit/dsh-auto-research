@@ -337,7 +337,9 @@ export class Runner {
 
     const initialFolder = join(this.output, 'initial')
     await fsp.mkdir(initialFolder, { recursive: true })
-    const baseState = await this.manager.baseline(this.workspace, 'initial')
+    const baseState = this.deps.initialState
+      ? { ...this.deps.initialState, id: 'initial' }
+      : await this.manager.baseline(this.workspace, 'initial')
     const baseManifest = await inventory(baseState.path)
     await writeJsonAtomic(join(initialFolder, 'INPUT-MANIFEST.json'), baseManifest)
     const initial = {
@@ -369,7 +371,8 @@ export class Runner {
     let leader = initial
     for (let roundNumber = 1; roundNumber <= options.rounds; roundNumber += 1) {
       this.checkCancelled()
-      const stalled = (this.now() - this.bestTime) / 1000 >= this.plan.stall_seconds
+      const stalled = Boolean(options.rsiTop
+        && (this.now() - this.bestTime) / 1000 >= this.plan.stall_seconds)
       const explore = Boolean(options.forkAndFlush || (options.rsiTop && stalled))
       const phases = explore ? ['explore', 'continue'] : ['continue']
       for (const phase of phases) {
@@ -763,6 +766,7 @@ export class Runner {
       }
       const valid = row.evaluation?.valid === true
       const preserve = row.timed_out === true || row.pending_workspace !== undefined
+        || row.collaboration_failed === true || row.completed === false
       try {
         if (valid) await this.manager.commit(row._state, { message: `auto-research: verified ${row.id}` })
         else if (preserve) await this.manager.commit(row._state, { message: `auto-research: unverified ${row.id}` })
@@ -822,6 +826,7 @@ export class Runner {
       if (row._state) {
         const valid = row.evaluation?.valid === true
         const preserve = row.timed_out === true || row.pending_workspace !== undefined
+          || row.collaboration_failed === true || row.completed === false
         if (preserve && !valid) {
           await this.preserveUnverified(row)
           continue

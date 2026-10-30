@@ -137,11 +137,11 @@ Everything lives under `<checkout>/.auto-research-methods/runs/<run-id>/`:
 | `LEADER.json` | Selected candidate |
 | `RESULT.json` | Batch boundary result |
 
-`<checkout>/.auto-research-methods/LATEST.json` records the selected workspace and the original manifest. The next batch starts from that leader only when the original workspace still matches; otherwise it stops and asks the coordinator to reconcile the starting point.
+`<checkout>/.auto-research-methods/LATEST.json` records the selected workspace, its LayerFS branch, and the original manifest. The next batch starts from that leader only when the original workspace still matches; otherwise it stops and asks the coordinator to reconcile the starting point. With LayerFS, the saved branch is remounted when its previous mount path is no longer available.
 
 ## LayerFS integration
 
-When `DSH_LAYERFS_PROJECT` and `DSH_LAYERFS_SDK` are present (or `config.layerfs` provides them), branches use `branch.fork`, `workspace.mount`, `workspace.commit`, and `workspace.unmount`. Verified states are committed; rejected or incomplete states are unmounted with `discard: true`. Without a bound project, a full-copy snapshot backend with content-addressed checkpoint objects is used.
+When `DSH_LAYERFS_PROJECT` and `DSH_LAYERFS_SDK` are present (or `config.layerfs` provides them), branches use `branch.fork`, `workspace.mount`, `workspace.commit`, and `workspace.unmount`. Verified states are committed; scientific rejections are unmounted with `discard: true`, while provider failures and timed-out work are committed as unverified and kept for review. Without a bound project, a full-copy snapshot backend with content-addressed checkpoint objects is used.
 
 The provider reads `DSH_LAYERFS_PROJECT`, `DSH_LAYERFS_SDK`, `DSH_LAYERFS_OPERATOR`, `DSH_LAYERFS_STORE_PATH`, and `DSH_LAYERFS_HOME`. Explicit `config.layerfs` wins over the environment.
 

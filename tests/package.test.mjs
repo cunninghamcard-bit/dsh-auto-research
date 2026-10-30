@@ -67,7 +67,7 @@ describe('package metadata', () => {
     for (const name of modules) {
       assert.equal((await stat(join(root, name))).isFile(), true, name)
     }
-    for (const test of ['protocols', 'evaluator', 'workspace', 'runner', 'provider', 'package']) {
+    for (const test of ['protocols', 'evaluator', 'workspace', 'runner', 'provider', 'policies', 'package']) {
       assert.equal((await stat(join(root, `tests/${test}.test.mjs`))).isFile(), true, test)
     }
   })
