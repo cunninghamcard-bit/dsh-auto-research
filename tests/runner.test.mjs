@@ -9,8 +9,8 @@ import {
   normalizeOptions,
   providerOutcome,
   validatePlan,
-} from '../src/runner.js'
-import { createWorkspaceManager, inventory } from '../src/layerfs-workspace.js'
+} from '../lib/runner.js'
+import { createWorkspaceManager, inventory } from '../lib/layerfs-workspace.js'
 import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.mjs'
 
 const sha256 = data => createHash('sha256').update(data).digest('hex')

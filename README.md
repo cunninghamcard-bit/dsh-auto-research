@@ -4,7 +4,7 @@ Evidence-scored research batches for [DeepSeek Harness](https://github.com/deeps
 
 One activation runs one **Batch**: freeze the evaluator, evaluate the baseline, run isolated research branches with **fork-and-flush** and/or **RSI-top**, optionally share checkpoints between cooperative cohorts, select a leader by independently evaluated score, and write a complete receipt trail. The coordinator model — not this plugin — owns the scientific objective, metrics, and decision to continue.
 
-Stack: Node.js ESM, Cordis plugins, `ctx.subagents`, optional [LayerFS](https://github.com/layerfs) copy-on-write branches. No runtime dependencies.
+Stack: strict TypeScript (ES2024, compiled to `lib/` with declarations and source maps), Node.js ESM, Cordis plugins, `ctx.subagents`, optional [LayerFS](https://github.com/layerfs) copy-on-write branches. No runtime dependencies.
 
 ## What it adds
 
@@ -137,13 +137,15 @@ Everything lives under `<checkout>/.auto-research-methods/runs/<run-id>/`:
 | `LEADER.json` | Selected candidate |
 | `RESULT.json` | Batch boundary result |
 
-`<checkout>/.auto-research-methods/LATEST.json` records the selected workspace, its LayerFS branch, and the original manifest. The next batch starts from that leader only when the original workspace still matches; otherwise it stops and asks the coordinator to reconcile the starting point. With LayerFS, the saved branch is remounted when its previous mount path is no longer available.
+`<checkout>/.auto-research-methods/LATEST.json` records the selected workspace, its LayerFS branch, and the original manifest. The next batch starts from that leader only when the original workspace still matches; otherwise it stops and asks the coordinator to reconcile the starting point. With LayerFS, the saved branch is remounted when its previous mount path is no longer available. If `LATEST.json` names a leader workspace or branch and neither can be adopted, the new batch fails loud instead of silently restarting from the seed. `runner.lock` makes one checkout single-instance. For a compact `plan.workspace` seed, runtime artifacts live inside the seed (`.auto-research-methods/`) and `<checkout>/.auto-research-methods/SEED.json` points at them.
 
 ## LayerFS integration
 
-When `DSH_LAYERFS_PROJECT` and `DSH_LAYERFS_SDK` are present (or `config.layerfs` provides them), branches use `branch.fork`, `workspace.mount`, `workspace.commit`, and `workspace.unmount`. Verified states are committed; scientific rejections are unmounted with `discard: true`, while provider failures and timed-out work are committed as unverified and kept for review. Without a bound project, a full-copy snapshot backend with content-addressed checkpoint objects is used.
+When `DSH_LAYERFS_PROJECT` and `DSH_LAYERFS_SDK` are present (or `config.layerfs` provides them), branches use `branch.fork`, `workspace.mount`, `workspace.commit`, and `workspace.unmount`. `Busy` refusals are retried with exponential backoff, branch names stay within Docker's 63-character limit, and adopted branch names are validated. Verified states are committed; completed branches that were scientifically rejected are committed as `rejected` and unmounted with `discard: false`, so losing work remains in LayerFS history. Provider failures and timed-out work are committed as unverified and kept for review. Without a bound project, a full-copy snapshot backend with content-addressed checkpoint objects is used.
 
-The provider reads `DSH_LAYERFS_PROJECT`, `DSH_LAYERFS_SDK`, `DSH_LAYERFS_OPERATOR`, `DSH_LAYERFS_STORE_PATH`, and `DSH_LAYERFS_HOME`. Explicit `config.layerfs` wins over the environment.
+The provider resolves `DSH_LAYERFS_PROJECT`, `DSH_LAYERFS_SDK`, `DSH_LAYERFS_OPERATOR`, `DSH_LAYERFS_CLI`, `DSH_LAYERFS_SKILL`, `DSH_LAYERFS_HOME`, `DSH_LAYERFS_STORE_PATH`, `DSH_LAYERFS_DOCKER`, `DSH_LAYERFS_IMAGE`, `DSH_LAYERFS_VOLUME`, `DSH_LAYERFS_DAEMON`, `DSH_LAYERFS_CONTAINER_PREFIX`, and `DSH_LAYERFS_DAEMON_HOST` from `config.layerfs`, `process.env`, and the session's `ctx.shellEnv` contributors. Explicit `config.layerfs` wins. A host-injected `layerfs.client` is never closed by this plugin.
+
+Real LayerFS mounts return a Sandbox-internal path such as `/workspaces/1`. When that path is not host-accessible, the backend stages a host copy at `<run>/<branch>/workspace`, evaluates and runs workers there, and on commit publishes added/modified/deleted files with `client.fs.apply` (or `fs.write`/`fs.rm`) before `workspace.commit`. Workers also receive `DSH_AUTO_RESEARCH_BRANCH` and `DSH_AUTO_RESEARCH_SANDBOX_PATH`.
 
 ## Safety
 
@@ -157,14 +159,16 @@ The provider reads `DSH_LAYERFS_PROJECT`, `DSH_LAYERFS_SDK`, `DSH_LAYERFS_OPERAT
 ## Tests
 
 ```bash
-npm test
+npm run typecheck   # strict tsc --noEmit
+npm run build       # tsc -> lib/index.js + lib/*.d.ts
+npm test            # typecheck + build + node --test tests/*.test.mjs
 ```
 
-The `node:test` suite covers protocols (metric views, portfolios, checkpoints, peer review, synthesis context), evaluator freezing and integrity, both workspace backends and completion restoration, full runner batches (fork-and-flush, RSI stall, cooperation, failure/timeout distinctions), provider/plugin lifecycle, cancellation, and package metadata.
+The `node:test` suite covers protocols (full RSI views, reservoir sampling, portfolios, checkpoint auto-discovery, peer review, shared-context fidelity), evaluator freezing/integrity/shebang handling, both workspace backends, LayerFS staging and Busy retries, completion restoration, full runner batches (fork-and-flush, RSI stall, cooperation, sibling aborts, provider.jsonl handoff, failure/timeout distinctions), the checkout lock, cancellation artifacts, provider/plugin lifecycle, and TypeScript build outputs.
 
 ## Limitations
 
-- Propagating a worker's provider session for continuation is recorded but not resumable through the generic `startActivation` seam; every worker turn receives a fresh prompt.
-- LayerFS mounts are assumed to expose a host-accessible workspace path.
+- The generic `startActivation` seam cannot resume a provider's own CLI session. Continuation fidelity is preserved by archiving each turn in `provider.jsonl` and handing the previous assistant output plus `.auto-research-methods-handoff.md` to the next worker.
+- Sandbox-internal LayerFS mounts are bridged through a host staging directory; very large workspaces pay a copy cost, and binary adopted files that `fs.read` refuses are skipped with a warning.
 - Cooperative epochs reuse a branch workspace and require the worker to finish within the share window; the hard phase deadline still applies.
 - The evaluator must be a local executable script; there is no built-in sandbox beyond the accepted workspace and inventory checks.

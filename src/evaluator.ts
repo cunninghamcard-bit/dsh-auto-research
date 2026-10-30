@@ -9,6 +9,7 @@
  */
 
 import { spawn } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
 import * as fsp from 'node:fs/promises'
 import { dirname, extname, isAbsolute, join, resolve } from 'node:path'
 import {
@@ -18,17 +19,30 @@ import {
   jsonDigest,
   jsonEqual,
 } from './layerfs-workspace.js'
+import type {
+  EvaluationResult,
+  Logger,
+  MetricDefinition,
+  SelectionMetric,
+} from './types.js'
 
 const SECRET_LINE = /(access_token|refresh_token|api_key|apiKey|client_secret|BEGIN [A-Z ]*PRIVATE KEY)/
+
+/** Plan fields the evaluator needs; a full {@link ResearchPlan} satisfies it. */
+export interface EvaluatorPlan {
+  evaluator: string
+  evaluation_seconds?: number | string
+  metrics?: MetricDefinition[]
+  selection_metrics?: SelectionMetric[]
+  evaluator_interpreter?: string | string[]
+  [key: string]: unknown
+}
 
 /**
  * Parse a finite numeric score. Booleans are not scores; neither is an empty
  * string, a non-finite number, or a value that only coerces to one.
- * @param {unknown} value
- * @param {string} [label]
- * @returns {number}
  */
-export function scoreValue(value, label = 'score') {
+export function scoreValue(value: unknown, label = 'score'): number {
   if (typeof value === 'boolean') throw new Error(`${label} is not a score`)
   if (typeof value === 'string' && value.trim() === '') throw new Error(`${label} must be finite`)
   if (value === null || value === undefined || typeof value === 'object') {
@@ -39,7 +53,7 @@ export function scoreValue(value, label = 'score') {
   return number
 }
 
-function terminate(child, signal) {
+function terminate(child: ChildProcess | undefined, signal: NodeJS.Signals): void {
   if (!child || child.pid === undefined) return
   try {
     if (process.platform !== 'win32') process.kill(-child.pid, signal)
@@ -49,41 +63,76 @@ function terminate(child, signal) {
   }
 }
 
+/** Result of one evaluator process. */
+export interface EvaluatorProcessResult {
+  code: number | null
+  timedOut: boolean
+  aborted: boolean
+  stdout: string
+  stderr: string
+  error?: Error
+}
+
+/** One evaluator process invocation. */
+export interface EvaluatorProcessParts {
+  argv: string[]
+  cwd: string
+  env: NodeJS.ProcessEnv
+  timeoutMs: number
+  signal?: AbortSignal
+  stdoutPath: string
+  stderrPath: string
+  spawn?: typeof spawn
+}
+
 /**
  * Run one evaluator process, capturing stdout/stderr and enforcing a timeout.
- * @returns {Promise<{code:number|null, timedOut:boolean, aborted:boolean, stdout:string, stderr:string, error?:Error}>}
+ * `settle()` never rejects: a log write failure cannot leave the promise
+ * pending, and the hard SIGKILL timer is cleared as soon as the child closes.
  */
-export function runEvaluatorProcess(parts) {
+export function runEvaluatorProcess(parts: EvaluatorProcessParts): Promise<EvaluatorProcessResult> {
   const { argv, cwd, env, timeoutMs, signal, stdoutPath, stderrPath } = parts
   const spawnImpl = parts.spawn ?? spawn
-  return new Promise(resolvePromise => {
-    let child
+  return new Promise<EvaluatorProcessResult>(resolvePromise => {
+    let child: ChildProcess | undefined
     let stdout = ''
     let stderr = ''
     let timedOut = false
     let aborted = false
     let settled = false
-    let timer
+    let timer: NodeJS.Timeout | undefined
+    let hard: NodeJS.Timeout | undefined
     try {
-      child = spawnImpl(argv[0], argv.slice(1), {
+      child = spawnImpl(argv[0] as string, argv.slice(1), {
         cwd,
         env,
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: process.platform !== 'win32',
       })
     } catch (error) {
-      resolvePromise({ code: null, timedOut, aborted, stdout, stderr, error })
+      resolvePromise({ code: null, timedOut, aborted, stdout, stderr, error: error as Error })
       return
     }
-    const settle = async (code, error) => {
+    const onAbort = (): void => {
+      aborted = true
+      terminate(child, 'SIGTERM')
+    }
+    const settle = async (code: number | null, error?: Error): Promise<void> => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      clearTimeout(hard)
       signal?.removeEventListener('abort', onAbort)
-      await fsp.mkdir(dirname(stdoutPath), { recursive: true })
-      await fsp.writeFile(stdoutPath, stdout)
-      await fsp.writeFile(stderrPath, stderr)
-      resolvePromise({ code, timedOut, aborted, stdout, stderr, ...(error ? { error } : {}) })
+      try {
+        await fsp.mkdir(dirname(stdoutPath), { recursive: true })
+        await fsp.writeFile(stdoutPath, stdout)
+        await fsp.writeFile(stderrPath, stderr)
+      } catch {
+        // Artifact directories can disappear during cancellation cleanup.
+      }
+      const result: EvaluatorProcessResult = { code, timedOut, aborted, stdout, stderr }
+      if (error) result.error = error
+      resolvePromise(result)
     }
     child.stdout?.on('data', chunk => {
       if (stdout.length < 32 * 1024 * 1024) stdout += chunk.toString('utf8')
@@ -94,22 +143,18 @@ export function runEvaluatorProcess(parts) {
     timer = setTimeout(() => {
       timedOut = true
       terminate(child, 'SIGTERM')
-      const hard = setTimeout(() => terminate(child, 'SIGKILL'), 2000)
+      hard = setTimeout(() => terminate(child, 'SIGKILL'), 2000)
       hard.unref?.()
     }, Math.max(1, timeoutMs))
     timer.unref?.()
-    const onAbort = () => {
-      aborted = true
-      terminate(child, 'SIGTERM')
-    }
     if (signal?.aborted) onAbort()
     else signal?.addEventListener('abort', onAbort, { once: true })
     child.on('error', error => { void settle(null, error) })
-    child.on('close', code => { void settle(code, undefined) })
+    child.on('close', code => { void settle(code) })
   })
 }
 
-function safeReason(value) {
+function safeReason(value: unknown): string {
   if (value === undefined || value === null) return ''
   const text = String(value)
   return SECRET_LINE.test(text) ? 'Evaluator rejected candidate' : `Evaluator rejected candidate: ${text}`
@@ -117,22 +162,48 @@ function safeReason(value) {
 
 /** A frozen evaluator bound to one run directory. */
 export class FrozenEvaluator {
-  constructor({ plan, output, logger = null, spawn: spawnImpl = undefined }) {
+  readonly output: string
+  readonly logger: Logger | null
+  readonly plan: EvaluatorPlan
+  hash: string | null = null
+  script: string | null = null
+  private readonly spawnImpl: typeof spawn | undefined
+
+  constructor({
+    plan,
+    output,
+    logger = null,
+    spawn: spawnImpl = undefined,
+  }: {
+    plan: EvaluatorPlan
+    output: string
+    logger?: Logger | null
+    spawn?: typeof spawn
+  }) {
     if (!plan || typeof plan.evaluator !== 'string' || plan.evaluator.length === 0) {
       throw new Error('Plan requires an evaluator script')
     }
     this.plan = plan
     this.output = output
     this.logger = logger
-    this.spawn = spawnImpl
-    this.hash = null
-    this.script = null
+    this.spawnImpl = spawnImpl
   }
 
-  /** Copy the evaluator outside every candidate workspace and hash it. */
-  async freeze() {
+  /**
+   * Copy the evaluator outside every candidate workspace and hash it.
+   * Extensionless scripts are classified from a Python/Node shebang; a script
+   * without either defaults to Python, matching `ara`.
+   */
+  async freeze(): Promise<string> {
     const source = resolve(this.plan.evaluator)
-    const extension = extname(source) || '.js'
+    let extension = extname(source)
+    if (extension === '') {
+      const body = await fsp.readFile(source, 'utf8')
+      const firstLine = body.split('\n', 1)[0] ?? ''
+      if (/^#!.*\bpython/i.test(firstLine)) extension = '.py'
+      else if (/^#!.*\bnode/i.test(firstLine)) extension = '.js'
+      else extension = '.py'
+    }
     const target = join(this.output, `evaluator${extension}`)
     await fsp.mkdir(this.output, { recursive: true })
     await fsp.copyFile(source, target)
@@ -141,8 +212,9 @@ export class FrozenEvaluator {
     return this.hash
   }
 
-  argv(workspace) {
+  argv(workspace: string): string[] {
     const configured = this.plan.evaluator_interpreter
+    if (typeof this.script !== 'string') throw new Error('Evaluator must be frozen before use')
     if (Array.isArray(configured) && configured.length > 0) {
       return [...configured.map(String), this.script, workspace]
     }
@@ -159,26 +231,32 @@ export class FrozenEvaluator {
     return [this.script, workspace]
   }
 
-  async validateCandidate(value, before, workspace) {
+  async validateCandidate(
+    value: unknown,
+    before: Record<string, string>,
+    workspace: string,
+  ): Promise<EvaluationResult> {
     if (value === null || typeof value !== 'object') throw new Error('Evaluator output must be a JSON object')
-    if (value.valid !== true) throw new Error(safeReason(value.reason))
-    const score = scoreValue(value.score)
-    const metrics = value.metrics ?? {}
+    const output = value as Record<string, unknown>
+    if (output.valid !== true) throw new Error(safeReason(output.reason))
+    const score = scoreValue(output.score)
+    const metrics = (output.metrics ?? {}) as unknown
     if (metrics === null || typeof metrics !== 'object' || Array.isArray(metrics)) {
       throw new Error('Evaluator metrics must be an object')
     }
+    const observed = metrics as Record<string, number | string>
     for (const spec of this.plan.metrics ?? []) {
-      if (spec.optional === true && !(spec.name in metrics)) continue
-      scoreValue(metrics[spec.name], `metric ${spec.name}`)
+      if (spec.optional === true && !(spec.name in observed)) continue
+      scoreValue(observed[spec.name], `metric ${spec.name}`)
     }
     for (const spec of this.plan.selection_metrics ?? []) {
-      scoreValue(metrics[spec.name], `selection metric ${spec.name}`)
+      scoreValue(observed[spec.name], `selection metric ${spec.name}`)
     }
-    const evidence = value.evidence
+    const evidence = output.evidence
     if (!Array.isArray(evidence) || evidence.length === 0) {
       throw new Error('No evaluation evidence')
     }
-    const receipts = {}
+    const receipts: Record<string, string> = {}
     for (const relative of evidence) {
       if (typeof relative !== 'string' || relative.length === 0 || isAbsolute(relative)) {
         throw new Error('Evidence must exist within the evaluated workspace')
@@ -196,26 +274,25 @@ export class FrozenEvaluator {
     return {
       valid: true,
       score,
-      metrics,
+      metrics: observed,
       evidence: receipts,
       workspace_manifest_sha256: jsonDigest(before),
     }
   }
 
-  /**
-   * Evaluate one candidate workspace.
-   * @param {string} workspace
-   * @param {string} folder receives evaluation.log / evaluation.err.log
-   * @param {{deadline?:number, signal?:AbortSignal, now?:() => number}} [options]
-   */
-  async evaluate(workspace, folder, options = {}) {
-    if (!this.hash) throw new Error('Evaluator must be frozen before use')
+  /** Evaluate one candidate workspace. `folder` receives evaluation logs. */
+  async evaluate(
+    workspace: string,
+    folder: string,
+    options: { deadline?: number; signal?: AbortSignal; now?: () => number } = {},
+  ): Promise<EvaluationResult> {
+    if (!this.hash || !this.script) throw new Error('Evaluator must be frozen before use')
     if (await digestFile(this.script) !== this.hash) {
       throw new Error('Evaluator or evaluated workspace changed; result rejected')
     }
     const before = await inventory(workspace)
     const now = options.now ?? (() => performance.now())
-    const budget = Number(this.plan.evaluation_seconds)
+    const budget = Number(this.plan.evaluation_seconds ?? 0)
     let seconds = budget
     if (options.deadline !== undefined) {
       seconds = Math.min(budget, (options.deadline - now()) / 1000)
@@ -228,7 +305,7 @@ export class FrozenEvaluator {
     const stderrPath = join(folder, 'evaluation.err.log')
     const temp = join(folder, '.method-evaluation', 'tmp')
     await fsp.mkdir(temp, { recursive: true })
-    const env = { ...process.env }
+    const env: NodeJS.ProcessEnv = { ...process.env }
     delete env.CLAUDECODE
     delete env.CODEX_THREAD_ID
     env.PYTHONDONTWRITEBYTECODE = '1'
@@ -239,10 +316,10 @@ export class FrozenEvaluator {
       cwd: this.output,
       env,
       timeoutMs: seconds * 1000,
-      signal: options.signal,
+      ...(options.signal ? { signal: options.signal } : {}),
       stdoutPath,
       stderrPath,
-      ...(this.spawn ? { spawn: this.spawn } : {}),
+      ...(this.spawnImpl ? { spawn: this.spawnImpl } : {}),
     })
     if (await digestFile(this.script) !== this.hash) {
       throw new Error('Evaluator or evaluated workspace changed; result rejected')
@@ -257,10 +334,10 @@ export class FrozenEvaluator {
       return {
         valid: false,
         reason: 'Evaluator failed or exceeded its budget',
-        exit_code: run.code ?? null,
+        exit_code: run.code,
       }
     }
-    let value
+    let value: unknown
     try {
       value = JSON.parse(run.stdout.trim())
     } catch {
@@ -273,12 +350,12 @@ export class FrozenEvaluator {
     try {
       return await this.validateCandidate(value, before, workspace)
     } catch (error) {
-      return { valid: false, reason: error.message }
+      return { valid: false, reason: (error as Error).message }
     }
   }
 }
 
 /** @returns the frozen evaluator for a plan. */
-export function createFrozenEvaluator(options) {
+export function createFrozenEvaluator(options: ConstructorParameters<typeof FrozenEvaluator>[0]): FrozenEvaluator {
   return new FrozenEvaluator(options)
 }

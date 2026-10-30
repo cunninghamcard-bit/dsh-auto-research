@@ -22,7 +22,7 @@ import {
   sha256,
   snapshot,
   writeJsonAtomic,
-} from '../src/layerfs-workspace.js'
+} from '../lib/layerfs-workspace.js'
 import { withTemp, writeWorkspace } from './helpers.mjs'
 
 describe('inventory and snapshot', () => {
@@ -191,6 +191,7 @@ describe('LayerFS backend', () => {
         project: 'p',
         output: join(root, 'out'),
         runId: 'run-1',
+        ownsClient: true,
       })
       const manager = new WorkspaceManager(backend, { output: join(root, 'out') })
       assert.equal(manager.kind, 'layerfs')

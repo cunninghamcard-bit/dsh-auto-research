@@ -7,7 +7,7 @@ import {
   createFrozenEvaluator,
   runEvaluatorProcess,
   scoreValue,
-} from '../src/evaluator.js'
+} from '../lib/evaluator.js'
 import { withTemp, writeStateEvaluator, writeWorkspace } from './helpers.mjs'
 
 async function fixture(root, options = {}) {

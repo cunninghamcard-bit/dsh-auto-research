@@ -29,8 +29,29 @@ import {
   sampleMetricViews,
   validatePeerReview,
   validatePortfolio,
+  writeSharedContextAtomic,
 } from './protocols.js'
-import { buildWorkerPrompt, RESEARCH_METHODS_POLICY, RESEARCH_POLICY, CONTINUE_POLICY } from './policies.js'
+import { buildWorkerPrompt, workerPolicy } from './policies.js'
+import type {
+  BatchResult,
+  Clock,
+  Config,
+  ContentBlock,
+  EvaluationResult,
+  MetricDiagnostic,
+  MetricView,
+  Phase,
+  PlanOptions,
+  ProviderOutcome,
+  ResearchOptions,
+  ResearchPlan,
+  ResearchPlanInput,
+  RunnerDeps,
+  SharedCheckpoint,
+  SubagentResult,
+  TrajectoryRow,
+  WorkspaceState,
+} from './types.js'
 
 /** Raised when a batch is stopped by the caller; artifacts are retained. */
 export class ResearchStoppedError extends Error {
@@ -40,15 +61,15 @@ export class ResearchStoppedError extends Error {
   }
 }
 
-const DEFAULT_CLOCK = {
+const DEFAULT_CLOCK: Clock = {
   now: () => performance.now(),
-  sleep: (milliseconds, signal) => new Promise((resolve, reject) => {
+  sleep: (milliseconds, signal) => new Promise<void>((resolve, reject) => {
     if (signal?.aborted) {
       reject(new ResearchStoppedError())
       return
     }
     const timer = setTimeout(resolve, Math.max(0, milliseconds))
-    const onAbort = () => {
+    const onAbort = (): void => {
       clearTimeout(timer)
       reject(new ResearchStoppedError())
     }
@@ -58,21 +79,26 @@ const DEFAULT_CLOCK = {
 }
 
 /** Merge plan-level option overrides over plugin configuration. */
-export function normalizeOptions(config = {}, plan = {}) {
+export function normalizeOptions(
+  config: Config = {},
+  plan: ResearchPlanInput = {},
+): ResearchOptions {
+  const overrides: PlanOptions = plan.options && typeof plan.options === 'object'
+    ? plan.options as PlanOptions
+    : {}
   return {
-    rounds: config.rounds ?? 1,
-    branches: config.branches ?? 4,
-    explorationMinutes: config.explorationMinutes ?? 30,
-    exploitationMinutes: config.exploitationMinutes ?? 30,
-    rsiTop: config.rsiTop ?? false,
-    forkAndFlush: config.forkAndFlush ?? false,
-    shareContext: config.shareContext ?? false,
-    sharingIntervalMinutes: config.sharingIntervalMinutes ?? 10,
-    ...(plan.options && typeof plan.options === 'object' ? plan.options : {}),
+    rounds: overrides.rounds ?? config.rounds ?? 1,
+    branches: overrides.branches ?? config.branches ?? 4,
+    explorationMinutes: overrides.explorationMinutes ?? config.explorationMinutes ?? 30,
+    exploitationMinutes: overrides.exploitationMinutes ?? config.exploitationMinutes ?? 30,
+    rsiTop: overrides.rsiTop ?? config.rsiTop ?? false,
+    forkAndFlush: overrides.forkAndFlush ?? config.forkAndFlush ?? false,
+    shareContext: overrides.shareContext ?? config.shareContext ?? false,
+    sharingIntervalMinutes: overrides.sharingIntervalMinutes ?? config.sharingIntervalMinutes ?? 10,
   }
 }
 
-function finitePositive(value) {
+function finitePositive(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value > 0
 }
 
@@ -80,98 +106,122 @@ function finitePositive(value) {
  * Validate the model-written plan against the execution contract and return
  * normalized defaults. Values are never replaced with repository heuristics.
  */
-export function validatePlan(plan, options) {
-  if (plan === null || typeof plan !== 'object') throw new Error('Research plan must be a JSON object')
-  if (typeof plan.objective !== 'string' || plan.objective.trim() === '') {
+export function validatePlan(plan: unknown, options: ResearchOptions): ResearchPlan {
+  if (plan === null || typeof plan !== 'object' || Array.isArray(plan)) {
+    throw new Error('Research plan must be a JSON object')
+  }
+  const input = plan as ResearchPlanInput
+  if (typeof input.objective !== 'string' || input.objective.trim() === '') {
     throw new Error('Plan requires an objective')
   }
-  if (typeof plan.worker_prompt !== 'string' || plan.worker_prompt.trim() === '') {
+  if (typeof input.worker_prompt !== 'string' || input.worker_prompt.trim() === '') {
     throw new Error('Plan requires a worker_prompt')
   }
-  if (typeof plan.evaluator !== 'string' || plan.evaluator.trim() === '') {
+  if (typeof input.evaluator !== 'string' || input.evaluator.trim() === '') {
     throw new Error('Plan requires an evaluator script')
   }
-  const evaluationSeconds = Number(plan.evaluation_seconds)
+  const evaluationSeconds = Number(input.evaluation_seconds)
   if (!finitePositive(evaluationSeconds)) throw new Error('Invalid evaluator configuration')
-  const direction = plan.direction ?? 'maximize'
+  const direction = input.direction ?? 'maximize'
   if (direction !== 'maximize' && direction !== 'minimize') {
     throw new Error('Invalid evaluator configuration')
   }
-  const metrics = plan.metrics ?? []
+  const metrics = input.metrics ?? []
   if (!Array.isArray(metrics)) throw new Error('Plan metrics must be an array')
-  const names = []
+  const names: string[] = []
   for (const metric of metrics) {
-    if (!metric || typeof metric.name !== 'string' || metric.name.trim() === '') {
+    if (!metric || typeof metric !== 'object' || typeof (metric as { name?: unknown }).name !== 'string'
+      || ((metric as { name: string }).name).trim() === '') {
       throw new Error('Invalid fixed metric definitions or subset size')
     }
-    names.push(metric.name)
+    names.push((metric as { name: string }).name)
   }
   if (new Set(names).size !== names.length) {
     throw new Error('Invalid fixed metric definitions or subset size')
   }
-  const selectionMetrics = plan.selection_metrics ?? []
+  const selectionMetrics = input.selection_metrics ?? []
   if (!Array.isArray(selectionMetrics)) throw new Error('Selection metrics must be declared and independently evaluated')
   for (const spec of selectionMetrics) {
-    if (!spec || !names.includes(spec.name) || (spec.direction !== 'maximize' && spec.direction !== 'minimize')) {
+    if (!spec || typeof spec !== 'object'
+      || !names.includes((spec as { name?: string }).name ?? '')
+      || ((spec as { direction?: unknown }).direction !== 'maximize'
+        && (spec as { direction?: unknown }).direction !== 'minimize')) {
       throw new Error('Selection metrics must be declared and independently evaluated')
     }
   }
-  if (!Number.isInteger(options.branches) || options.branches < 2 || !Number.isInteger(options.rounds) || options.rounds < 1) {
+  if (!Number.isInteger(options.branches) || options.branches < 2
+    || !Number.isInteger(options.rounds) || options.rounds < 1) {
     throw new Error('Invalid branch/round budget')
   }
-  for (const key of ['explorationMinutes', 'exploitationMinutes']) {
+  for (const key of ['explorationMinutes', 'exploitationMinutes'] as const) {
     if (!finitePositive(options[key])) throw new Error('Invalid time budget')
   }
   if (options.shareContext && !finitePositive(options.sharingIntervalMinutes)) {
     throw new Error('Invalid context sharing interval')
   }
-  let stall = plan.stall_seconds ?? null
-  let subset = plan.metric_subset ?? 1
-  let portfolio = plan.portfolio_size ?? 2
-  let gain = plan.meaningful_gain ?? 0
+  let stall = typeof input.stall_seconds === 'number' ? input.stall_seconds : null
+  let subset = typeof input.metric_subset === 'number' ? input.metric_subset : 1
+  let portfolio = typeof input.portfolio_size === 'number' ? input.portfolio_size : 2
+  let gain = 0
+  if (input.meaningful_gain !== undefined) {
+    try {
+      gain = scoreValue(input.meaningful_gain, 'meaningful_gain')
+    } catch {
+      if (options.rsiTop) throw new Error('Invalid model-defined RSI intervention parameters')
+    }
+  }
   if (options.rsiTop) {
     if (!Number.isInteger(subset) || subset < 1 || subset > names.length) {
       throw new Error('Invalid fixed metric definitions or subset size')
     }
     if (!finitePositive(stall)) throw new Error('Invalid model-defined RSI intervention parameters')
-    try {
-      gain = scoreValue(gain, 'meaningful_gain')
-    } catch {
-      throw new Error('Invalid model-defined RSI intervention parameters')
-    }
     if (gain < 0 || !Number.isInteger(portfolio) || portfolio < 2) {
       throw new Error('Invalid model-defined RSI intervention parameters')
     }
   }
-  return {
-    ...plan,
-    objective: plan.objective,
-    worker_prompt: plan.worker_prompt,
-    evaluator: plan.evaluator,
+  const { workspace: rawWorkspace, evaluator_interpreter: rawInterpreter, options: rawOptions, ...rest } = input
+  const normalized: ResearchPlan = {
+    ...rest,
+    objective: input.objective,
+    worker_prompt: input.worker_prompt,
+    evaluator: input.evaluator,
     evaluation_seconds: evaluationSeconds,
     direction,
-    metrics,
-    selection_metrics: selectionMetrics,
+    metrics: metrics as ResearchPlan['metrics'],
+    selection_metrics: selectionMetrics as ResearchPlan['selection_metrics'],
     stall_seconds: stall,
     metric_subset: subset,
     portfolio_size: portfolio,
     meaningful_gain: gain,
   }
+  if (typeof rawWorkspace === 'string') normalized.workspace = rawWorkspace
+  if (typeof rawInterpreter === 'string' || Array.isArray(rawInterpreter)) {
+    normalized.evaluator_interpreter = rawInterpreter as string | string[]
+  }
+  if (rawOptions && typeof rawOptions === 'object') normalized.options = rawOptions as PlanOptions
+  return normalized
 }
 
 /** Port of `provider_outcome`: transport diagnostics are not turn failures. */
-export function providerOutcome(events = [], rc, timedOut) {
-  let terminal = null
-  let session = null
-  const diagnostics = []
+export function providerOutcome(
+  events: unknown[] = [],
+  rc: number | null,
+  timedOut: boolean,
+): ProviderOutcome {
+  let terminal: string | null = null
+  let session: string | null = null
+  const diagnostics: unknown[] = []
   for (const event of events) {
-    const kind = event?.type
-    if (kind === 'thread.started') session = event.thread_id
-    if (event?.session_id) session = event.session_id
+    if (!event || typeof event !== 'object') continue
+    const record = event as Record<string, unknown>
+    const kind = record.type
+    if (kind === 'thread.started' && typeof record.thread_id === 'string') session = record.thread_id
+    if (typeof record.session_id === 'string') session = record.session_id
     if (kind === 'turn.completed') terminal = 'completed'
     else if (kind === 'turn.failed') terminal = 'failed'
-    else if (kind === 'result') terminal = event.subtype === 'success' && !event.is_error ? 'completed' : 'failed'
-    else if (kind === 'error' || event?.is_error) diagnostics.push(event)
+    else if (kind === 'result') {
+      terminal = record.subtype === 'success' && !record.is_error ? 'completed' : 'failed'
+    } else if (kind === 'error' || record.is_error) diagnostics.push(event)
   }
   return {
     completed: terminal === 'completed' && rc === 0 && !timedOut,
@@ -181,8 +231,8 @@ export function providerOutcome(events = [], rc, timedOut) {
   }
 }
 
-function combineSignals(signals) {
-  const active = signals.filter(Boolean)
+function combineSignals(signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const active = signals.filter((signal): signal is AbortSignal => signal !== undefined)
   if (active.length === 0) return undefined
   if (active.length === 1) return active[0]
   if (typeof AbortSignal.any === 'function') return AbortSignal.any(active)
@@ -197,16 +247,21 @@ function combineSignals(signals) {
   return controller.signal
 }
 
-function compareKeys(a, b) {
+function compareKeys(a: number[], b: number[]): number {
   for (let index = 0; index < a.length; index += 1) {
-    if (a[index] < b[index]) return -1
-    if (a[index] > b[index]) return 1
+    const left = a[index] as number
+    const right = b[index] as number
+    if (left < right) return -1
+    if (left > right) return 1
   }
   return 0
 }
 
-function mergeEnv(configured = {}, layerfsEnv = {}) {
-  const result = {}
+function mergeEnv(
+  configured: Record<string, unknown> = {},
+  layerfsEnv: Record<string, unknown> = {},
+): Record<string, string> {
+  const result: Record<string, string> = {}
   const secret = /(token|key|secret|password|credential)/i
   for (const [key, value] of Object.entries({ ...layerfsEnv, ...configured })) {
     if (value === undefined || value === null) continue
@@ -216,11 +271,86 @@ function mergeEnv(configured = {}, layerfsEnv = {}) {
   return result
 }
 
+/** Extract assistant text from a provider `output` value. */
+export function outputText(output: SubagentResult['output']): string {
+  if (typeof output === 'string') return output
+  if (!Array.isArray(output)) return ''
+  return (output as ContentBlock[])
+    .map(block => {
+      if (typeof block === 'string') return block
+      if (block?.type === 'text' && typeof block.text === 'string') return block.text
+      if (typeof block?.text === 'string') return block.text
+      return ''
+    })
+    .filter(Boolean)
+    .join('\n')
+}
+
+interface PeerSlot {
+  id: string
+  parent: string | null
+  phase: Phase | undefined
+  collaborator: number | undefined
+  evaluation: EvaluationResult
+  checkpoint: SharedCheckpoint
+  workspace: string
+  transcript: string
+  notes: string
+}
+
 /** One batch runner. */
 export class Runner {
-  constructor({ config = {}, plan, workspace, output, originalManifest = null, selectionFile = null, deps = {} }) {
+  readonly config: Config
+  readonly options: ResearchOptions
+  readonly plan: ResearchPlan
+  readonly workspace: string
+  readonly output: string
+  readonly deps: RunnerDeps
+  readonly manager: RunnerDeps['workspaceManager']
+  readonly subagents: RunnerDeps['subagents']
+  readonly clock: Clock
+  readonly rng: () => number
+  readonly logger: RunnerDeps['logger']
+  readonly workerProvider: string
+  readonly parent: unknown
+  readonly signal: AbortSignal | undefined
+  readonly workerEnv: Record<string, string>
+  readonly evaluator: RunnerDeps['evaluator'] & { hash: string | null }
+  readonly originalManifest: Record<string, string> | null
+  readonly selectionFile: string | null
+  readonly runId: string
+  readonly rows: TrajectoryRow[] = []
+  readonly selections: Array<Record<string, unknown>> = []
+  peerBundle: string | null = null
+  readonly peerSlots: Record<string, PeerSlot> = {}
+  bestTime: number
+  anchor: number | null = null
+  cancelled = false
+  readonly abort = new AbortController()
+  timedOutRows: TrajectoryRow[] = []
+  readonly abandoned: TrajectoryRow[] = []
+  readonly activeStates = new Map<WorkspaceState, { id: string; parent: string | null; workspace: string }>()
+  readonly releasedStates = new Set<WorkspaceState>()
+
+  constructor({
+    config = {},
+    plan,
+    workspace,
+    output,
+    originalManifest = null,
+    selectionFile = null,
+    deps,
+  }: {
+    config?: Config
+    plan: unknown
+    workspace: string
+    output: string
+    originalManifest?: Record<string, string> | null
+    selectionFile?: string | null
+    deps: RunnerDeps
+  }) {
     this.config = config
-    this.options = normalizeOptions(config, plan)
+    this.options = normalizeOptions(config, plan as ResearchPlanInput)
     this.plan = validatePlan(plan, this.options)
     this.workspace = workspace
     this.output = output
@@ -237,54 +367,51 @@ export class Runner {
     this.parent = deps.parent
     this.signal = deps.signal
     this.workerEnv = mergeEnv(deps.workerEnv ?? config.workerEnv ?? {}, deps.layerfsEnv ?? {})
-    this.evaluator = deps.evaluator ?? new FrozenEvaluator({ plan: this.plan, output, logger: this.logger })
+    this.evaluator = (deps.evaluator ?? new FrozenEvaluator({ plan: this.plan, output, logger: this.logger ?? null })) as RunnerDeps['evaluator'] & { hash: string | null }
     this.originalManifest = originalManifest
     this.selectionFile = selectionFile
-    this.rows = []
-    this.selections = []
-    this.peerBundle = null
-    this.peerSlots = {}
     this.bestTime = this.clock.now()
-    this.anchor = null
-    this.cancelled = false
-    this.abort = new AbortController()
     this.runId = deps.runId ?? basename(output)
-    this.timedOutRows = []
   }
 
-  now() {
+  now(): number {
     return this.clock.now()
   }
 
-  async sleep(milliseconds) {
+  async sleep(milliseconds: number): Promise<void> {
     if (milliseconds <= 0) return
     await this.clock.sleep(milliseconds, this.abort.signal)
   }
 
-  stopped() {
+  stopped(): boolean {
+    return this.cancelled || this.signal?.aborted === true || this.abort.signal.aborted
+  }
+
+  /** Whether the caller (not a sibling failure) stopped this batch. */
+  intentionalStop(): boolean {
     return this.cancelled || this.signal?.aborted === true
   }
 
-  checkCancelled() {
+  checkCancelled(): void {
     if (this.stopped()) throw new ResearchStoppedError()
   }
 
   /** Stop scheduling and abort in-flight workers/evaluations. */
-  stop() {
+  stop(): void {
     this.cancelled = true
     this.abort.abort()
   }
 
-  signalForWork() {
-    return combineSignals([this.abort.signal, this.signal])
+  signalForWork(): AbortSignal {
+    return combineSignals([this.abort.signal, this.signal]) ?? this.abort.signal
   }
 
-  metricDiagnostics() {
+  metricDiagnostics(): MetricDiagnostic[] {
     const validRows = this.rows.filter(row => row.evaluation?.valid === true)
     return (this.plan.metrics ?? []).map(metric => {
       const values = validRows
         .filter(row => metric.name in (row.evaluation.metrics ?? {}))
-        .map(row => row.evaluation.metrics[metric.name])
+        .map(row => (row.evaluation.metrics ?? {})[metric.name])
       const distinct = new Set(values.map(value => JSON.stringify(value)))
       return {
         name: metric.name,
@@ -296,7 +423,7 @@ export class Runner {
     })
   }
 
-  dashboard() {
+  dashboard(): Record<string, unknown> {
     return {
       metrics: this.plan.metrics ?? [],
       metric_diagnostics: this.metricDiagnostics(),
@@ -304,7 +431,7 @@ export class Runner {
     }
   }
 
-  async checkDisk(workspace, count) {
+  async checkDisk(workspace: string, count: number): Promise<void> {
     if (this.manager.kind !== 'snapshot') return
     const files = await inventory(workspace)
     const required = (await inventoryBytes(workspace, files)) * count
@@ -314,7 +441,7 @@ export class Runner {
     }
   }
 
-  views(count) {
+  views(count: number): MetricView[] {
     if (!this.options.rsiTop) {
       return Array.from({ length: count }, () => ({ definitions: [], diagnostics: [], rows: [] }))
     }
@@ -323,12 +450,90 @@ export class Runner {
       subset: this.plan.metric_subset,
       count,
       diagnostics: this.metricDiagnostics(),
-      rows: this.rows,
+      rows: this.rows.map(row => ({
+        id: row.id,
+        parent: row.parent,
+        workspace: row.workspace,
+        evaluation: row.evaluation,
+      })),
       rng: this.rng,
     })
   }
 
-  async run() {
+  /** Run all branches; one unexpected rejection aborts its siblings. */
+  private async runBranches(tasks: Array<Promise<TrajectoryRow>>): Promise<TrajectoryRow[]> {
+    const guarded = tasks.map(task => task.catch((error: unknown) => {
+      this.abort.abort()
+      throw error
+    }))
+    const settled = await Promise.allSettled(guarded)
+    const rows: TrajectoryRow[] = []
+    let firstError: unknown = null
+    let inducedStop: unknown = null
+    for (const outcome of settled) {
+      if (outcome.status === 'fulfilled') {
+        rows.push(outcome.value)
+        continue
+      }
+      // A sibling failure aborts its peers; those induced stop errors must not
+      // mask the underlying unexpected error in the batch diagnostic.
+      if (outcome.reason instanceof ResearchStoppedError) {
+        if (inducedStop === null) inducedStop = outcome.reason
+      } else if (firstError === null) {
+        firstError = outcome.reason
+      }
+    }
+    if (firstError !== null) throw firstError
+    if (inducedStop !== null) throw inducedStop
+    return rows
+  }
+
+  async run(): Promise<BatchResult> {
+    try {
+      return await this.runBatch()
+    } catch (error) {
+      if (this.intentionalStop()) {
+        await this.writeStoppedResult().catch(() => {})
+      }
+      throw error
+    }
+  }
+
+  /** Persist the honest cancellation artifact (idempotent). */
+  async writeStoppedResult(): Promise<Record<string, unknown>> {
+    const result = {
+      status: 'STOPPED',
+      stop_reason: 'stopped',
+      pending_workspaces: this.pendingWorkspaces(),
+      artifacts_preserved: true,
+    }
+    await writeJsonAtomic(join(this.output, 'RESULT.json'), result)
+    return result
+  }
+
+  /** Live branches that have not been committed/unmounted yet. */
+  pendingWorkspaces(): Array<Record<string, unknown>> {
+    const pending = new Map<string, Record<string, unknown>>()
+    for (const row of this.rows) {
+      if (!row._state || row._released || row.id === 'initial') continue
+      pending.set(row.workspace, {
+        id: row.id,
+        workspace: row.workspace,
+        branch: row._state.branch ?? null,
+      })
+    }
+    for (const [state, active] of this.activeStates) {
+      pending.set(active.workspace, {
+        id: active.id,
+        parent: active.parent,
+        workspace: active.workspace,
+        branch: state.branch ?? null,
+      })
+    }
+    return [...pending.values()]
+  }
+
+  private async runBatch(): Promise<BatchResult> {
     const options = this.options
     await fsp.mkdir(this.output, { recursive: true })
     await writeJsonAtomic(join(this.output, 'PLAN.json'), this.plan)
@@ -342,7 +547,7 @@ export class Runner {
       : await this.manager.baseline(this.workspace, 'initial')
     const baseManifest = await inventory(baseState.path)
     await writeJsonAtomic(join(initialFolder, 'INPUT-MANIFEST.json'), baseManifest)
-    const initial = {
+    const initial: TrajectoryRow = {
       id: 'initial',
       parent: null,
       workspace: baseState.path,
@@ -368,24 +573,25 @@ export class Runner {
     this.anchor = scoreValue(initial.evaluation.score)
     this.bestTime = this.now()
 
-    let leader = initial
+    let leader: TrajectoryRow = initial
     for (let roundNumber = 1; roundNumber <= options.rounds; roundNumber += 1) {
       this.checkCancelled()
       const stalled = Boolean(options.rsiTop
-        && (this.now() - this.bestTime) / 1000 >= this.plan.stall_seconds)
+        && (this.plan.stall_seconds ?? Number.POSITIVE_INFINITY) > 0
+        && (this.now() - this.bestTime) / 1000 >= (this.plan.stall_seconds ?? Number.POSITIVE_INFINITY))
       const explore = Boolean(options.forkAndFlush || (options.rsiTop && stalled))
-      const phases = explore ? ['explore', 'continue'] : ['continue']
+      const phases: Phase[] = explore ? ['explore', 'continue'] : ['continue']
       for (const phase of phases) {
         this.checkCancelled()
         await writeJsonAtomic(join(this.output, 'DASHBOARD.json'), this.dashboard())
         const count = phase === 'explore' ? options.branches : 1
         await this.checkDisk(leader.workspace, count)
         const views = this.views(count)
-        let candidates
+        let candidates: TrajectoryRow[]
         if (options.shareContext) {
           candidates = await this.cooperativeCohort(leader, count, phase, roundNumber, views)
         } else {
-          candidates = await Promise.all(Array.from({ length: count }, (_, index) => this.branch(
+          candidates = await this.runBranches(Array.from({ length: count }, (_, index) => this.branch(
             leader,
             index,
             phase,
@@ -422,7 +628,7 @@ export class Runner {
         const current = scoreValue(leader.evaluation.score)
         let gain = this.anchor === null ? null : current - this.anchor
         if (gain !== null && this.plan.direction === 'minimize') gain = -gain
-        if (this.anchor === null || gain > this.plan.meaningful_gain) {
+        if (this.anchor === null || (gain !== null && gain > this.plan.meaningful_gain)) {
           this.anchor = current
           this.bestTime = this.now()
         }
@@ -434,7 +640,7 @@ export class Runner {
     return this.finish(leader)
   }
 
-  async writeSelection(leader) {
+  async writeSelection(leader: TrajectoryRow): Promise<void> {
     if (!this.selectionFile) return
     await writeJsonAtomic(this.selectionFile, {
       leader_workspace: leader.workspace,
@@ -445,44 +651,68 @@ export class Runner {
     })
   }
 
-  async publishPeers(rows, folder) {
-    let updated = false
+  private peerSlotsOf(rows: TrajectoryRow[]): PeerSlot[] {
     for (const row of rows) {
       if (row.completed && !row.collaboration_failed && row.shared_checkpoint) {
-        this.peerSlots[`${row.phase}:${row.collaborator}`] = {
+        const key = `${row.phase ?? 'explore'}:${row.collaborator ?? 0}`
+        this.peerSlots[key] = {
           id: row.id,
           parent: row.parent,
           phase: row.phase,
           collaborator: row.collaborator,
           evaluation: row.evaluation,
           checkpoint: row.shared_checkpoint,
+          workspace: row.workspace,
+          transcript: join(row.workspace, 'provider.jsonl'),
+          notes: join(row.workspace, 'RESEARCH_HANDOFF.md'),
         }
-        updated = true
       }
     }
-    if (!updated) return this.peerBundle
-    const peers = Object.values(this.peerSlots)
+    return Object.values(this.peerSlots)
+  }
+
+  async publishPeers(rows: TrajectoryRow[], folder: string): Promise<string> {
+    const peers = this.peerSlotsOf(rows)
+    if (peers.length === 0) {
+      if (!this.peerBundle) throw new Error('No completed peer checkpoint is available to publish')
+      return this.peerBundle
+    }
     const path = join(folder, 'PEER-EVIDENCE.json')
+    await fsp.mkdir(folder, { recursive: true })
     await writeJsonAtomic(path, buildPeerEvidence({ objective: this.plan.objective, peers }))
     await fsp.chmod(path, 0o444)
     this.peerBundle = path
-    await fsp.mkdir(folder, { recursive: true })
-    await fsp.writeFile(join(folder, 'shared-context.md'), buildZeroSynthesisContext({
+    const context = buildZeroSynthesisContext({
       objective: this.plan.objective,
-      rows: peers.map(peer => ({ id: peer.id, shared_checkpoint: peer.checkpoint })),
-    }))
+      checkpoints: peers.map(peer => ({
+        id: peer.id,
+        summary: peer.checkpoint.summary,
+        files: peer.checkpoint.files,
+        checkout: peer.workspace,
+        transcript: peer.transcript,
+        notes: peer.notes,
+      })),
+    })
+    await writeSharedContextAtomic(join(folder, 'shared-context.md'), context, { mode: 0o600 })
     return path
   }
 
-  async cooperativeCohort(leader, count, phase, roundNumber, views) {
+  async cooperativeCohort(
+    leader: TrajectoryRow,
+    count: number,
+    phase: Phase,
+    roundNumber: number,
+    views: MetricView[],
+  ): Promise<TrajectoryRow[]> {
     const minutes = phase === 'explore' ? this.options.explorationMinutes : this.options.exploitationMinutes
     const seconds = 60 * minutes
     const interval = 60 * this.options.sharingIntervalMinutes
     const start = this.now()
     const deadline = start + seconds * 1000
-    let parents = Array.from({ length: count }, () => leader)
-    const history = []
-    const checkpoints = new Array(count).fill(null)
+    let parents: TrajectoryRow[] = Array.from({ length: count }, () => leader)
+    const history: Array<Record<string, unknown>> = []
+    const checkpoints: Array<string | null> = new Array(count).fill(null)
+    let previousSharedContext: string | null = null
     let epoch = 0
     while (true) {
       this.checkCancelled()
@@ -491,7 +721,7 @@ export class Runner {
       const shareAt = Math.min(deadline, start + (epoch + 1) * interval * 1000)
       const prefix = `round-${roundNumber}-${phase}-epoch-${epoch + 1}`
       const bundle = this.peerBundle
-      const candidates = await Promise.all(parents.map((parent, index) => this.branch(
+      const candidates = await this.runBranches(parents.map((parent, index) => this.branch(
         parent,
         index,
         phase,
@@ -505,22 +735,25 @@ export class Runner {
           count,
           seconds: remaining,
           index,
+          sharedContext: previousSharedContext,
         },
       )))
       for (let index = 0; index < candidates.length; index += 1) {
         const row = candidates[index]
-        if (row.completed && row.evaluation?.valid === true && !row.collaboration_failed) {
+        if (row && row.completed && row.evaluation?.valid === true && !row.collaboration_failed) {
           checkpoints[index] = await this.manager.retainCompletedState(publicRow(row))
         }
       }
       const publication = join(this.output, `${prefix}-shared`)
       await this.publishPeers(candidates, publication)
+      previousSharedContext = join(publication, 'shared-context.md')
       history.push({
         epoch: epoch + 1,
         target_seconds: (shareAt - start) / 1000,
         actual_seconds: (this.now() - start) / 1000,
         rows: candidates.map(publicRow),
         peer_bundle: this.peerBundle,
+        shared_context: previousSharedContext,
       })
       await writeJsonAtomic(join(this.output, `round-${roundNumber}-${phase}-COLLABORATION.json`), {
         phase_budget_seconds: seconds,
@@ -532,13 +765,15 @@ export class Runner {
         || row.collaboration_failed
         || !row.provider_session)
       if (incomplete) {
-        const restored = []
+        const restored: TrajectoryRow[] = []
         for (let index = 0; index < candidates.length; index += 1) {
           const row = candidates[index]
+          if (!row) continue
           const broken = !row.completed || row.evaluation?.valid !== true || row.collaboration_failed
-          if (checkpoints[index] && broken) {
+          const checkpoint = checkpoints[index]
+          if (checkpoint && broken) {
             await this.preserveUnverified(row)
-            restored.push(await this.manager.restoreCompletedState(checkpoints[index], publicRow(row)))
+            restored.push(await this.manager.restoreCompletedState(checkpoint, publicRow(row)))
           } else {
             restored.push(row)
           }
@@ -553,21 +788,38 @@ export class Runner {
     return history.length > 0 ? parents : []
   }
 
-  async branch(parent, index, phase, folder, view = { definitions: [] }, cooperation = null) {
+  async branch(
+    parent: TrajectoryRow,
+    index: number,
+    phase: Phase,
+    folder: string,
+    view: MetricView = { definitions: [], diagnostics: [], rows: [] },
+    cooperation: {
+      resume: boolean
+      bundle: string | null
+      deadline: number
+      shareAt: number
+      count: number
+      seconds: number
+      index: number
+      sharedContext: string | null
+    } | null = null,
+  ): Promise<TrajectoryRow> {
     await fsp.mkdir(folder, { recursive: true })
     const resume = Boolean(cooperation?.resume)
-    let state
+    let state: WorkspaceState | undefined
     let ownsState = false
     try {
       if (resume) {
-        state = parent._state
+        state = parent._state ?? undefined
         if (!state) throw new Error('Cooperative resume requires the parent workspace')
       } else {
         this.checkCancelled()
-        state = await this.manager.fork(parent._state, basename(folder))
+        state = await this.manager.fork(parent._state as WorkspaceState, basename(folder))
         ownsState = true
       }
       const checkout = state.path
+      this.activeStates.set(state, { id: basename(folder), parent: parent.id, workspace: checkout })
       const manifest = await inventory(checkout)
       await writeJsonAtomic(join(folder, 'INPUT-MANIFEST.json'), manifest)
 
@@ -587,13 +839,13 @@ export class Runner {
         : seconds
       const session = phase === 'continue' || resume ? parent.provider_session ?? null : null
 
-      let peer = null
+      let peer: { path: string; digest: string; ids: string[] } | null = null
       if (cooperation?.bundle) {
         const bundleText = await fsp.readFile(cooperation.bundle, 'utf8')
         const bundle = JSON.parse(bundleText)
         peer = {
           path: join(checkout, 'SHARED_CONTEXT', `peer-evidence-${basename(folder)}.json`),
-          digest: null,
+          digest: '',
           ids: peerIdsOf(bundle),
         }
         await fsp.mkdir(join(checkout, 'SHARED_CONTEXT'), { recursive: true })
@@ -601,6 +853,31 @@ export class Runner {
         await fsp.chmod(peer.path, 0o444)
         peer.digest = await digestFile(peer.path)
       }
+
+      let sharedContextPath: string | null = null
+      if (cooperation?.sharedContext) {
+        const targetFile = join(checkout, 'SHARED_CONTEXT', 'shared-context.md')
+        await fsp.mkdir(join(checkout, 'SHARED_CONTEXT'), { recursive: true })
+        await fsp.copyFile(cooperation.sharedContext, targetFile)
+        try {
+          await fsp.chmod(targetFile, 0o600)
+        } catch {
+          // Read-only mounts still receive the bytes.
+        }
+        sharedContextPath = targetFile
+      }
+
+      let handoff: { from: string; text: string; path?: string } | null = null
+      if ((phase === 'continue' || resume) && typeof parent.last_output === 'string' && parent.last_output.trim() !== '') {
+        const handoffPath = join(checkout, '.auto-research-methods-handoff.md')
+        await fsp.writeFile(handoffPath, parent.last_output, { mode: 0o600 })
+        handoff = { from: parent.id, text: parent.last_output, path: handoffPath }
+      }
+
+      const branchEnv: Record<string, string> = { ...this.workerEnv }
+      if (state.branch) branchEnv.DSH_AUTO_RESEARCH_BRANCH = state.branch
+      if (state.sandboxPath) branchEnv.DSH_AUTO_RESEARCH_SANDBOX_PATH = state.sandboxPath
+      branchEnv.DSH_AUTO_RESEARCH_CHECKOUT = checkout
 
       const prompt = buildWorkerPrompt({
         plan: this.plan,
@@ -613,10 +890,12 @@ export class Runner {
           ? { index, count: cooperation.count, target, seconds }
           : null,
         peer,
-        env: this.workerEnv,
+        env: branchEnv,
         provider: this.workerProvider,
-        policy: [RESEARCH_POLICY, RESEARCH_METHODS_POLICY, CONTINUE_POLICY].join('\n\n'),
+        policy: workerPolicy({ cooperation: Boolean(cooperation) }),
         seconds,
+        handoff,
+        sharedContext: sharedContextPath,
       })
       await writeJsonAtomic(join(folder, 'LAUNCH.json'), {
         phase,
@@ -624,12 +903,17 @@ export class Runner {
         fresh_context: !session,
         provider_session: session,
         seconds,
-        metric_view: view.definitions ?? [],
+        metric_view: view,
         cooperative_resume: resume,
         peer_manifest_sha256: peer?.digest ?? null,
         share_target_unix: cooperation ? Date.now() + Math.max(0, cooperation.shareAt - this.now()) : null,
         worker_provider: this.workerProvider,
-        environment: Object.keys(this.workerEnv),
+        environment: Object.keys(branchEnv),
+        handoff_from: handoff?.from ?? null,
+        handoff_path: handoff?.path ?? null,
+        shared_context: sharedContextPath,
+        workspace_branch: state.branch,
+        sandbox_path: state.sandboxPath,
       })
       const providerSeconds = cooperation ? seconds - this.plan.evaluation_seconds : seconds
       await writeJsonAtomic(join(folder, 'BUDGET.json'), {
@@ -640,12 +924,19 @@ export class Runner {
         throw new Error('No provider window remains after reserving evaluation')
       }
 
+      const started = Date.now()
       const timeout = new AbortController()
       const timer = setTimeout(() => timeout.abort(), providerSeconds * 1000)
       timer.unref?.()
       const signal = combineSignals([this.signalForWork(), timeout.signal])
-      let result
-      let childId = null
+      let result: SubagentResult | undefined
+      let childId: string | null = null
+      const providerEvents: Array<Record<string, unknown>> = [{
+        type: 'prompt',
+        at: new Date(started).toISOString(),
+        provider: this.workerProvider,
+        text: prompt,
+      }]
       try {
         const activation = await this.subagents.startActivation({
           provider: this.workerProvider,
@@ -655,29 +946,49 @@ export class Runner {
             prompt: [{ type: 'text', text: prompt }],
             parent: this.parent,
           },
-          signal,
+          ...(signal ? { signal } : {}),
           delivery: 'caller',
         })
         childId = activation.childId ?? null
-        result = await activation.result
         try {
-          await activation.dispose()
-        } catch (error) {
-          this.logger?.warn?.(`[auto-research] worker dispose failed: ${error.message}`)
+          result = await activation.result
+        } finally {
+          try {
+            await activation.dispose()
+          } catch (error) {
+            this.logger?.warn?.(`[auto-research] worker dispose failed: ${(error as Error).message}`)
+          }
         }
       } finally {
         clearTimeout(timer)
       }
       this.checkCancelled()
+      const assistantText = outputText(result?.output)
+      providerEvents.push({
+        type: 'assistant',
+        at: new Date().toISOString(),
+        text: assistantText,
+      })
+      providerEvents.push({
+        type: 'result',
+        at: new Date().toISOString(),
+        stop_reason: result?.stopReason ?? 'error',
+        diagnostic: result?.diagnostic ?? null,
+        duration_ms: Date.now() - started,
+      })
+      await fsp.writeFile(
+        join(folder, 'provider.jsonl'),
+        providerEvents.map(event => JSON.stringify(event)).join('\n') + '\n',
+      )
       const completed = result?.stopReason === 'completed'
       const timedOut = result?.stopReason === 'aborted' && !this.stopped()
-      const outcome = {
+      const outcome: ProviderOutcome = {
         completed,
         provider_session: childId ?? session,
         terminal: result?.stopReason ?? 'error',
         diagnostic_count: result?.diagnostic ? 1 : 0,
       }
-      const row = {
+      const row: TrajectoryRow = {
         id: basename(folder),
         parent: parent.id,
         phase,
@@ -689,6 +1000,8 @@ export class Runner {
         completed,
         provider_outcome: outcome,
         time: Date.now(),
+        last_output: assistantText,
+        ...(handoff?.path ? { handoff_path: handoff.path } : {}),
         evaluation: completed
           ? await this.evaluator.evaluate(checkout, folder, {
             ...(cooperation ? { deadline: cooperation.deadline } : {}),
@@ -704,7 +1017,7 @@ export class Runner {
           validatePortfolio(portfolio, { portfolioSize: this.plan.portfolio_size, parentId: parent.id })
           row.portfolio_sha256 = await digestFile(join(checkout, 'PORTFOLIO.json'))
         } catch (error) {
-          row.evaluation = { valid: false, reason: 'RSI portfolio protocol: ' + error.message }
+          row.evaluation = { valid: false, reason: 'RSI portfolio protocol: ' + (error as Error).message }
         }
       }
       if (cooperation && row.completed) {
@@ -719,72 +1032,117 @@ export class Runner {
             await writeJsonAtomic(join(folder, 'PEER-REVIEW.json'), review)
           }
         } catch (error) {
-          row.evaluation = { valid: false, reason: 'Collaboration protocol: ' + error.message }
+          row.evaluation = { valid: false, reason: 'Collaboration protocol: ' + (error as Error).message }
           row.collaboration_failed = true
         }
       }
       await writeJsonAtomic(join(folder, 'RESULT.json'), publicRow(row))
+      this.activeStates.delete(state)
       return { ...row, _state: state, _ownsState: ownsState }
     } catch (error) {
       if (ownsState && state) {
+        const stopped = this.intentionalStop()
+        const orphan: TrajectoryRow = {
+          id: basename(folder),
+          parent: parent.id,
+          phase,
+          workspace: state.path,
+          evaluation: { valid: false, reason: stopped ? 'Branch stopped before completion' : 'Branch aborted before completion' },
+          completed: false,
+          _state: stopped ? null : state,
+          _ownsState: true,
+          _released: true,
+        }
+        this.abandoned.push(orphan)
         try {
-          await this.manager.release(state, { discard: true })
+          if (stopped) {
+            // Cancellation preserves the branch for review; the pending path
+            // is reported in RESULT.json before cleanup.
+            await this.manager.commit(state, { message: `auto-research: unverified ${orphan.id}` })
+            await this.manager.release(state, { discard: false })
+            this.releasedStates.add(state)
+          } else {
+            this.activeStates.delete(state)
+            await this.manager.release(state, { discard: true })
+            this.releasedStates.add(state)
+          }
         } catch (releaseError) {
-          this.logger?.warn?.(`[auto-research] branch release failed: ${releaseError.message}`)
+          this.logger?.warn?.(`[auto-research] branch release failed: ${(releaseError as Error).message}`)
         }
       }
       throw error
     }
   }
 
-  choose(incumbent, candidates) {
+  choose(incumbent: TrajectoryRow, candidates: TrajectoryRow[]): TrajectoryRow {
     const eligible = [incumbent, ...candidates].filter(row => row.evaluation?.valid === true)
     if (eligible.length === 0) throw new Error('No valid evaluated branch; all work retained')
-    const key = row => {
+    const key = (row: TrajectoryRow): number[] => {
       let primary = scoreValue(row.evaluation.score)
       if (this.plan.direction === 'minimize') primary = -primary
       const progress = (this.plan.selection_metrics ?? []).map(spec => {
-        const value = scoreValue(row.evaluation.metrics[spec.name], `selection metric ${spec.name}`)
+        const value = scoreValue(row.evaluation.metrics?.[spec.name], `selection metric ${spec.name}`)
         return spec.direction === 'maximize' ? value : -value
       })
       return [primary, ...progress, row.id !== 'initial' ? 1 : 0, row.time ?? 0]
     }
     const ordered = [...eligible].sort((a, b) => compareKeys(key(b), key(a)))
-    return ordered[0]
+    const selected = ordered[0]
+    if (!selected) throw new Error('No valid evaluated branch; all work retained')
+    return selected
   }
 
-  async recycle(candidates, leader) {
+  /**
+   * Commit and unmount this phase's branches. A completed branch that failed
+   * science is preserved as `rejected`, never discarded; only a branch that
+   * never completed is treated as unverified. No state is released twice.
+   */
+  async recycle(candidates: TrajectoryRow[], leader: TrajectoryRow): Promise<void> {
     for (const row of candidates) {
       if (!row._ownsState || !row._state) continue
-      if (row.id === leader.id) {
-        try {
-          await this.manager.commit(row._state, { message: `auto-research: verified ${row.id}` })
-        } catch (error) {
-          this.logger?.warn?.(`[auto-research] commit failed: ${error.message}`)
-        }
+      if (this.releasedStates.has(row._state)) {
+        row._state = null
+        row._released = true
         continue
       }
-      const valid = row.evaluation?.valid === true
-      const preserve = row.timed_out === true || row.pending_workspace !== undefined
-        || row.collaboration_failed === true || row.completed === false
-      try {
-        if (valid) await this.manager.commit(row._state, { message: `auto-research: verified ${row.id}` })
-        else if (preserve) await this.manager.commit(row._state, { message: `auto-research: unverified ${row.id}` })
-      } catch (error) {
-        this.logger?.warn?.(`[auto-research] commit failed: ${error.message}`)
+      const state = row._state
+      if (row.id === leader.id) {
+        try {
+          await this.manager.commit(state, { message: `auto-research: verified ${row.id}` })
+        } catch (error) {
+          this.logger?.warn?.(`[auto-research] commit failed: ${(error as Error).message}`)
+        }
+        // The leader stays mounted: the next phase continues from this exact
+        // workspace, and `releaseAll()` commits/unmounts it at batch end.
+        continue
+      }
+      {
+        const valid = row.evaluation?.valid === true
+        const completed = row.completed === true
+        const label = valid ? 'verified' : completed ? 'rejected' : 'unverified'
+        try {
+          await this.manager.commit(state, { message: `auto-research: ${label} ${row.id}` })
+        } catch (error) {
+          this.logger?.warn?.(`[auto-research] commit failed: ${(error as Error).message}`)
+        }
       }
       try {
-        await this.manager.release(row._state, { discard: !valid && !preserve })
+        await this.manager.release(state, { discard: false })
       } catch (error) {
-        this.logger?.warn?.(`[auto-research] release failed: ${error.message}`)
+        this.logger?.warn?.(`[auto-research] release failed: ${(error as Error).message}`)
       }
+      this.releasedStates.add(state)
       row._state = null
       row._released = true
     }
   }
 
-  async finish(leader, reason = 'configured_batch_complete', pending = null) {
-    const unfinished = {}
+  async finish(
+    leader: TrajectoryRow,
+    reason = 'configured_batch_complete',
+    pending: TrajectoryRow[] | null = null,
+  ): Promise<BatchResult> {
+    const unfinished: Record<string, Record<string, unknown>> = {}
     for (const row of pending ?? []) {
       unfinished[row.workspace] = {
         id: row.id,
@@ -802,7 +1160,7 @@ export class Runner {
         }
       }
     }
-    const result = {
+    const result: BatchResult = {
       status: 'COMPLETED',
       leader: publicRow(leader),
       workspace_modified: false,
@@ -821,49 +1179,54 @@ export class Runner {
   }
 
   /** Release every mounted workspace at the end of a batch. */
-  async releaseAll() {
-    for (const row of this.rows) {
-      if (row._state) {
-        const valid = row.evaluation?.valid === true
-        const preserve = row.timed_out === true || row.pending_workspace !== undefined
-          || row.collaboration_failed === true || row.completed === false
-        if (preserve && !valid) {
-          await this.preserveUnverified(row)
-          continue
-        }
-        try {
-          if (valid) await this.manager.commit(row._state, { message: `auto-research: retained ${row.id}` })
-        } catch (error) {
-          this.logger?.warn?.(`[auto-research] final commit failed: ${error.message}`)
-        }
-        try {
-          await this.manager.release(row._state, { discard: !valid })
-        } catch (error) {
-          this.logger?.warn?.(`[auto-research] final release failed: ${error.message}`)
-        }
-        row._state = null
+  async releaseAll(): Promise<void> {
+    for (const row of [...this.rows, ...this.abandoned]) {
+      const state = row._state
+      if (!state || this.releasedStates.has(state)) continue
+      const valid = row.evaluation?.valid === true
+      const completed = row.completed === true
+      try {
+        if (valid) await this.manager.commit(state, { message: `auto-research: retained ${row.id}` })
+        else if (completed) await this.manager.commit(state, { message: `auto-research: rejected ${row.id}` })
+        else await this.manager.commit(state, { message: `auto-research: unverified ${row.id}` })
+      } catch (error) {
+        this.logger?.warn?.(`[auto-research] final commit failed: ${(error as Error).message}`)
       }
+      try {
+        await this.manager.release(state, { discard: false })
+      } catch (error) {
+        this.logger?.warn?.(`[auto-research] final release failed: ${(error as Error).message}`)
+      }
+      this.releasedStates.add(state)
+      row._state = null
+      row._released = true
     }
     try {
-      await this.manager.close()
+      await this.manager.close?.()
     } catch (error) {
-      this.logger?.warn?.(`[auto-research] workspace close failed: ${error.message}`)
+      this.logger?.warn?.(`[auto-research] workspace close failed: ${(error as Error).message}`)
     }
   }
 
   /** Keep an unverified workspace available for independent review. */
-  async preserveUnverified(row) {
-    if (!row._state) return
-    try {
-      await this.manager.commit(row._state, { message: `auto-research: unverified ${row.id}` })
-    } catch (error) {
-      this.logger?.warn?.(`[auto-research] unverified commit failed: ${error.message}`)
+  async preserveUnverified(row: TrajectoryRow): Promise<void> {
+    const state = row._state
+    if (!state || this.releasedStates.has(state)) {
+      row._state = null
+      row._released = true
+      return
     }
     try {
-      await this.manager.release(row._state, { discard: false })
+      await this.manager.commit(state, { message: `auto-research: unverified ${row.id}` })
     } catch (error) {
-      this.logger?.warn?.(`[auto-research] unverified release failed: ${error.message}`)
+      this.logger?.warn?.(`[auto-research] unverified commit failed: ${(error as Error).message}`)
     }
+    try {
+      await this.manager.release(state, { discard: false })
+    } catch (error) {
+      this.logger?.warn?.(`[auto-research] unverified release failed: ${(error as Error).message}`)
+    }
+    this.releasedStates.add(state)
     row._state = null
     row._released = true
   }

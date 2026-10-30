@@ -1,28 +1,37 @@
 {
   "name": "dsh-auto-research",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Evidence-scored, fork-and-flush and RSI-top research batches as a DeepSeek Harness SubagentProvider, isolated with LayerFS",
   "icon": "./icon.svg",
   "type": "module",
-  "main": "src/index.js",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
   "exports": {
-    ".": "./src/index.js",
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
     "./package.json": "./package.json",
     "./src/*": "./src/*",
+    "./lib/*": "./lib/*",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./locale/*.json": "./locale/*.json"
   },
   "files": [
+    "lib",
     "src",
     "icon.svg",
     "cordis.patch.yml",
     "locale",
     "README.md",
     "README.zh.md",
-    "LICENSE"
+    "LICENSE",
+    "tsconfig.json"
   ],
   "scripts": {
-    "test": "node --test tests/*.test.mjs"
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "npm run typecheck && npm run build && node --test tests/*.test.mjs"
   },
   "keywords": [
     "dsh",
@@ -33,7 +42,8 @@
     "rsi-top",
     "fork-and-flush",
     "layerfs",
-    "auto-research"
+    "auto-research",
+    "typescript"
   ],
   "license": "MIT",
   "engines": {
@@ -44,5 +54,9 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
   }
 }

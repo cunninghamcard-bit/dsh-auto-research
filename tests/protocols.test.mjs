@@ -11,7 +11,7 @@ import {
   seededRandom,
   validatePeerReview,
   validatePortfolio,
-} from '../src/protocols.js'
+} from '../lib/protocols.js'
 import { withTemp } from './helpers.mjs'
 
 describe('sampleMetricViews', () => {
@@ -207,7 +207,7 @@ describe('seededRandom', () => {
       assert.equal(value, b())
       assert.ok(value >= 0 && value < 1)
     }
-    const source = await readFile(new URL('../src/protocols.js', import.meta.url), 'utf8')
+    const source = await readFile(new URL('../lib/protocols.js', import.meta.url), 'utf8')
     assert.match(source, /ALLOWED_SHARED_EXTENSIONS/)
   })
 })

@@ -9,9 +9,9 @@ import {
   parsePlanFromPrompt,
   resolveConfig,
   resolvePlan,
-} from '../src/provider.js'
-import { Config, apply, coordinatorPolicy, name as pluginName, inject } from '../src/index.js'
-import { ResearchStoppedError } from '../src/runner.js'
+} from '../lib/provider.js'
+import { Config, apply, coordinatorPolicy, name as pluginName, inject } from '../lib/index.js'
+import { ResearchStoppedError } from '../lib/runner.js'
 import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.mjs'
 
 function planObject(root, extra = {}) {

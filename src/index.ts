@@ -8,9 +8,10 @@
 
 import { AutoResearchProvider, resolveConfig } from './provider.js'
 import { coordinatorPolicy } from './policies.js'
+import type { Config as PluginConfig, PluginContext, ResolvedConfig } from './types.js'
 
 export const name = 'dsh-auto-research'
-export const inject = ['subagents', 'systemPrompt']
+export const inject: string[] = ['subagents', 'systemPrompt']
 
 const PLACEMENT = 'PLAN_POLICY'
 
@@ -24,7 +25,7 @@ export const Config = Object.freeze({
   '~standard': {
     version: 1,
     vendor: 'dsh-auto-research',
-    validate(value) {
+    validate(value: unknown): { value: ResolvedConfig } | { issues: Array<{ message: string; path: never[] }> } {
       try {
         return { value: resolveConfig(value ?? {}) }
       } catch (error) {
@@ -36,17 +37,17 @@ export const Config = Object.freeze({
 
 /**
  * Register the provider and coordinator guidance.
- * @param {object} ctx Cordis context with `subagents` and `systemPrompt`
- * @param {object} [config]
  */
-export function apply(ctx, config) {
+export function apply(ctx: PluginContext, config?: PluginConfig): void {
   const resolved = resolveConfig(config)
   const provider = new AutoResearchProvider({ ctx, config: resolved })
-  ctx.subagents.registerProvider(provider)
-  const order = typeof ctx.systemPrompt.getSectionOrder === 'function'
-    ? ctx.systemPrompt.getSectionOrder(PLACEMENT) ?? 500
+  ctx.subagents.registerProvider?.(provider)
+  const prompt = ctx.systemPrompt
+  if (!prompt) return
+  const order = typeof prompt.getSectionOrder === 'function'
+    ? prompt.getSectionOrder(PLACEMENT) ?? 500
     : 500
-  ctx.systemPrompt.section({
+  prompt.section({
     name: 'auto-research:coordinator',
     order,
     interpolate: false,
@@ -55,4 +56,12 @@ export function apply(ctx, config) {
 }
 
 export { AutoResearchProvider, resolveConfig, coordinatorPolicy }
-export { RESEARCH_POLICY, RESEARCH_METHODS_POLICY, CONTINUE_POLICY, buildWorkerPrompt } from './policies.js'
+export {
+  RESEARCH_POLICY,
+  RESEARCH_METHODS_POLICY,
+  CONTINUE_POLICY,
+  SHARED_CONTEXT_POLICY,
+  DSH_COORDINATOR_ADDENDUM,
+  buildWorkerPrompt,
+  workerPolicy,
+} from './policies.js'

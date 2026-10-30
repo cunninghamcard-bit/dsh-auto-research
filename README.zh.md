@@ -141,7 +141,7 @@
 
 ## LayerFS 集成
 
-存在 `DSH_LAYERFS_PROJECT` 与 `DSH_LAYERFS_SDK`（或 `config.layerfs` 提供）时，分支使用 `branch.fork`、`workspace.mount`、`workspace.commit` 与 `workspace.unmount`。验证通过的状态会提交；科学上被拒绝的探针以 `discard: true` 卸载，而 provider 失败与超时的工作会作为未验证状态提交并保留以供审阅。没有绑定项目时，使用全量拷贝快照后端与内容寻址检查点对象。
+存在 `DSH_LAYERFS_PROJECT` 与 `DSH_LAYERFS_SDK`（或 `config.layerfs` 提供）时，分支使用 `branch.fork`、`workspace.mount`、`workspace.commit` 与 `workspace.unmount`。`Busy` 拒绝会以指数退避重试；分支名保持在 63 字符以内；验证通过的状态会提交；已完成的科学拒绝分支会以 `rejected` 提交并以 `discard: false` 卸载，保留在 LayerFS 历史中；provider 失败与超时的工作会作为未验证状态提交并保留以供审阅。Sandbox 内部挂载路径会通过宿主暂存目录桥接，并用 `fs.apply`/`workspace.commit` 同步。没有绑定项目时，使用全量拷贝快照后端与内容寻址检查点对象。
 
 provider 读取 `DSH_LAYERFS_PROJECT`、`DSH_LAYERFS_SDK`、`DSH_LAYERFS_OPERATOR`、`DSH_LAYERFS_STORE_PATH`、`DSH_LAYERFS_HOME`。显式 `config.layerfs` 优先于环境变量。
 
@@ -153,6 +153,10 @@ provider 读取 `DSH_LAYERFS_PROJECT`、`DSH_LAYERFS_SDK`、`DSH_LAYERFS_OPERATO
 - 序列化前会清理配置；疑似机密的环境变量键不会写入。
 - 不会自动合并、重置、覆盖、删除或发布。
 - 批次边界不能证明用户目标已完成，也不能证明存在基准提升。
+
+## 构建
+
+源码位于 `src/*.ts`（严格 TypeScript），`npm run build` 编译到 `lib/`（`lib/index.js`、`lib/*.d.ts`），`npm test` 依次执行 typecheck、build 和 `node --test`。
 
 ## 测试
 
