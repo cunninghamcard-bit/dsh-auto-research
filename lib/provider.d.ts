@@ -40,14 +40,29 @@ export interface RunnerLock {
     release: () => Promise<void>;
 }
 /**
+ * Refuse a runtime root that is a symlink escaping the workspace.
+ *
+ * `.auto-research-methods` holds every branch artifact and the runner lock, so
+ * a planted symlink would redirect those writes outside the assigned
+ * checkout. A missing runtime root is fine (it is created later).
+ */
+export declare function assertRuntimeRootContained(workspaceRoot: string, runtimeRoot: string): Promise<void>;
+/**
  * Acquire `<runtimeRoot>/runner.lock` so two `subagent_auto_research`
  * invocations on one checkout fail loud instead of racing on `LATEST.json`.
- * A stale lock is reclaimed only when its owning PID is gone.
+ *
+ * The payload is written to a unique sibling first and then hard-linked into
+ * place, so a lock file is never observable empty or half-written. A stale
+ * lock is reclaimed only when its owning PID is gone; an unparsable lock that
+ * is younger than {@link LOCK_WRITE_GRACE_MS} is treated as live rather than
+ * unlinked, which closes the remaining creation window.
  */
-export declare function acquireRunnerLock(runtimeRoot: string, runId: string, { cwd, pid, alive, }?: {
+export declare function acquireRunnerLock(runtimeRoot: string, runId: string, { cwd, pid, alive, now, writeGraceMs, }?: {
     cwd?: string;
     pid?: number;
     alive?: (pid: number) => boolean;
+    now?: () => number;
+    writeGraceMs?: number;
 }): Promise<RunnerLock>;
 /** One provider instance, normally created by the Cordis plugin entry. */
 export declare class AutoResearchProvider implements SubagentProvider {

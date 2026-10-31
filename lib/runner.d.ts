@@ -75,7 +75,15 @@ export declare class Runner {
         parent: string | null;
         workspace: string;
     }>;
+    /** Every state a backend created, from the moment it was returned. */
+    readonly trackedStates: Map<WorkspaceState, {
+        id: string;
+        parent: string | null;
+        workspace: string;
+    }>;
     readonly releasedStates: Set<WorkspaceState>;
+    readonly workerGraceMs: number;
+    private managerClosed;
     constructor({ config, plan, workspace, output, originalManifest, selectionFile, deps, }: {
         config?: Config;
         plan: unknown;
@@ -94,6 +102,22 @@ export declare class Runner {
     /** Stop scheduling and abort in-flight workers/evaluations. */
     stop(): void;
     signalForWork(): AbortSignal;
+    /** Remember a created state so a failed sibling or cohort cannot leak it. */
+    private trackState;
+    /** Clear the row handles that point at a state whose release succeeded. */
+    private markReleased;
+    /**
+     * Release one state. The handle is retained when the backend refuses, so a
+     * later `releaseAll()` can retry and `pendingWorkspaces()` still reports it.
+     */
+    private releaseTracked;
+    /**
+     * Await a worker activation, but never past a short grace after its signal
+     * aborts. A provider that ignores abort gets disposed and the batch moves on.
+     */
+    private awaitActivationResult;
+    /** Wait for a disposal, but do not let a stuck provider hold the batch. */
+    private disposeWithin;
     metricDiagnostics(): MetricDiagnostic[];
     dashboard(): Record<string, unknown>;
     checkDisk(workspace: string, count: number): Promise<void>;
@@ -108,7 +132,7 @@ export declare class Runner {
     private runBatch;
     writeSelection(leader: TrajectoryRow): Promise<void>;
     private peerSlotsOf;
-    publishPeers(rows: TrajectoryRow[], folder: string): Promise<string>;
+    publishPeers(rows: TrajectoryRow[], folder: string): Promise<string | null>;
     cooperativeCohort(leader: TrajectoryRow, count: number, phase: Phase, roundNumber: number, views: MetricView[]): Promise<TrajectoryRow[]>;
     branch(parent: TrajectoryRow, index: number, phase: Phase, folder: string, view?: MetricView, cooperation?: {
         resume: boolean;

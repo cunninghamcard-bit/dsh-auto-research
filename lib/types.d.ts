@@ -289,17 +289,35 @@ export interface Logger {
     warn?: (...args: unknown[]) => void;
     error?: (...args: unknown[]) => void;
 }
-/** Explicit LayerFS binding (host-injected client or settings). */
+/**
+ * Explicit LayerFS binding (host-injected client or settings).
+ *
+ * Every deployment field the SDK reads from `DSH_LAYERFS_*` is accepted here,
+ * and an explicitly configured field always wins over an ambient environment
+ * value. `null` means "explicitly unset".
+ */
 export interface LayerFSBinding {
     client?: LayerFSClient;
     operator?: unknown;
-    project?: string;
-    sdk?: string;
+    project?: string | null;
+    sdk?: string | null;
     operatorPath?: string;
+    cli?: string | null;
+    skill?: string | null;
     storePath?: string | null;
     home?: string | null;
     trace?: string | null;
     traceStep?: string | null;
+    traceStart?: string | null;
+    docker?: string | null;
+    image?: string | null;
+    volume?: string | null;
+    daemon?: string | null;
+    containerPrefix?: string | null;
+    daemonHost?: string | null;
+    storeContainer?: string | null;
+    bundle?: string | null;
+    wslEndpoint?: string | null;
     syncBaseline?: boolean;
     [key: string]: unknown;
 }
@@ -316,7 +334,7 @@ export interface Config {
     forkAndFlush?: boolean;
     shareContext?: boolean;
     sharingIntervalMinutes?: number;
-    layerfs?: LayerFSBinding | false;
+    layerfs?: LayerFSBinding | false | null;
     workerEnv?: Record<string, unknown>;
     plan?: ResearchPlanInput;
     [key: string]: unknown;
@@ -334,7 +352,7 @@ export interface ResolvedConfig {
     forkAndFlush: boolean;
     shareContext: boolean;
     sharingIntervalMinutes: number;
-    layerfs?: LayerFSBinding | false;
+    layerfs?: LayerFSBinding | false | null;
     workerEnv: Record<string, unknown>;
     plan?: ResearchPlanInput;
     [key: string]: unknown;
@@ -351,6 +369,10 @@ export interface LayerFSMount {
 }
 /** Structural LayerFS SDK client (the real `@layerfs/sdk` satisfies this). */
 export interface LayerFSClient {
+    project?: {
+        init?: (sourcePath: string) => Promise<unknown>;
+        [key: string]: unknown;
+    };
     branch?: {
         fork?: (name: string, from?: string) => Promise<unknown>;
         [key: string]: unknown;
@@ -390,6 +412,14 @@ export interface LayerFSSettings {
     volume: string | null;
     daemon: string | null;
     containerPrefix: string | null;
+    /** macOS/Live: the Linux Store container every ported SDK call runs in. */
+    storeContainer: string | null;
+    /** macOS/Live: the sealed Linux LayerFS build whose SDK `sdk` loads. */
+    bundle: string | null;
+    /** Windows: private endpoint file of the WSL LayerFS worker. */
+    wslEndpoint: string | null;
+    /** `1` when the SDK also writes a trace line as each call starts. */
+    traceStart: string | null;
     daemonHost: string | null;
 }
 /** Clock seam used by tests and deterministic runs. */

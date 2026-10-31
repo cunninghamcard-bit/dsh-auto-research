@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   LayerFSBackend,
@@ -281,6 +282,149 @@ export class LayerFS {
         containerPrefix: 'prefix',
         daemonHost: 'host.docker.internal',
       })
+    })
+  })
+})
+
+describe('ported SDK environment forwarding', () => {
+  it('publishes every DSH_LAYERFS_* setting while a client is alive and restores the process after', async () => {
+    await withTemp(async root => {
+      const sdk = join(root, 'port-sdk.mjs')
+      await writeFile(sdk, `
+// A stand-in for @dsh-layerfs/host/src/port/sdk.js: it reads the bundle at
+// import time and the Store container on every call.
+const bundleAtImport = process.env.DSH_LAYERFS_BUNDLE ?? null
+export class LayerFS {
+  constructor(project, options) {
+    this.projectName = project
+    this.options = { ...options, deploy: {} }
+    this.bundleAtImport = bundleAtImport
+    this.lastCall = null
+  }
+  async call() {
+    this.lastCall = {
+      storeContainer: process.env.DSH_LAYERFS_STORE_CONTAINER ?? null,
+      bareStoreContainer: process.env.LAYERFS_STORE_CONTAINER ?? null,
+      bundle: process.env.DSH_LAYERFS_BUNDLE ?? null,
+      daemonHost: process.env.DSH_LAYERFS_DAEMON_HOST ?? null,
+    }
+    return this.lastCall
+  }
+  async close() {}
+}
+`)
+      const settings = resolveLayerfsConfig({
+        DSH_LAYERFS_PROJECT: 'proj',
+        DSH_LAYERFS_SDK: sdk,
+        DSH_LAYERFS_HOME: '/home',
+        DSH_LAYERFS_DOCKER: '/orbstack/docker.sock',
+        DSH_LAYERFS_IMAGE: 'sha256:abc',
+        DSH_LAYERFS_VOLUME: 'volume',
+        DSH_LAYERFS_DAEMON: '/bundle/layerfs-daemon',
+        DSH_LAYERFS_CONTAINER_PREFIX: 'prefix-',
+        DSH_LAYERFS_DAEMON_HOST: 'host.docker.internal',
+        DSH_LAYERFS_STORE_CONTAINER: 'prefix-store',
+        DSH_LAYERFS_BUNDLE: '/bundle',
+        DSH_LAYERFS_TRACE_START: '1',
+      })
+      assert.equal(settings.storeContainer, 'prefix-store')
+      assert.equal(settings.bundle, '/bundle')
+      assert.equal(settings.traceStart, '1')
+      const env = layerfsEnvironment({}, settings)
+      assert.equal(env.DSH_LAYERFS_STORE_CONTAINER, 'prefix-store')
+      assert.equal(env.DSH_LAYERFS_BUNDLE, '/bundle')
+
+      const previous = {
+        DSH_LAYERFS_STORE_CONTAINER: process.env.DSH_LAYERFS_STORE_CONTAINER,
+        LAYERFS_STORE_CONTAINER: process.env.LAYERFS_STORE_CONTAINER,
+        DSH_LAYERFS_BUNDLE: process.env.DSH_LAYERFS_BUNDLE,
+        LAYERFS_NATIVE: process.env.LAYERFS_NATIVE,
+      }
+      delete process.env.DSH_LAYERFS_STORE_CONTAINER
+      delete process.env.LAYERFS_STORE_CONTAINER
+      delete process.env.DSH_LAYERFS_BUNDLE
+      const { loadLayerfs } = await import('../lib/layerfs-workspace.js')
+      const loaded = await loadLayerfs(settings)
+      assert.equal(loaded.client.bundleAtImport, '/bundle', 'the bundle is visible at import time')
+      assert.deepEqual(await loaded.client.call(), {
+        storeContainer: 'prefix-store',
+        bareStoreContainer: 'prefix-store',
+        bundle: '/bundle',
+        daemonHost: 'host.docker.internal',
+      })
+      await loaded.close()
+      assert.equal(process.env.DSH_LAYERFS_STORE_CONTAINER, undefined)
+      assert.equal(process.env.LAYERFS_STORE_CONTAINER, undefined)
+      assert.equal(process.env.DSH_LAYERFS_BUNDLE, undefined)
+      for (const [name, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    })
+  })
+})
+
+describe('LayerFS project initialization', () => {
+  it('initializes a missing project before forking its main branch', async () => {
+    await withTemp(async root => {
+      const home = join(root, 'home')
+      const source = join(root, 'source')
+      await writeWorkspace(source)
+      const actions = []
+      const client = {
+        options: { home, deploy: {} },
+        project: {
+          async init(path) {
+            actions.push(['init', path])
+            // project.init records the project as a directory under the home
+            await mkdir(join(home, 'proj'), { recursive: true })
+            return { kind: 'Initialized' }
+          },
+        },
+        branch: {
+          async fork(name, from) {
+            actions.push(['fork', name, from])
+            if (!existsSync(join(home, 'proj'))) throw Object.assign(new Error('project proj does not exist'), { code: 'NoSuchProject' })
+          },
+        },
+        workspace: {
+          async mount(branch) { return { sandbox: '1', path: `/workspaces/${branch}` } },
+          async commit() {},
+          async unmount() {},
+        },
+        fs: { async apply() {} },
+      }
+      const backend = new LayerFSBackend({ client, project: 'proj', output: join(root, 'out'), runId: 'run-9' })
+      const state = await backend.baseline(source, 'initial')
+      assert.equal(state.branch, 'ar-run-9-initial')
+      assert.deepEqual(actions, [
+        ['init', source],
+        ['fork', 'ar-run-9-initial', 'main'],
+      ])
+    })
+  })
+
+  it('does not initialize a project whose home entry already exists', async () => {
+    await withTemp(async root => {
+      const home = join(root, 'home')
+      await mkdir(join(home, 'proj'), { recursive: true })
+      const source = join(root, 'source')
+      await writeWorkspace(source)
+      const actions = []
+      const client = {
+        options: { home },
+        project: { async init() { actions.push('init') } },
+        branch: { async fork(name) { actions.push(['fork', name]) } },
+        workspace: {
+          async mount() { return { sandbox: '1', path: '/workspaces/1' } },
+          async commit() {},
+          async unmount() {},
+        },
+        fs: { async apply() {} },
+      }
+      const backend = new LayerFSBackend({ client, project: 'proj', output: join(root, 'out'), runId: 'run-10' })
+      await backend.baseline(source, 'initial')
+      assert.deepEqual(actions, [['fork', 'ar-run-10-initial']])
     })
   })
 })

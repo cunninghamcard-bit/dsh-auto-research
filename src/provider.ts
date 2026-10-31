@@ -34,6 +34,7 @@ import type {
   SubagentResult,
   SubagentRun,
   SubagentStartRequest,
+  WorkspaceState,
 } from './types.js'
 
 /** Out-of-process capability advertisement: no parent-enforced start features. */
@@ -191,15 +192,19 @@ function publicConfig(config: ResolvedConfig): Config {
   for (const [key, value] of Object.entries(workerEnv ?? {})) {
     if (!secret.test(key)) safeEnv[key] = value
   }
-  const safeLayerfs = layerfs && typeof layerfs === 'object'
-    ? layerfs.client
-      ? { project: layerfs.project ?? null }
-      : layerfs
-    : undefined
+  // The tri-state opt-out is part of the public contract: CONFIG.json must
+  // record `layerfs: false`, not silently drop the field.
+  const safeLayerfs: LayerFSBinding | false | undefined = layerfs === false
+    ? false
+    : layerfs && typeof layerfs === 'object'
+      ? layerfs.client
+        ? { project: layerfs.project ?? null }
+        : layerfs
+      : undefined
   return {
     ...rest,
     workerEnv: safeEnv,
-    ...(safeLayerfs ? { layerfs: safeLayerfs as LayerFSBinding } : {}),
+    ...(safeLayerfs !== undefined ? { layerfs: safeLayerfs } : {}),
   }
 }
 
@@ -243,9 +248,57 @@ function processAlive(pid: number): boolean {
 }
 
 /**
+ * Refuse a runtime root that is a symlink escaping the workspace.
+ *
+ * `.auto-research-methods` holds every branch artifact and the runner lock, so
+ * a planted symlink would redirect those writes outside the assigned
+ * checkout. A missing runtime root is fine (it is created later).
+ */
+export async function assertRuntimeRootContained(
+  workspaceRoot: string,
+  runtimeRoot: string,
+): Promise<void> {
+  let stats: Awaited<ReturnType<typeof fsp.lstat>>
+  try {
+    stats = await fsp.lstat(runtimeRoot)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
+    throw error
+  }
+  if (!stats.isSymbolicLink()) {
+    if (!stats.isDirectory()) {
+      throw new Error(`Auto-research runtime root is not a directory: ${runtimeRoot}`)
+    }
+    return
+  }
+  let realRoot: string
+  let realRuntime: string
+  try {
+    [realRoot, realRuntime] = await Promise.all([fsp.realpath(workspaceRoot), fsp.realpath(runtimeRoot)])
+  } catch (error) {
+    throw new Error(
+      `Auto-research runtime root is an unresolvable symlink: ${runtimeRoot} (${(error as Error).message})`,
+    )
+  }
+  if (!isContained(realRoot, realRuntime)) {
+    throw new Error(
+      `Auto-research runtime root is a symlink escaping the workspace: ${runtimeRoot} -> ${realRuntime}`,
+    )
+  }
+}
+
+/** A lock file that stayed unparsable this recently is still being written. */
+const LOCK_WRITE_GRACE_MS = 2000
+
+/**
  * Acquire `<runtimeRoot>/runner.lock` so two `subagent_auto_research`
  * invocations on one checkout fail loud instead of racing on `LATEST.json`.
- * A stale lock is reclaimed only when its owning PID is gone.
+ *
+ * The payload is written to a unique sibling first and then hard-linked into
+ * place, so a lock file is never observable empty or half-written. A stale
+ * lock is reclaimed only when its owning PID is gone; an unparsable lock that
+ * is younger than {@link LOCK_WRITE_GRACE_MS} is treated as live rather than
+ * unlinked, which closes the remaining creation window.
  */
 export async function acquireRunnerLock(
   runtimeRoot: string,
@@ -254,17 +307,27 @@ export async function acquireRunnerLock(
     cwd = runtimeRoot,
     pid = process.pid,
     alive = processAlive,
-  }: { cwd?: string; pid?: number; alive?: (pid: number) => boolean } = {},
+    now = Date.now,
+    writeGraceMs = LOCK_WRITE_GRACE_MS,
+  }: {
+    cwd?: string
+    pid?: number
+    alive?: (pid: number) => boolean
+    now?: () => number
+    writeGraceMs?: number
+  } = {},
 ): Promise<RunnerLock> {
   await fsp.mkdir(runtimeRoot, { recursive: true })
   const path = join(runtimeRoot, 'runner.lock')
-  const info = { pid, runId, cwd, started_at: new Date().toISOString() }
+  const info = { pid, runId, cwd, started_at: new Date(now()).toISOString() }
+  const payload = JSON.stringify(info, null, 2) + '\n'
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    let handle: Awaited<ReturnType<typeof fsp.open>> | null = null
+    const temporary = join(runtimeRoot, `.runner.lock.${pid}.${randomUUID()}`)
     try {
-      handle = await fsp.open(path, 'wx', 0o600)
-      await handle.writeFile(JSON.stringify(info, null, 2) + '\n')
-      await handle.close()
+      await fsp.writeFile(temporary, payload, { mode: 0o600 })
+      // link() is atomic and refuses an existing target, so the visible lock is
+      // always the complete payload.
+      await fsp.link(temporary, path)
       let released = false
       return {
         path,
@@ -281,13 +344,14 @@ export async function acquireRunnerLock(
         },
       }
     } catch (error) {
-      if (handle) await handle.close().catch(() => {})
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
       let saved: { pid?: unknown; runId?: unknown; started_at?: unknown } | null = null
+      let readable = true
       try {
         saved = JSON.parse(await fsp.readFile(path, 'utf8')) as { pid?: unknown; runId?: unknown }
       } catch {
         saved = null
+        readable = false
       }
       const owner = typeof saved?.pid === 'number' ? saved.pid : null
       if (owner !== null && alive(owner)) {
@@ -295,8 +359,20 @@ export async function acquireRunnerLock(
           `Another auto-research batch is already running for this checkout: ${path} (pid ${owner}, run ${String(saved?.runId ?? 'unknown')})`,
         )
       }
+      if (owner === null) {
+        // Either a writer that has not finished or a corrupt lock. Only a lock
+        // old enough to be certainly abandoned may be removed.
+        const stats = await fsp.stat(path).catch(() => null)
+        if (stats && now() - stats.mtimeMs < writeGraceMs) {
+          throw new Error(
+            `Another auto-research batch is starting for this checkout: ${path}${readable ? '' : ' (lock still being written)'}`,
+          )
+        }
+      }
       // Stale lock: reclaim only when the owner is definitely gone.
       await fsp.unlink(path).catch(() => {})
+    } finally {
+      await fsp.unlink(temporary).catch(() => {})
     }
   }
   throw new Error(`Could not acquire the auto-research runner lock: ${path}`)
@@ -392,6 +468,7 @@ export class AutoResearchProvider implements SubagentProvider {
     const workerProvider = this.workerProviderName()
     const workspaceRoot = await selectPlanWorkspace(cwd, plan as { workspace?: unknown })
     const runtimeRoot = join(workspaceRoot, '.auto-research-methods')
+    await assertRuntimeRootContained(workspaceRoot, runtimeRoot)
     const seed = resolve(workspaceRoot) !== resolve(cwd)
     const runId = randomUUID()
     const output = join(runtimeRoot, 'runs', runId)
@@ -407,6 +484,7 @@ export class AutoResearchProvider implements SubagentProvider {
     }
     const lock = await acquireRunnerLock(runtimeRoot, runId, { cwd })
     let manager: Awaited<ReturnType<typeof createWorkspaceManager>> | null = null
+    let initialState: WorkspaceState | null = null
     let runner: Runner | null = null
     let released = false
     const releaseLock = async (): Promise<void> => {
@@ -420,11 +498,16 @@ export class AutoResearchProvider implements SubagentProvider {
 
       const shellEnv = await resolveShellEnvironment(this.ctx, request.parent)
       const env: NodeJS.ProcessEnv & Record<string, unknown> = { ...process.env, ...shellEnv }
-      const layerfsConfig = this.config.layerfs && typeof this.config.layerfs === 'object' ? this.config.layerfs : null
+      const explicitLayerfs = this.config.layerfs
+      const layerfsConfig = explicitLayerfs && typeof explicitLayerfs === 'object' ? explicitLayerfs : null
       const layerfsSettings: LayerFSSettings | null = layerfsConfig?.client
         ? null
-        : resolveLayerfsConfig(env, layerfsConfig ?? false)
-      const layerfsEnv = layerfsEnvironment(env, layerfsSettings)
+        : resolveLayerfsConfig(env, explicitLayerfs === false ? false : layerfsConfig ?? undefined)
+      // An explicit opt-out also stops the session's LayerFS binding from
+      // leaking into worker environments.
+      const layerfsEnv = explicitLayerfs === false
+        ? {}
+        : layerfsEnvironment(env, layerfsSettings, explicitLayerfs)
       manager = await createWorkspaceManager({
         output,
         runId,
@@ -434,7 +517,6 @@ export class AutoResearchProvider implements SubagentProvider {
       })
 
       let sourceWorkspace = workspaceRoot
-      let initialState = null
       if (await pathExists(selectionFile)) {
         let latest = null
         try {
@@ -571,6 +653,15 @@ export class AutoResearchProvider implements SubagentProvider {
         },
       }
     } catch (error) {
+      if (initialState) {
+        // The adopted branch is mounted; a startup failure must not leave it
+        // behind when the manager (and its client) closes.
+        try {
+          await manager?.release(initialState, { discard: false })
+        } catch (releaseError) {
+          this.ctx.logger?.warn?.(`[auto-research] failed to release the adopted initial state: ${(releaseError as Error).message}`)
+        }
+      }
       await manager?.close().catch(() => {})
       await releaseLock().catch(() => {})
       throw error

@@ -113,9 +113,17 @@ export function runEvaluatorProcess(parts: EvaluatorProcessParts): Promise<Evalu
       resolvePromise({ code: null, timedOut, aborted, stdout, stderr, error: error as Error })
       return
     }
+    const escalate = (): void => {
+      terminate(child, 'SIGTERM')
+      // A process that ignores SIGTERM must still die; both the timeout and
+      // the abort path share one escalation timer.
+      if (hard) return
+      hard = setTimeout(() => terminate(child, 'SIGKILL'), 2000)
+      hard.unref?.()
+    }
     const onAbort = (): void => {
       aborted = true
-      terminate(child, 'SIGTERM')
+      escalate()
     }
     const settle = async (code: number | null, error?: Error): Promise<void> => {
       if (settled) return
@@ -142,9 +150,7 @@ export function runEvaluatorProcess(parts: EvaluatorProcessParts): Promise<Evalu
     })
     timer = setTimeout(() => {
       timedOut = true
-      terminate(child, 'SIGTERM')
-      hard = setTimeout(() => terminate(child, 'SIGKILL'), 2000)
-      hard.unref?.()
+      escalate()
     }, Math.max(1, timeoutMs))
     timer.unref?.()
     if (signal?.aborted) onAbort()

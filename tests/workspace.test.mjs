@@ -239,10 +239,10 @@ describe('LayerFS backend', () => {
     })
   })
 
-  it('rejects incomplete LayerFS clients and parent branches', async () => {
+  it('rejects incomplete LayerFS clients and parents without a workspace', async () => {
     assert.throws(() => new LayerFSBackend({ client: {}, output: '/tmp' }), /requires branch.fork/)
     const backend = new LayerFSBackend({ client: fakeLayerfs('/tmp', []), output: '/tmp' })
-    await assert.rejects(backend.fork({ id: 'x' }, 'child'), /parent branch/)
+    await assert.rejects(backend.fork({ id: 'x' }, 'child'), /parent workspace/)
   })
 })
 
