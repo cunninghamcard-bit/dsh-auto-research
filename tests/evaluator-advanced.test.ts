@@ -6,10 +6,10 @@ import {
   FrozenEvaluator,
   runEvaluatorProcess,
 } from '../lib/evaluator.js'
-import { withTemp, writeWorkspace } from './helpers.mjs'
+import { withTemp, writeWorkspace } from './helpers.ts'
 
 describe('extensionless evaluator classification', () => {
-  async function freeze(root, body, name = 'evaluator') {
+  async function freeze(root: string, body: string, name = 'evaluator'): Promise<any> {
     const source = join(root, name)
     await fsp.writeFile(source, body)
     const evaluator = new FrozenEvaluator({
@@ -108,7 +108,7 @@ describe('runEvaluatorProcess robustness', () => {
         stderrPath: join(root, 'spawn.err.log'),
         spawn: () => { throw new Error('spawn refused') },
       })
-      assert.match(result.error.message, /spawn refused/)
+      assert.match(result.error!.message, /spawn refused/)
     })
   })
 })
@@ -142,7 +142,7 @@ describe('frozen evaluator edge cases', () => {
       await evaluator.freeze()
       const result = await evaluator.evaluate(workspace, join(root, 'out', 'eval'))
       assert.equal(result.valid, false)
-      assert.match(result.reason, /not a single JSON object/)
+      assert.match(result.reason!, /not a single JSON object/)
     })
   })
 })

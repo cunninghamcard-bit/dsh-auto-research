@@ -12,7 +12,7 @@ import {
   validatePeerReview,
   validatePortfolio,
 } from '../lib/protocols.js'
-import { withTemp } from './helpers.mjs'
+import { withTemp } from './helpers.ts'
 
 describe('sampleMetricViews', () => {
   const metrics = ['a', 'b', 'c', 'd'].map(name => ({ name, definition: name }))
@@ -33,12 +33,12 @@ describe('sampleMetricViews', () => {
 
   it('projects diagnostics and parent rows onto the selected metrics', () => {
     const rows = [{ id: 'initial', parent: null, workspace: '/tmp/x', evaluation: { metrics: { a: 1, b: 2, c: 3 } } }]
-    const diagnostics = [{ name: 'a' }, { name: 'b' }, { name: 'c' }]
-    const [view] = sampleMetricViews({ metrics, subset: 1, count: 1, rows, diagnostics, rng: () => 0 })
+    const diagnostics = [{ name: 'a' }, { name: 'b' }, { name: 'c' }] as any
+    const view = sampleMetricViews({ metrics, subset: 1, count: 1, rows, diagnostics, rng: () => 0 })[0]!
     assert.equal(view.definitions.length, 1)
-    const key = view.definitions[0].name
+    const key = view.definitions[0]!.name
     assert.deepEqual(view.diagnostics.map(d => d.name), [key])
-    assert.deepEqual(Object.keys(view.rows[0].metrics), [key])
+    assert.deepEqual(Object.keys(view.rows[0]!.metrics), [key])
   })
 
   it('rejects impossible subset sizes and negative counts', () => {
@@ -49,7 +49,7 @@ describe('sampleMetricViews', () => {
 })
 
 describe('validatePortfolio', () => {
-  const proposal = (label, probability = 0.5) => ({
+  const proposal = (label: string, probability: any = 0.5) => ({
     bottleneck: `bottleneck ${label}`,
     mechanism: `mechanism ${label}`,
     expected_effect: `effect ${label}`,
@@ -60,7 +60,7 @@ describe('validatePortfolio', () => {
   it('accepts exactly the requested number of distinct hypotheses', () => {
     const normalized = validatePortfolio([proposal('one'), proposal('two')], { portfolioSize: 2, parentId: 'initial' })
     assert.equal(normalized.length, 2)
-    assert.equal(normalized[0].parent, 'initial')
+    assert.equal(normalized[0]!.parent, 'initial')
   })
 
   it('rejects wrong size, duplicates, empty fields, and out-of-range probabilities', () => {
@@ -74,7 +74,7 @@ describe('validatePortfolio', () => {
 })
 
 describe('readSharedCheckpoint', () => {
-  async function setup(root, files, summary = 'observed a gain; negative result retained') {
+  async function setup(root: string, files: Record<string, string>, summary = 'observed a gain; negative result retained') {
     for (const [name, body] of Object.entries(files)) {
       await mkdir(join(root, name, '..'), { recursive: true })
       await writeFile(join(root, name), body)
@@ -91,8 +91,8 @@ describe('readSharedCheckpoint', () => {
       const result = await readSharedCheckpoint(root)
       assert.match(result.summary, /negative result/)
       assert.equal(Object.keys(result.files).length, 2)
-      assert.equal(result.files['RESEARCH_CHECKPOINT.md'].text, '# checkpoint\n')
-      assert.match(result.files['RESEARCH_CHECKPOINT.md'].sha256, /^[0-9a-f]{64}$/)
+      assert.equal(result.files['RESEARCH_CHECKPOINT.md']!.text, '# checkpoint\n')
+      assert.match(result.files['RESEARCH_CHECKPOINT.md']!.sha256, /^[0-9a-f]{64}$/)
     })
   })
 
@@ -180,7 +180,7 @@ describe('buildZeroSynthesisContext', () => {
             'RESEARCH_CONTEXT/integer__mult__kappa0__verified.md': { text: '# topic' },
           },
         },
-      }],
+      }] as any[],
     })
     assert.match(text, /# Shared research context/)
     assert.match(text, /Objective: prove X/)
@@ -193,7 +193,7 @@ describe('buildZeroSynthesisContext', () => {
     assert.match(buildZeroSynthesisContext({}), /No RESEARCH_CONTEXT topic files/)
     const bundle = buildPeerEvidence({ objective: 'o', peers: [{ id: 'p1' }] })
     assert.equal(bundle.objective, 'o')
-    assert.match(bundle.scope, /not a shared proof/)
+    assert.match(bundle.scope as string, /not a shared proof/)
     assert.deepEqual(peerIdsOf(bundle), ['p1'])
   })
 })

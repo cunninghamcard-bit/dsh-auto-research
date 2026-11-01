@@ -87,6 +87,11 @@ export interface WorkerEnvRegistration {
 export declare class WorkerEnvRegistry {
     private readonly entries;
     private nextKey;
+    private readonly resolveCwd;
+    constructor(options?: {
+        /** Resolve the per-session assigned checkout (`ctx.workingDirectory.get`). */
+        resolveCwd?: (session: unknown, agent: unknown) => string | null;
+    });
     get size(): number;
     /** @returns every checkout that currently has a live worker. */
     checkouts(): string[];
@@ -108,15 +113,18 @@ export declare class WorkerEnvRegistry {
 export declare function sessionIdOf(agent: unknown): string | null;
 /** Whether `path` sits inside a `.auto-research-methods/runs/` runtime tree. */
 export declare function isInsideRuntimeRuns(path: string): boolean;
+/** `dsh`-owned names that a plugin contributor may never claim. */
+export declare const DSH_RESERVED_ENV_KEYS: Set<string>;
 /**
  * The `DSH_*` keys the `auto-research` contributor declares.
  *
  * The owned worker keys are always declared; a configured `workerEnv` adds
  * every well-formed `DSH_*` name (except `DSH_LAYERFS_*`, owned by
- * `@dsh-layerfs/host`). Other names cannot travel through a `dsh` shell
- * registry at all, so they stay in the prompt environment only.
+ * `@dsh-layerfs/host`, and the harness-reserved names). Other names cannot
+ * travel through a `dsh` shell registry at all, so they stay in the prompt
+ * environment only.
  */
-export declare function declaredWorkerEnvKeys(workerEnv?: Record<string, unknown>): Record<string, {
+export declare function declaredWorkerEnvKeys(workerEnv?: Record<string, unknown> | null): Record<string, {
     description: string;
 }>;
 /** One provider instance, normally created by the Cordis plugin entry. */
@@ -182,6 +190,11 @@ export declare class AutoResearchProvider implements SubagentProvider {
      * checkout or any `runs/` runtime tree is rejected the same way.
      */
     private assertNotRecursive;
+    /**
+     * The assigned checkout of one session, when the host exposes
+     * `ctx.workingDirectory.get(session)`.
+     */
+    private sessionWorkingDirectory;
     /**
      * Choose the worker provider. Explicit configuration wins (after validation);
      * otherwise external/non-inheriting providers are preferred over in-process

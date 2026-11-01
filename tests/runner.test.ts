@@ -11,11 +11,11 @@ import {
   validatePlan,
 } from '../lib/runner.js'
 import { createWorkspaceManager, inventory } from '../lib/layerfs-workspace.js'
-import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.mjs'
+import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
 
-const sha256 = data => createHash('sha256').update(data).digest('hex')
+const sha256 = (data: any) => createHash('sha256').update(data).digest('hex')
 
-function planFor(root, extra = {}) {
+function planFor(root: string, extra: any = {}): any {
   return {
     objective: 'Improve the fixture score',
     worker_prompt: 'Run one bounded fixture experiment and save evidence.',
@@ -42,13 +42,20 @@ function planFor(root, extra = {}) {
   }
 }
 
-async function setup(root, {
+async function setup(root: string, {
   state = { score: 1, metrics: { score: 1 } },
   worker = null,
   extraPlan = {},
   options = {},
   clock = fakeClock(),
   config = {},
+}: {
+  state?: any
+  worker?: any
+  extraPlan?: any
+  options?: any
+  clock?: any
+  config?: any
 } = {}) {
   const workspace = join(root, 'workspace')
   await writeWorkspace(workspace, state)
@@ -57,7 +64,7 @@ async function setup(root, {
   Object.assign(plan.options, options)
   const output = join(root, 'out')
   const manager = await createWorkspaceManager({ output, runId: 'run', env: {} })
-  const subagents = fakeSubagents(worker ?? (async (spec, index) => {
+  const subagents = fakeSubagents(worker ?? (async (spec: any, index: number) => {
     const target = spec.request.cwd
     await setState(target, { score: 2 + index, metrics: { score: 2 + index } })
     return { output: [], stopReason: 'completed' }
@@ -82,7 +89,7 @@ async function setup(root, {
   return { runner, subagents, manager, output, workspace, plan, clock }
 }
 
-async function writePortfolio(cwd, size = 2, parent = 'initial') {
+async function writePortfolio(cwd: string, size = 2, parent = 'initial') {
   await writeFile(join(cwd, 'PORTFOLIO.json'), JSON.stringify(Array.from({ length: size }, (_, index) => ({
     bottleneck: 'b' + index,
     mechanism: 'm' + index,
@@ -92,7 +99,7 @@ async function writePortfolio(cwd, size = 2, parent = 'initial') {
   }))))
 }
 
-async function writeCheckpoint(cwd, index, { review = true } = {}) {
+async function writeCheckpoint(cwd: string, index: number, { review = true }: { review?: boolean } = {}) {
   await writeFile(join(cwd, 'RESEARCH_CHECKPOINT.md'), `# checkpoint ${index}\n`)
   await mkdir(join(cwd, 'RESEARCH_CONTEXT'), { recursive: true })
   await writeFile(join(cwd, 'RESEARCH_CONTEXT', `topic__method__result__verified.md`), '# topic\n')
@@ -107,7 +114,7 @@ async function writeCheckpoint(cwd, index, { review = true } = {}) {
     const bundle = files.find(name => name.startsWith('peer-evidence-'))
     if (bundle) {
       const body = await readFile(join(cwd, 'SHARED_CONTEXT', bundle))
-      peers = { bundle: body, parsed: JSON.parse(body) }
+      peers = { bundle: body, parsed: JSON.parse(body as any) }
     }
   } catch {
     peers = null
@@ -115,7 +122,7 @@ async function writeCheckpoint(cwd, index, { review = true } = {}) {
   if (peers) {
     await writeFile(join(cwd, 'PEER-REVIEW.json'), JSON.stringify({
       manifest_sha256: sha256(peers.bundle),
-      reviews: peers.parsed.peers.map(peer => ({
+      reviews: peers.parsed.peers.map((peer: any) => ({
         peer_id: peer.id,
         finding: 'observed ' + peer.id,
         action: 'independent check',
@@ -148,9 +155,9 @@ describe('normalizeOptions / validatePlan', () => {
     assert.throws(() => validatePlan(base, { ...options, branches: 2, explorationMinutes: 0 }), /time budget/)
     assert.throws(() => validatePlan(base, { ...options, branches: 2, shareContext: true, sharingIntervalMinutes: 0 }), /sharing interval/)
     assert.throws(() => validatePlan({ ...base, metric_subset: 2 }, { ...options, branches: 2, rsiTop: true }), /metric definitions/)
-    assert.throws(() => validatePlan({ ...base, stall_seconds: 0 }, { ...options, branches: 2, rsiTop: true, metric_subset: 1, portfolio_size: 2, meaningful_gain: 0 }), /RSI/)
-    assert.throws(() => validatePlan({ ...base, meaningful_gain: -1 }, { ...options, branches: 2, rsiTop: true, metric_subset: 1, portfolio_size: 2, stall_seconds: 1 }), /meaningful_gain must be non-negative/)
-    assert.throws(() => validatePlan({ ...base, portfolio_size: 1 }, { ...options, branches: 2, rsiTop: true, metric_subset: 1, stall_seconds: 1, meaningful_gain: 0 }), /RSI/)
+    assert.throws(() => validatePlan({ ...base, stall_seconds: 0 }, { ...options, branches: 2, rsiTop: true, metric_subset: 1, portfolio_size: 2, meaningful_gain: 0 } as any), /RSI/)
+    assert.throws(() => validatePlan({ ...base, meaningful_gain: -1 }, { ...options, branches: 2, rsiTop: true, metric_subset: 1, portfolio_size: 2, stall_seconds: 1 } as any), /meaningful_gain must be non-negative/)
+    assert.throws(() => validatePlan({ ...base, portfolio_size: 1 }, { ...options, branches: 2, rsiTop: true, metric_subset: 1, stall_seconds: 1, meaningful_gain: 0 } as any), /RSI/)
   })
 
   it('ports provider_outcome diagnostics', () => {
@@ -207,8 +214,8 @@ describe('Runner batches', () => {
   it('triggers an RSI-top explore cohort on a stall and enforces portfolios', async () => {
     await withTemp(async root => {
       let tick = 1000
-      const clock = { now: () => { tick += 25; return tick }, sleep: async ms => { tick += ms } }
-      const worker = async (spec, index) => {
+      const clock = { now: () => { tick += 25; return tick }, sleep: async (ms: number) => { tick += ms } }
+      const worker = async (spec: any, index: number) => {
         const text = spec.request.prompt[0].text
         await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index, progress: 2 + index } })
         if (text.includes('RSI-top dashboard view')) await writePortfolio(spec.request.cwd, 2)
@@ -225,7 +232,7 @@ describe('Runner batches', () => {
       assert.equal(subagents.calls.length, 3)
       assert.match(subagents.calls[0].request.prompt[0].text, /RSI-top dashboard view/)
       const dashboard = JSON.parse(await readFile(join(runner.output, 'DASHBOARD.json'), 'utf8'))
-      const exploreRows = dashboard.trajectories.filter(row => row.phase === 'explore')
+      const exploreRows = dashboard.trajectories.filter((row: any) => row.phase === 'explore')
       assert.equal(exploreRows.length, 2)
       for (const row of exploreRows) assert.match(row.portfolio_sha256, /^[0-9a-f]{64}$/)
       assert.equal(result.leader.id, 'round-1-continue-1')
@@ -235,7 +242,7 @@ describe('Runner batches', () => {
 
   it('rejects an invalid explore portfolio without promoting it', async () => {
     await withTemp(async root => {
-      const worker = async (spec, index) => {
+      const worker = async (spec: any, index: number) => {
         const text = spec.request.prompt[0].text
         await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index, progress: 2 + index } })
         if (text.includes('RSI-top dashboard view')) {
@@ -250,7 +257,7 @@ describe('Runner batches', () => {
       })
       const result = await runner.run()
       const dashboard = JSON.parse(await readFile(join(runner.output, 'DASHBOARD.json'), 'utf8'))
-      const explore = dashboard.trajectories.filter(row => row.phase === 'explore')
+      const explore = dashboard.trajectories.filter((row: any) => row.phase === 'explore')
       assert.equal(explore.length, 2)
       for (const row of explore) assert.match(row.evaluation.reason, /RSI portfolio protocol/)
       assert.equal(result.leader.id, 'round-1-continue-1')
@@ -284,13 +291,13 @@ describe('Runner batches', () => {
       assert.equal(result.status, 'COMPLETED')
       assert.equal(result.stop_reason, 'phase_budget_reached')
       assert.equal(result.pending_workspaces.length, 1)
-      assert.equal(result.pending_workspaces[0].status, 'requires_independent_review')
+      assert.equal(result.pending_workspaces[0]!.status, 'requires_independent_review')
       await timedOut.runner.releaseAll()
     })
   })
 
   it('selects by primary score, verified progress, and retained research state', () => {
-    const make = (id, score, progress, time = 0) => ({
+    const make = (id: any, score: any, progress: any, time = 0) => ({
       id,
       time,
       evaluation: { valid: true, score, metrics: { score, progress } },
@@ -312,12 +319,12 @@ describe('Runner batches', () => {
 
   it('stops a running batch through stop()', async () => {
     await withTemp(async root => {
-      let release
-      let startedResolve
+      let release: any
+      let startedResolve: any
       const gate = new Promise(resolve => { release = resolve })
       const started = new Promise(resolve => { startedResolve = resolve })
-      const signalAborted = signal => signal?.aborted === true
-      const worker = async spec => {
+      const signalAborted = (signal: any) => signal?.aborted === true
+      const worker = async (spec: any) => {
         startedResolve()
         await gate
         return { output: [], stopReason: signalAborted(spec.signal) ? 'aborted' : 'completed' }
@@ -336,7 +343,7 @@ describe('Runner batches', () => {
 describe('cooperative cohorts', () => {
   it('shares checkpoints and peer reviews across epochs', async () => {
     await withTemp(async root => {
-      const worker = async (spec, index) => {
+      const worker = async (spec: any, index: number) => {
         await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index } })
         await writeCheckpoint(spec.request.cwd, index)
         return { output: [], stopReason: 'completed' }
@@ -360,16 +367,16 @@ describe('cooperative cohorts', () => {
       const shared = collaboration.epochs.at(-1).peer_bundle
       assert.match(await readFile(shared, 'utf8'), /PEER-EVIDENCE|peers|objective/)
       assert.equal((await stat(join(shared, '..', 'shared-context.md'))).isFile(), true)
-      const reviewed = collaboration.epochs.slice(1).flatMap(epoch => epoch.rows)
-      assert.ok(reviewed.some(row => row.peer_review_sha256))
-      assert.ok(collaboration.epochs[0].rows.every(row => !row.peer_review_sha256))
+      const reviewed = collaboration.epochs.slice(1).flatMap((epoch: any) => epoch.rows)
+      assert.ok(reviewed.some((row: any) => row.peer_review_sha256))
+      assert.ok(collaboration.epochs[0].rows.every((row: any) => !row.peer_review_sha256))
       await runner.releaseAll()
     })
   })
 
   it('restores the last verified completed state when a later epoch fails', async () => {
     await withTemp(async root => {
-      const worker = async (spec, index) => {
+      const worker = async (spec: any, index: number) => {
         const cwd = spec.request.cwd
         if (index === 2) {
           await writeFile(join(cwd, 'state.json'), '{"score":0}')
@@ -393,7 +400,7 @@ describe('cooperative cohorts', () => {
       const result = await runner.run()
       assert.equal(result.status, 'COMPLETED')
       const dashboard = JSON.parse(await readFile(join(runner.output, 'DASHBOARD.json'), 'utf8'))
-      const restored = dashboard.trajectories.find(row => row.retained_completed_id)
+      const restored = dashboard.trajectories.find((row: any) => row.retained_completed_id)
       assert.ok(restored)
       assert.match(restored.incomplete_successor, /^round-1-explore-epoch-2-branch-[12]$/)
       assert.match(restored.retained_completed_id, /^round-1-explore-epoch-1-branch-[12]$/)
@@ -406,7 +413,7 @@ describe('cooperative cohorts', () => {
 
   it('rejects a candidate that omits the peer review', async () => {
     await withTemp(async root => {
-      const worker = async (spec, index) => {
+      const worker = async (spec: any, index: number) => {
         await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index } })
         await writeCheckpoint(spec.request.cwd, index, { review: index < 2 })
         return { output: [], stopReason: 'completed' }

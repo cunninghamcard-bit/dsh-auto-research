@@ -15,6 +15,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   AutoResearchProvider,
+  DSH_RESERVED_ENV_KEYS,
   WorkerEnvRegistry,
   acquireRunnerLock,
   declaredWorkerEnvKeys,
@@ -29,7 +30,10 @@ import {
   validatePlan,
 } from '../lib/runner.js'
 import {
+  LAYERFS_ENV_KEYS,
   LayerFSBackend,
+  applyEnvironmentPatch,
+  applyLayerfsEnvironment,
   createWorkspaceManager,
   inventory,
   jsonDigest,
@@ -44,12 +48,12 @@ import {
   withoutLayerfsTrace,
   writeJsonAtomic,
 } from '../lib/layerfs-workspace.js'
-import { runEvaluatorProcess, scoreValue } from '../lib/evaluator.js'
-import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.mjs'
+import { FrozenEvaluator, runEvaluatorProcess, scoreValue } from '../lib/evaluator.js'
+import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
 
 const SANDBOX_PATH = `/workspaces/regression-${process.pid}`
 
-function planFor(root, extra = {}) {
+function planFor(root: string, extra: any = {}) {
   return {
     objective: 'Improve the fixture score',
     worker_prompt: 'Run one bounded fixture experiment and save evidence.',
@@ -76,14 +80,14 @@ function planFor(root, extra = {}) {
   }
 }
 
-async function setupRunner(root, {
+async function setupRunner(root: string, {
   worker,
   options = {},
   extraPlan = {},
   manager = null,
   subagents = null,
   deps = {},
-} = {}) {
+}: any = {}) {
   const workspace = join(root, 'workspace')
   await writeWorkspace(workspace, { score: 1, metrics: { score: 1 } })
   await writeStateEvaluator(join(root, 'evaluator.mjs'))
@@ -113,26 +117,26 @@ async function setupRunner(root, {
   return { runner, subagents: service, manager: workspaceManager, output, workspace, plan }
 }
 
-function hostClient(root, actions, { unmount } = {}) {
+function hostClient(root: string, actions: any[], { unmount }: any = {}): any {
   const mounts = join(root, 'mounts')
   return {
     branch: {
-      async fork(name, from) {
+      async fork(name: any, from: any) {
         actions.push(['fork', name, from])
         await mkdir(join(mounts, name), { recursive: true })
       },
     },
     workspace: {
-      async mount(name) {
+      async mount(name: any) {
         actions.push(['mount', name])
         const path = join(mounts, name)
         await mkdir(path, { recursive: true })
         return { sandbox: name, path }
       },
-      async commit(handle, message) {
+      async commit(handle: any, message: any) {
         actions.push(['commit', handle.sandbox, message])
       },
-      async unmount(handle, discard) {
+      async unmount(handle: any, discard: any) {
         actions.push(['unmount', handle.sandbox, discard])
         if (unmount) await unmount(handle, discard)
       },
@@ -143,31 +147,31 @@ function hostClient(root, actions, { unmount } = {}) {
   }
 }
 
-function sandboxClient(actions) {
+function sandboxClient(actions: any[]): any {
   const client = {
     branch: {
-      async fork(name, from) {
+      async fork(name: any, from: any) {
         actions.push(['fork', name, from])
       },
     },
     workspace: {
-      async mount(name) {
+      async mount(name: any) {
         actions.push(['mount', name])
         return { sandbox: 'sandbox-1', path: SANDBOX_PATH }
       },
-      async commit(handle, message) {
+      async commit(handle: any, message: any) {
         actions.push(['commit', handle.sandbox, message])
       },
-      async unmount(handle, discard) {
+      async unmount(handle: any, discard: any) {
         actions.push(['unmount', handle.sandbox, discard])
       },
     },
     fs: {
-      async apply(branch, changes, message) {
+      async apply(branch: any, changes: any, message: any) {
         actions.push([
           'apply',
           branch,
-          changes.map(change => ({
+          changes.map((change: any) => ({
             op: change.op,
             path: change.path,
             content: change.content === undefined ? undefined : Buffer.from(change.content).toString('utf8'),
@@ -183,7 +187,7 @@ function sandboxClient(actions) {
   return client
 }
 
-async function providerFixture(root, { config = {}, shellEnv = null, plan: planOverride = null } = {}) {
+async function providerFixture(root: string, { config = {}, shellEnv = null, plan: planOverride = null }: any = {}) {
   const cwd = join(root, 'repo')
   await writeWorkspace(cwd, { score: 1, metrics: { score: 1 } })
   await writeStateEvaluator(join(cwd, 'evaluator.mjs'))
@@ -192,7 +196,7 @@ async function providerFixture(root, { config = {}, shellEnv = null, plan: planO
     await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
     return { output: [{ type: 'text', text: 'worker done' }], stopReason: 'completed' }
   })
-  const ctx = { subagents, logger: { info() {}, warn() {} } }
+  const ctx: any = { subagents, logger: { info() {}, warn() {} } }
   if (shellEnv) ctx.shellEnv = shellEnv
   const provider = new AutoResearchProvider({
     ctx,
@@ -239,7 +243,7 @@ export class LayerFS {
         const result = await handle.result
         assert.equal(result.stopReason, 'completed', String(result.diagnostic ?? ''))
         const runs = await readdir(join(cwd, '.auto-research-methods', 'runs'))
-        const config = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'runs', runs[0], 'CONFIG.json'), 'utf8'))
+        const config = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'runs', runs[0]!, 'CONFIG.json'), 'utf8'))
         assert.equal(config.layerfs, false)
         assert.doesNotMatch(subagents.calls[0].request.prompt[0].text, /DSH_LAYERFS_PROJECT/)
         const latest = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'LATEST.json'), 'utf8'))
@@ -317,7 +321,7 @@ describe('P1-2: atomic runner lock and runtime containment', () => {
 
   it('releases an adopted initial state when Runner construction fails', async () => {
     await withTemp(async root => {
-      const actions = []
+      const actions: any[] = []
       const client = hostClient(root, actions)
       const { cwd, provider, plan } = await providerFixture(root, {
         config: { layerfs: { project: 'p', client } },
@@ -350,12 +354,12 @@ describe('P1-2: atomic runner lock and runtime containment', () => {
 describe('P1-3/P1-8: no branch state leaks on sibling or cohort failure', () => {
   it('records fulfilled siblings when another branch rejects and releases them later', async () => {
     await withTemp(async root => {
-      let rejectFirst = null
-      let failingReady
+      let rejectFirst: any = null
+      let failingReady: any
       const failingStarted = new Promise(resolve => { failingReady = resolve })
       const subagents = {
         list: () => ['worker'],
-        async startActivation(spec) {
+        async startActivation(spec: any) {
           // Branch start order is not guaranteed; identify the sibling by its
           // checkout so the fulfilled one is always round-1-explore-2.
           if (String(spec.request.cwd).includes('round-1-explore-2')) {
@@ -375,12 +379,12 @@ describe('P1-3/P1-8: no branch state leaks on sibling or cohort failure', () => 
           }
         },
       }
-      const released = []
+      const released: any[] = []
       const { runner, manager } = await setupRunner(root, {
         subagents,
         options: { forkAndFlush: true },
       })
-      let siblingEvaluatedResolve
+      let siblingEvaluatedResolve: any
       const siblingEvaluated = new Promise(resolve => { siblingEvaluatedResolve = resolve })
       const evaluate = runner.evaluator.evaluate.bind(runner.evaluator)
       runner.evaluator.evaluate = async (workspace, folder, options) => {
@@ -389,7 +393,7 @@ describe('P1-3/P1-8: no branch state leaks on sibling or cohort failure', () => 
         return value
       }
       const release = manager.release.bind(manager)
-      manager.release = async (state, options) => {
+      manager.release = async (state: any, options: any) => {
         released.push(state)
         return release(state, options)
       }
@@ -401,7 +405,7 @@ describe('P1-3/P1-8: no branch state leaks on sibling or cohort failure', () => 
       const sibling = runner.abandoned.find(row => row.id === 'round-1-explore-2')
       const siblingState = sibling?._state
       assert.ok(siblingState, 'the fulfilled sibling is recorded with its state')
-      assert.ok(runner.pendingWorkspaces().some(entry => entry.workspace.includes('round-1-explore-2')))
+      assert.ok(runner.pendingWorkspaces().some(entry => String(entry.workspace).includes('round-1-explore-2')))
       await runner.releaseAll()
       assert.ok(released.includes(siblingState), 'releaseAll released the fulfilled sibling state')
       assert.equal(runner.pendingWorkspaces().length, 0)
@@ -410,7 +414,7 @@ describe('P1-3/P1-8: no branch state leaks on sibling or cohort failure', () => 
 
   it('releases every cohort state when retainCompletedState throws', async () => {
     await withTemp(async root => {
-      const worker = async (spec, index) => {
+      const worker = async (spec: any, index: any) => {
         await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index } })
         await writeFile(join(spec.request.cwd, 'SHARED_CHECKPOINT.json'), JSON.stringify({
           summary: `verified ${index}`,
@@ -429,9 +433,9 @@ describe('P1-3/P1-8: no branch state leaks on sibling or cohort failure', () => 
         extraPlan: { evaluation_seconds: 0.5 },
       })
       manager.retainCompletedState = async () => { throw new Error('retain exploded') }
-      const released = []
+      const released: any[] = []
       const release = manager.release.bind(manager)
-      manager.release = async (state, options) => {
+      manager.release = async (state: any, options: any) => {
         released.push(state)
         return release(state, options)
       }
@@ -448,7 +452,7 @@ describe('P1-3/P1-8: no branch state leaks on sibling or cohort failure', () => 
 describe('P1-4: bounded worker termination', () => {
   it('disposes an activation that ignores abort and stops waiting after the grace', async () => {
     await withTemp(async root => {
-      let started
+      let started: any
       const startedPromise = new Promise(resolve => { started = resolve })
       let disposed = 0
       const subagents = {
@@ -515,7 +519,7 @@ describe('P1-6: a failed release keeps the state retryable', () => {
       // Deterministic per branch: activation order is not guaranteed, so the
       // score comes from the checkout, making round-1-explore-2 the leader and
       // round-1-explore-1 the first (failing) release.
-      const worker = async spec => {
+      const worker = async (spec: any) => {
         const score = String(spec.request.cwd).includes('explore-1') ? 2 : 3
         await setState(spec.request.cwd, { score, metrics: { score } })
         return { output: [], stopReason: 'completed' }
@@ -527,7 +531,7 @@ describe('P1-6: a failed release keeps the state retryable', () => {
       let releaseCalls = 0
       let closes = 0
       const release = manager.release.bind(manager)
-      manager.release = async (state, options) => {
+      manager.release = async (state: any, options: any) => {
         releaseCalls += 1
         if (releaseCalls === 1) throw new Error('release unavailable')
         return release(state, options)
@@ -537,7 +541,7 @@ describe('P1-6: a failed release keeps the state retryable', () => {
       const failed = runner.rows.find(row => row.id === 'round-1-explore-1')
       assert.ok(failed?._state, 'the handle is retained after the failed release')
       assert.notEqual(failed._released, true)
-      assert.ok(runner.pendingWorkspaces().some(entry => entry.workspace.includes('round-1-explore-1')))
+      assert.ok(runner.pendingWorkspaces().some(entry => String(entry.workspace).includes('round-1-explore-1')))
       assert.equal(closes, 0, 'the manager stays open while a state is mounted')
       await runner.releaseAll()
       assert.equal(failed._state, null)
@@ -553,7 +557,7 @@ describe('P1-7: LayerFS post-mount cleanup and staging forks', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const client = sandboxClient(actions)
       client.fs.apply = async () => { throw new Error('apply exploded') }
       const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-1', retryBaseDelayMs: 1 })
@@ -565,7 +569,7 @@ describe('P1-7: LayerFS post-mount cleanup and staging forks', () => {
 
   it('unmounts with discard and removes staging when adopt materialization fails', async () => {
     await withTemp(async root => {
-      const actions = []
+      const actions: any[] = []
       const client = sandboxClient(actions)
       client.fs.read = async () => ({ text: '' })
       client.fs.list = async () => { throw new Error('list exploded') }
@@ -580,7 +584,7 @@ describe('P1-7: LayerFS post-mount cleanup and staging forks', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const backend = new LayerFSBackend({
         client: sandboxClient(actions),
         output: join(root, 'out'),
@@ -595,7 +599,7 @@ describe('P1-7: LayerFS post-mount cleanup and staging forks', () => {
       const forkIndex = actions.findIndex(action => action[0] === 'fork')
       assert.ok(applyIndex >= 0, 'the staged parent was published')
       assert.ok(forkIndex > applyIndex, 'the child branch was forked after the publish')
-      const published = actions[applyIndex][2].map(change => change.path)
+      const published = actions[applyIndex][2].map((change: any) => change.path)
       assert.ok(published.includes('/uncommitted.txt'))
       assert.equal(child.staging, true)
     })
@@ -633,7 +637,7 @@ describe('P1-9: explicit LayerFS fields and precedence', () => {
       DSH_LAYERFS_TRACE_START: '0',
     }
     const settings = resolveLayerfsConfig(ambient, fields)
-    for (const [key, value] of Object.entries(fields)) assert.equal(settings[key], value, key)
+    for (const [key, value] of Object.entries(fields)) assert.equal((settings as any)[key], value, key)
     const environment = layerfsEnvironment(ambient, settings)
     assert.equal(environment.DSH_LAYERFS_DOCKER, '/explicit/docker.sock')
     assert.equal(environment.DSH_LAYERFS_IMAGE, 'explicit-image')
@@ -649,7 +653,7 @@ describe('P1-9: explicit LayerFS fields and precedence', () => {
 describe('P2-1: an empty peer epoch still writes collaboration state', () => {
   it('returns null from publishPeers and records the epoch', async () => {
     await withTemp(async root => {
-      const worker = async (spec, index) => {
+      const worker = async (spec: any, index: any) => {
         await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index } })
         return { output: [], stopReason: 'completed' }
       }
@@ -677,7 +681,7 @@ describe('P2-1: an empty peer epoch still writes collaboration state', () => {
  * Repair round: one block per item of the complete repair specification.
  * ------------------------------------------------------------------------- */
 
-function digestText(text) {
+function digestText(text: string) {
   return createHash('sha256').update(text).digest('hex')
 }
 
@@ -686,7 +690,7 @@ function digestText(text) {
  * a shared checkpoint, and — from the second epoch on — a peer review of the
  * snapshot this branch actually received.
  */
-async function writeCooperationArtifacts(cwd, score) {
+async function writeCooperationArtifacts(cwd: string, score: number) {
   await setState(cwd, { score, metrics: { score } })
   await writeFile(join(cwd, 'SHARED_CHECKPOINT.json'), JSON.stringify({
     summary: `verified ${score}`,
@@ -705,7 +709,7 @@ async function writeCooperationArtifacts(cwd, score) {
   const bundle = JSON.parse(text)
   await writeFile(join(cwd, 'PEER-REVIEW.json'), JSON.stringify({
     manifest_sha256: digestText(text),
-    reviews: (bundle.peers ?? []).map(peer => ({
+    reviews: (bundle.peers ?? []).map((peer: any) => ({
       peer_id: peer.id,
       finding: 'peer evidence observed',
       action: 'independent check',
@@ -714,7 +718,7 @@ async function writeCooperationArtifacts(cwd, score) {
 }
 
 /** A client whose Sandbox mount is only visible inside its Sandbox. */
-function sandboxClientWith(actions, overrides = {}) {
+function sandboxClientWith(actions: any[], overrides: any = {}) {
   const client = sandboxClient(actions)
   Object.assign(client.fs, overrides.fs ?? {})
   Object.assign(client.workspace, overrides.workspace ?? {})
@@ -723,7 +727,7 @@ function sandboxClientWith(actions, overrides = {}) {
 
 describe('R1/R4: repository hygiene', () => {
   it('derives every E2E path from the repository or the home directory', async () => {
-    const support = await import('./e2e-support.mjs')
+    const support = await import('./e2e-support.ts')
     const testsDir = dirname(fileURLToPath(import.meta.url))
     assert.equal(
       support.DSH_ROOT,
@@ -755,7 +759,7 @@ describe('R1/R4: repository hygiene', () => {
       process.env.LAYERFS_DOCKER = socket
       process.env.LAYERFS_BUNDLE = bundle
       try {
-        const fresh = await import(`./e2e-support.mjs?probe=${process.pid}-${Date.now()}`)
+        const fresh = await import(`./e2e-support.ts?probe=${process.pid}-${Date.now()}`)
         assert.equal(fresh.LAYERFS_DOCKER, socket)
         assert.equal(fresh.LAYERFS_BUNDLE, bundle)
         // The bundle and daemon files exist, so a file-existence probe would
@@ -870,14 +874,14 @@ describe('R5: worker shell environment injection', () => {
   })
 
   it('registers its contributor on the real ctx.shellEnv service shape', () => {
-    let registered = null
+    let registered: any = null
     let disposedWith = null
     const provider = new AutoResearchProvider({
       ctx: {
         subagents: fakeSubagents(async () => ({ output: [], stopReason: 'completed' })),
         logger: {},
         shellEnv: {
-          register(contributor) {
+          register(contributor: any) {
             registered = contributor
             return () => { disposedWith = contributor }
           },
@@ -898,9 +902,9 @@ describe('R5: worker shell environment injection', () => {
       await writeWorkspace(cwd, { score: 1, metrics: { score: 1 } })
       await writeStateEvaluator(join(cwd, 'evaluator.mjs'))
       const plan = planFor(cwd)
-      let contributor = null
-      const workerEnvs = []
-      const coordinatorEnvs = []
+      let contributor: any = null
+      const workerEnvs: any[] = []
+      const coordinatorEnvs: any[] = []
       const subagents = fakeSubagents(async spec => {
         const header = { id: 'child-1', cwd: spec.request.cwd, origin: 'subagent' }
         workerEnvs.push(contributor.resolve({ agent: { session: { header } }, callId: 'bash-1', rootCallId: 'bash-1' }))
@@ -916,7 +920,7 @@ describe('R5: worker shell environment injection', () => {
         ctx: {
           subagents,
           logger: { info() {}, warn() {} },
-          shellEnv: { register(value) { contributor = value; return () => {} } },
+          shellEnv: { register(value: any) { contributor = value; return () => {} } },
         },
         config: {
           workerProvider: 'worker',
@@ -948,7 +952,7 @@ describe('R5: worker shell environment injection', () => {
 
 describe('R6: ShellEnvRegistry.collect contract and trace hygiene', () => {
   it('passes a complete tool execution to collect()', async () => {
-    const seen = []
+    const seen: any[] = []
     const merged = await resolveShellEnvironment({
       shellEnv: {
         collect(execution) {
@@ -970,7 +974,7 @@ describe('R6: ShellEnvRegistry.collect contract and trace hygiene', () => {
   it('still merges resolve(), snapshot(), env and contributors', async () => {
     const service = {
       env: { A: '1' },
-      async resolve(execution) { return { B: execution.callId === 'auto-research-env' ? '2' : 'wrong' } },
+      async resolve(execution: any) { return { B: execution.callId === 'auto-research-env' ? '2' : 'wrong' } },
       snapshot() { return { C: '3' } },
       contributors: [{ env: { D: '4' } }],
     }
@@ -1014,7 +1018,7 @@ describe('R6: ShellEnvRegistry.collect contract and trace hygiene', () => {
         await handle.result
         const runs = await readdir(join(cwd, '.auto-research-methods', 'runs'))
         const launch = JSON.parse(await readFile(
-          join(cwd, '.auto-research-methods', 'runs', runs[0], 'round-1-continue-1', 'LAUNCH.json'),
+          join(cwd, '.auto-research-methods', 'runs', runs[0]!, 'round-1-continue-1', 'LAUNCH.json'),
           'utf8',
         ))
         for (const key of keys) assert.equal(launch.environment.includes(key), false, key)
@@ -1032,7 +1036,7 @@ describe('R6: ShellEnvRegistry.collect contract and trace hygiene', () => {
 describe('R7: multi-epoch cooperative cohorts keep every epoch and its ownership', () => {
   it('records both epochs once and transfers the resumed branch ownership', async () => {
     await withTemp(async root => {
-      const worker = async spec => {
+      const worker = async (spec: any) => {
         await writeCooperationArtifacts(spec.request.cwd, 2)
         return { output: [], stopReason: 'completed' }
       }
@@ -1049,12 +1053,12 @@ describe('R7: multi-epoch cooperative cohorts keep every epoch and its ownership
         },
         extraPlan: { evaluation_seconds: 1 },
       })
-      const commits = []
-      const releases = []
+      const commits: any[] = []
+      const releases: any[] = []
       const commit = manager.commit.bind(manager)
       const release = manager.release.bind(manager)
-      manager.commit = async (state, options) => { commits.push(options?.message ?? ''); return commit(state, options) }
-      manager.release = async (state, options) => { releases.push(state); return release(state, options) }
+      manager.commit = async (state: any, options: any) => { commits.push(options?.message ?? ''); return commit(state, options) }
+      manager.release = async (state: any, options: any) => { releases.push(state); return release(state, options) }
 
       const result = await runner.run()
       assert.equal(result.status, 'COMPLETED')
@@ -1068,7 +1072,7 @@ describe('R7: multi-epoch cooperative cohorts keep every epoch and its ownership
       assert.equal(new Set(runner.rows.map(row => row.id)).size, runner.rows.length)
       const dashboard = JSON.parse(await readFile(join(output, 'DASHBOARD.json'), 'utf8'))
       assert.equal(dashboard.trajectories.length, 5)
-      assert.equal(new Set(dashboard.trajectories.map(row => row.id)).size, 5)
+      assert.equal(new Set(dashboard.trajectories.map((row: any) => row.id)).size, 5)
 
       // Epoch 0 owns the forked state; epoch 1 resumes that same state. Only the
       // returned rows may own it so `recycle` can commit/unmount them.
@@ -1092,7 +1096,7 @@ describe('R8: the runner lock precedes every artifact write', () => {
       await writeWorkspace(seed, { score: 1, metrics: { score: 1 } })
       await writeStateEvaluator(join(seed, 'evaluator.mjs'))
       await mkdir(join(cwd, '.auto-research-methods'), { recursive: true })
-      const gate = Promise.withResolvers()
+      const gate = Promise.withResolvers<void>()
       const subagents = fakeSubagents(async spec => {
         await gate.promise
         await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
@@ -1215,10 +1219,10 @@ describe('R10: transient LayerFS startup failures and stale mounts', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const client = sandboxClientWith(actions, {
         workspace: {
-          async commit(handle, message) {
+          async commit(handle: any, message: any) {
             actions.push(['commit', message])
             throw Object.assign(new Error('branch head moved since mount'), { code: 'headMovedSinceMount' })
           },
@@ -1239,10 +1243,10 @@ describe('R10: transient LayerFS startup failures and stale mounts', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const client = sandboxClientWith(actions, {
         workspace: {
-          async unmount(handle, discard) {
+          async unmount(handle: any, discard: any) {
             actions.push(['unmount', discard])
             if (!discard) throw Object.assign(new Error('head moved since mount'), { code: 'headMovedSinceMount' })
           },
@@ -1251,7 +1255,10 @@ describe('R10: transient LayerFS startup failures and stale mounts', () => {
       const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-r10b', retryBaseDelayMs: 1 })
       const state = await backend.baseline(source, 'initial')
       await backend.release(state)
+      // The baseline remount discards its pre-baseline Sandbox view; the
+      // release then falls back from a stale `discard: false` to `discard: true`.
       assert.deepEqual(actions.filter(action => action[0] === 'unmount'), [
+        ['unmount', true],
         ['unmount', false],
         ['unmount', true],
       ])
@@ -1262,12 +1269,12 @@ describe('R10: transient LayerFS startup failures and stale mounts', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const client = sandboxClientWith(actions, {
         workspace: {
-          async unmount(handle, discard) {
+          async unmount(handle: any, discard: any) {
             actions.push(['unmount', discard])
-            throw new Error('permission denied')
+            if (!discard) throw new Error('permission denied')
           },
         },
       })
@@ -1281,7 +1288,7 @@ describe('R10: transient LayerFS startup failures and stale mounts', () => {
 describe('R11: a superseded leader is released in recycle', () => {
   it('commits and unmounts the defeated leader instead of holding it', async () => {
     await withTemp(async root => {
-      const worker = async (spec, index) => {
+      const worker = async (spec: any, index: any) => {
         await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index } })
         return { output: [], stopReason: 'completed' }
       }
@@ -1309,13 +1316,13 @@ describe('R11: a superseded leader is released in recycle', () => {
 describe('R12: paginated branch reads and listing cursors', () => {
   it('reads a multi-page branch file to the end', async () => {
     await withTemp(async root => {
-      const actions = []
+      const actions: any[] = []
       const client = sandboxClient(actions)
-      const pages = []
-      client.fs.list = async (branch, path) => (path === '/'
+      const pages: any[] = []
+      client.fs.list = async (branch: any, path: any) => (path === '/'
         ? { items: [{ name: 'big.txt', type: 'file' }], hasMore: false }
         : { items: [], hasMore: false })
-      client.fs.read = async (branch, path, startLine) => {
+      client.fs.read = async (branch: any, path: any, startLine: any) => {
         pages.push(startLine)
         if (startLine === undefined) return { text: 'aaa\n', nextLine: 2000 }
         if (startLine === 2000) return { text: 'bbb\n', nextLine: 4000 }
@@ -1332,10 +1339,10 @@ describe('R12: paginated branch reads and listing cursors', () => {
     await withTemp(async root => {
       const client = sandboxClient([])
       let reads = 0
-      client.fs.list = async (branch, path) => (path === '/'
+      client.fs.list = async (branch: any, path: any) => (path === '/'
         ? { items: [{ name: 'stuck.txt', type: 'file' }], hasMore: false }
         : { items: [], hasMore: false })
-      client.fs.read = async (branch, path, startLine) => {
+      client.fs.read = async (branch: any, path: any, startLine: any) => {
         reads += 1
         return { text: 'x', nextLine: 5 }
       }
@@ -1348,16 +1355,16 @@ describe('R12: paginated branch reads and listing cursors', () => {
 
   it('follows nextPagePos and never re-reads a page', async () => {
     await withTemp(async root => {
-      const positions = []
+      const positions: any[] = []
       const client = sandboxClient([])
-      client.fs.list = async (branch, path, pageSize, pagePos) => {
+      client.fs.list = async (branch: any, path: any, pageSize: any, pagePos: any) => {
         positions.push([path, pagePos])
         if (path !== '/') return { items: [], hasMore: false }
         if (pagePos === 0) return { items: [{ name: 'a.txt', type: 'file' }], hasMore: true, nextPagePos: 5000 }
         if (pagePos === 5000) return { items: [{ name: 'b.txt', type: 'file' }], hasMore: false }
         throw new Error('unexpected cursor ' + pagePos)
       }
-      client.fs.read = async (branch, path) => `content of ${path}\n`
+      client.fs.read = async (branch: any, path: any) => `content of ${path}\n`
       const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-r12c', retryBaseDelayMs: 1 })
       const state = await backend.adopt('ar-run-r12-leader', 'initial')
       assert.deepEqual(positions.filter(([path]) => path === '/').map(([, pos]) => pos), [0, 5000])
@@ -1437,18 +1444,18 @@ describe('R15: canonical distinct metric values', () => {
         id: 'a',
         parent: 'initial',
         workspace: join(root, 'a'),
-        evaluation: { valid: true, score: 1, metrics: { shape: { x: 1, y: 2 } } },
+        evaluation: { valid: true, score: 1, metrics: { shape: { x: 1, y: 2 } } as any },
       })
       runner.rows.push({
         id: 'b',
         parent: 'initial',
         workspace: join(root, 'b'),
-        evaluation: { valid: true, score: 2, metrics: { shape: { y: 2, x: 1 } } },
+        evaluation: { valid: true, score: 2, metrics: { shape: { y: 2, x: 1 } } as any },
       })
       const [diagnostic] = runner.metricDiagnostics()
-      assert.equal(diagnostic.observations, 2)
-      assert.equal(diagnostic.distinct_values, 1)
-      assert.equal(diagnostic.constant_in_observed_checkpoints, true)
+      assert.equal(diagnostic!.observations, 2)
+      assert.equal(diagnostic!.distinct_values, 1)
+      assert.equal(diagnostic!.constant_in_observed_checkpoints, true)
     })
   })
 
@@ -1462,15 +1469,15 @@ describe('R15: canonical distinct metric values', () => {
         id: 'a',
         parent: 'initial',
         workspace: join(root, 'a'),
-        evaluation: { valid: true, score: 1, metrics: { shape: { x: 1, y: 2 } } },
+        evaluation: { valid: true, score: 1, metrics: { shape: { x: 1, y: 2 } } as any },
       })
       runner.rows.push({
         id: 'b',
         parent: 'initial',
         workspace: join(root, 'b'),
-        evaluation: { valid: true, score: 2, metrics: { shape: { x: 1, y: 3 } } },
+        evaluation: { valid: true, score: 2, metrics: { shape: { x: 1, y: 3 } } as any },
       })
-      assert.equal(runner.metricDiagnostics()[0].distinct_values, 2)
+      assert.equal(runner.metricDiagnostics()[0]!.distinct_values, 2)
     })
   })
 })
@@ -1518,12 +1525,12 @@ describe('R17: an unexpected branch error preserves its workspace', () => {
         },
       }
       const { runner, manager } = await setupRunner(root, { subagents })
-      const commits = []
-      const releases = []
+      const commits: any[] = []
+      const releases: any[] = []
       const commit = manager.commit.bind(manager)
       const release = manager.release.bind(manager)
-      manager.commit = async (state, options) => { commits.push(options?.message ?? ''); return commit(state, options) }
-      manager.release = async (state, options) => { releases.push(options ?? {}); return release(state, options) }
+      manager.commit = async (state: any, options: any) => { commits.push(options?.message ?? ''); return commit(state, options) }
+      manager.release = async (state: any, options: any) => { releases.push(options ?? {}); return release(state, options) }
       await assert.rejects(runner.run(), /worker exploded/)
       assert.ok(commits.some(message => /^auto-research: unverified /.test(message)), commits.join('\n'))
       assert.ok(releases.length >= 1)
@@ -1540,7 +1547,7 @@ describe('R18: prototype-safe staging and retained-state edges', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const backend = new LayerFSBackend({
         client: sandboxClient(actions),
         output: join(root, 'out'),
@@ -1552,15 +1559,15 @@ describe('R18: prototype-safe staging and retained-state edges', () => {
       await writeFile(join(state.path, 'toString'), 'str\n')
       actions.length = 0
       await backend.commit(state, { message: 'add' })
-      const written = actions.find(action => action[0] === 'apply')[2].map(change => change.path)
+      const written = actions.find(action => action[0] === 'apply')[2].map((change: any) => change.path)
       assert.ok(written.includes('/constructor'), written.join(','))
       assert.ok(written.includes('/toString'))
       await rm(join(state.path, 'constructor'))
       actions.length = 0
       await backend.commit(state, { message: 'remove' })
       const removed = actions.find(action => action[0] === 'apply')[2]
-        .filter(change => change.op === 'rm')
-        .map(change => change.path)
+        .filter((change: any) => change.op === 'rm')
+        .map((change: any) => change.path)
       assert.deepEqual(removed, ['/constructor'])
     })
   })
@@ -1569,18 +1576,18 @@ describe('R18: prototype-safe staging and retained-state edges', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const client = {
-        branch: { async fork(name) { actions.push(['fork', name]) } },
+        branch: { async fork(name: any) { actions.push(['fork', name]) } },
         workspace: {
           async mount() { return { sandbox: '1', path: SANDBOX_PATH } },
           async commit() { actions.push(['commit']) },
           async unmount() {},
         },
         fs: {
-          async mkdir(branch, path) { actions.push(['mkdir', path]) },
-          async write(branch, path) { actions.push(['write', path]) },
-          async rm(branch, path) { actions.push(['rm', path]) },
+          async mkdir(branch: any, path: any) { actions.push(['mkdir', path]) },
+          async write(branch: any, path: any) { actions.push(['write', path]) },
+          async rm(branch: any, path: any) { actions.push(['rm', path]) },
         },
       }
       const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-r18b', retryBaseDelayMs: 1 })
@@ -1600,15 +1607,15 @@ describe('R18: prototype-safe staging and retained-state edges', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const client = sandboxClient(actions)
-      client.fs.list = async (branch, path) => (path === '/'
+      client.fs.list = async (branch: any, path: any) => (path === '/'
         ? { items: [{ name: 'stale.txt', type: 'file' }], hasMore: false }
         : { items: [], hasMore: false })
       const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-r18c', retryBaseDelayMs: 1 })
       await backend.baseline(source, 'initial')
       const apply = actions.find(action => action[0] === 'apply')
-      const removed = apply[2].filter(change => change.op === 'rm').map(change => change.path)
+      const removed = apply[2].filter((change: any) => change.op === 'rm').map((change: any) => change.path)
       assert.deepEqual(removed, ['/stale.txt'])
     })
   })
@@ -1617,7 +1624,7 @@ describe('R18: prototype-safe staging and retained-state edges', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const client = hostClient(root, actions)
       const backend = new LayerFSBackend({
         client,
@@ -1745,7 +1752,7 @@ export class LayerFS {
         DSH_LAYERFS_SDK: sdk,
         DSH_LAYERFS_OPERATOR: operator,
       })
-      await assert.rejects(loadLayerfs(settings), /operator unavailable/)
+      await assert.rejects(loadLayerfs(settings!), /operator unavailable/)
       assert.equal(existsSync(marker), true, 'the constructed client was closed')
     })
   })
@@ -1778,7 +1785,7 @@ export class LayerFS {
       [{ providerName: '' }, /providerName must be a non-empty string/],
       [{ planPath: '   ' }, /planPath must be a non-empty string/],
       [{ workerProvider: 7 }, /workerProvider must be a non-empty string/],
-    ]) {
+    ] as Array<[any, RegExp]>) {
       assert.throws(() => resolveConfig(config), pattern, JSON.stringify(config))
     }
     assert.equal(resolveConfig({}).rounds, 1)
@@ -1788,10 +1795,10 @@ export class LayerFS {
 
   it('surfaces configuration errors as standard-schema issues', async () => {
     const { Config } = await import('../lib/index.js')
-    const bad = Config['~standard'].validate({ branches: 0 })
+    const bad: any = Config['~standard'].validate({ branches: 0 })
     assert.ok(Array.isArray(bad.issues))
     assert.match(bad.issues[0].message, /branches must be a positive integer/)
-    const good = Config['~standard'].validate({ rounds: 2 })
+    const good: any = Config['~standard'].validate({ rounds: 2 })
     assert.equal(good.value.rounds, 2)
   })
 
@@ -1801,5 +1808,760 @@ export class LayerFS {
     assert.equal(sessionIdOf(null), null)
     assert.equal(isInsideRuntimeRuns(join('/tmp', 'repo', '.auto-research-methods', 'runs', 'id')), true)
     assert.equal(isInsideRuntimeRuns(join('/tmp', 'repo', '.auto-research-methods', 'plan.json')), false)
+  })
+})
+
+describe('R22: worker environments resolve the assigned checkout, not the copied parent cwd', () => {
+  it('matches header.parentId, ctx.workingDirectory, and working-directory changes', () => {
+    const repo = join('/tmp', 'repo-r22')
+    const checkout = join(repo, 'runs', 'branch-1')
+    let resolvedCwd: string | null = null
+    const registry = new WorkerEnvRegistry({ resolveCwd: () => resolvedCwd })
+    registry.register({
+      id: 'branch-1',
+      checkout,
+      parentSessionId: 'coord',
+      childSessionId: 'child-1',
+      env: { DSH_AUTO_RESEARCH_BRANCH: 'ar-run-r22-branch-1' },
+    })
+    const coordinator = { agent: { session: { header: { id: 'coord', cwd: repo, origin: 'coordinator' } } } }
+    assert.deepEqual(registry.resolve(coordinator), {})
+
+    // The real harness copies the coordinator cwd onto the child header.
+    const child = {
+      agent: {
+        session: {
+          header: { id: 'child-1', cwd: repo, parentId: 'coord' },
+          entries: [{ type: 'working-directory/change', cwd: checkout }],
+        },
+      },
+    }
+    assert.equal(registry.resolve(child).DSH_AUTO_RESEARCH_BRANCH, 'ar-run-r22-branch-1')
+
+    // A grandchild carries the worker session id as its parent.
+    const grandchild = { agent: { session: { header: { id: 'grand', cwd: repo, parentId: 'child-1', origin: 'subagent' } } } }
+    assert.equal(registry.resolve(grandchild).DSH_AUTO_RESEARCH_WORKER, '1')
+
+    resolvedCwd = checkout
+    const viaWorkingDirectory = { agent: { session: { header: { id: 'other', cwd: repo, origin: 'subagent' } } } }
+    assert.equal(registry.resolve(viaWorkingDirectory).DSH_AUTO_RESEARCH_BRANCH, 'ar-run-r22-branch-1')
+
+    resolvedCwd = null
+    const withExecutionCwd = {
+      agent: { session: { header: { id: 'other-2', cwd: repo, origin: 'subagent' } } },
+      cwd: checkout,
+    }
+    assert.equal(registry.resolve(withExecutionCwd).DSH_AUTO_RESEARCH_WORKER, '1')
+  })
+
+  it('refuses recursive delegation resolved through an assigned checkout', async () => {
+    await withTemp(async root => {
+      const checkout = join(root, 'runs', 'branch-1')
+      await mkdir(checkout, { recursive: true })
+      await mkdir(join(root, 'unrelated'), { recursive: true })
+      const ctx: any = {
+        subagents: {
+          list: () => ['auto-research', 'worker'],
+          registerProvider() {},
+          async startActivation() { throw new Error('unused') },
+        },
+      }
+      const provider = new AutoResearchProvider({ ctx, config: { workerEnv: { DSH_R22: '1' } } })
+      provider.workerEnvs.register({ id: 'branch-1', checkout, parentSessionId: 'coord', childSessionId: 'child-1' })
+      const parent = {
+        session: {
+          header: { id: 'child-1', cwd: root, parentId: 'coord' },
+          entries: [{ type: 'working-directory/change', cwd: checkout }],
+        },
+      }
+      await assert.rejects(
+        provider.start({ cwd: join(root, 'unrelated'), parent, prompt: 'go' }),
+        /cannot be called recursively/,
+      )
+    })
+  })
+})
+
+describe('R23: adopted binary and over-48KiB files survive materialization', () => {
+  function readerClient(
+    actions: any[],
+    files: Record<string, any>,
+    exec: ((mount: any, command: string) => Promise<any>) | null = null,
+  ): any {
+    return {
+      branch: { async fork() {} },
+      workspace: {
+        async mount() { return { sandbox: 'r23', path: '/workspaces/r23' } },
+        async commit(_handle: any, message: string) { actions.push(['commit', message]) },
+        async unmount() {},
+        ...(exec ? { exec } : {}),
+      },
+      fs: {
+        async list(_branch: string, path = '/') {
+          if (path !== '/') return []
+          return Object.keys(files).map(name => ({ name: name.replace(/^\/+/, '') }))
+        },
+        async read(_branch: string, name: string) {
+          const value = files[name]
+          if (value instanceof Error) throw value
+          return { text: value }
+        },
+        async apply(_branch: string, changes: any[], message: string) {
+          actions.push(['apply', changes, message])
+        },
+      },
+      async close() {},
+    }
+  }
+
+  it('copies a binary file through workspace.exec + base64', async () => {
+    await withTemp(async root => {
+      const actions: any[] = []
+      const commands: string[] = []
+      const bytes = Buffer.from([0, 1, 2, 255, 65])
+      const binaryError = Object.assign(new Error('binary file'), { code: 'Binary' })
+      const client = readerClient(actions, { '/binary.bin': binaryError }, async (_mount, command) => {
+        commands.push(command)
+        return { stdout: bytes.toString('base64'), exitCode: 0 }
+      })
+      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'r23' })
+      const state = await backend.adopt('ar-run-r23', 'adopted')
+      assert.equal(state.staging, true)
+      assert.deepEqual(await readFile(join(state.path, 'binary.bin')), bytes)
+      assert.match(commands[0]!, /base64 < "\$1"/)
+      assert.match(commands[0]!, /\/workspaces\/r23\/binary\.bin/)
+    })
+  })
+
+  it('records a skipped binary file and never emits a staging rm for it', async () => {
+    await withTemp(async root => {
+      const actions: any[] = []
+      const client = readerClient(actions, { '/binary.bin': Object.assign(new Error('binary'), { code: 'Binary' }) })
+      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'r23b' })
+      const state: any = await backend.adopt('ar-run-r23b', 'adopted')
+      assert.deepEqual(state.skippedFiles, ['binary.bin'])
+      await writeFile(join(state.path, 'new.txt'), 'new\n')
+      // Simulate a branch that already tracked the binary file: the staging
+      // inventory knows it, so a naive delete pass would emit `rm`.
+      state.stagingInventory = { 'binary.bin': '' }
+      await backend.commit(state, { message: 'auto-research: verified adopted' })
+      const apply = actions.find(action => action[0] === 'apply')
+      assert.ok(apply, 'the new host file is published')
+      const paths = apply[1].map((change: any) => change.path)
+      assert.ok(paths.includes('/new.txt'))
+      assert.equal(paths.includes('/binary.bin'), false)
+    })
+  })
+
+  it('fails loud when fs.read truncates a line and workspace.exec is unavailable', async () => {
+    await withTemp(async root => {
+      const actions: any[] = []
+      const truncated = Object.assign(new Error('line truncated'), { code: 'LineTruncated' })
+      const client = readerClient(actions, { '/big.txt': truncated })
+      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'r23c' })
+      await assert.rejects(
+        backend.adopt('ar-run-r23c', 'adopted'),
+        /truncated a line > 48 KiB .* workspace\.exec is unavailable/,
+      )
+    })
+  })
+})
+
+describe('R24: staged Sandbox mounts stay bidirectional', () => {
+  it('remounts the branch after publishing the baseline', async () => {
+    await withTemp(async root => {
+      const source = join(root, 'source')
+      await writeWorkspace(source)
+      const actions: any[] = []
+      let mounts = 0
+      const client: any = {
+        branch: { async fork() {} },
+        workspace: {
+          async mount() {
+            mounts += 1
+            const handle = { sandbox: `s${mounts}`, path: `/workspaces/r24-${mounts}` }
+            actions.push(['mount', handle.sandbox])
+            return handle
+          },
+          async commit() {},
+          async unmount(handle: any, discard: boolean) {
+            actions.push(['unmount', handle.sandbox, discard])
+          },
+        },
+        fs: {
+          async apply(_branch: string, changes: any[]) {
+            actions.push(['apply', changes.map(change => change.path)])
+          },
+        },
+        async close() {},
+      }
+      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'r24' })
+      const state = await backend.baseline(source, 'initial')
+      assert.equal((state.handle as any).sandbox, 's2')
+      assert.equal(state.sandboxPath, '/workspaces/r24-2')
+      assert.deepEqual(actions.map(action => action[0]), ['mount', 'apply', 'unmount', 'mount'])
+      assert.deepEqual(actions[2], ['unmount', 's1', true])
+    })
+  })
+
+  it('folds a committed Sandbox overlay back and lets host edits win', async () => {
+    await withTemp(async root => {
+      const source = join(root, 'source')
+      await writeWorkspace(source)
+      const branchFiles: Record<string, string> = {
+        '/state.json': JSON.stringify({ score: 1, metrics: { score: 1 } }, null, 2) + '\n',
+        '/notes.md': '# notes\n',
+      }
+      let statusCalls = 0
+      const client: any = {
+        branch: { async fork() {} },
+        workspace: {
+          async mount() { return { sandbox: 'r24', path: '/workspaces/r24-reconcile' } },
+          async commit() {},
+          async unmount() {},
+          async status() {
+            statusCalls += 1
+            return { overlay: { entries: 1 }, headMovedSinceMount: true }
+          },
+        },
+        fs: {
+          async list(_branch: string, path = '/') {
+            if (path !== '/') return []
+            return Object.keys(branchFiles).map(name => ({ name: name.replace(/^\/+/, '') }))
+          },
+          async read(_branch: string, name: string) {
+            return { text: branchFiles[name] ?? '' }
+          },
+          async apply() {},
+        },
+        async close() {},
+      }
+      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'r24b' })
+      const state = await backend.baseline(source, 'initial')
+      // A worker edits inside /workspaces/<n>; the host copy has not changed.
+      branchFiles['/state.json'] = JSON.stringify({ score: 9, metrics: { score: 9 } }, null, 2) + '\n'
+      delete branchFiles['/notes.md']
+      await backend.reconcile(state)
+      assert.match(await readFile(join(state.path, 'state.json'), 'utf8'), /"score": 9/)
+      await assert.rejects(stat(join(state.path, 'notes.md')), { code: 'ENOENT' })
+
+      // Host edits take precedence: reconcile must not touch them.
+      await writeFile(join(state.path, 'state.json'), JSON.stringify({ score: 3, metrics: { score: 3 } }, null, 2) + '\n')
+      const callsBefore = statusCalls
+      await backend.reconcile(state)
+      assert.equal(statusCalls, callsBefore)
+      assert.match(await readFile(join(state.path, 'state.json'), 'utf8'), /"score": 3/)
+    })
+  })
+
+  it('calls reconcile after the worker activation and before evaluation', async () => {
+    await withTemp(async root => {
+      const base = await createWorkspaceManager({ output: join(root, 'out'), runId: 'run', env: {} })
+      const reconciles: string[] = []
+      const manager: any = {
+        kind: base.kind,
+        baseline: (...args: any[]) => base.baseline(args[0], args[1]),
+        fork: (...args: any[]) => base.fork(args[0], args[1]),
+        adopt: (...args: any[]) => base.adopt(args[0], args[1]),
+        commit: (...args: any[]) => base.commit(args[0], args[1]),
+        release: (...args: any[]) => base.release(args[0], args[1]),
+        retainCompletedState: (...args: any[]) => base.retainCompletedState(args[0]),
+        restoreCompletedState: (...args: any[]) => base.restoreCompletedState(args[0], args[1]),
+        async reconcile(state: any) {
+          reconciles.push(state.path)
+          await base.reconcile(state)
+        },
+        close: () => base.close(),
+      }
+      const worker = async (spec: any) => {
+        await setState(spec.request.cwd, { score: 4, metrics: { score: 4 } })
+        return { output: [], stopReason: 'completed' }
+      }
+      const { runner } = await setupRunner(root, {
+        manager,
+        worker,
+        options: { rounds: 1, branches: 2, forkAndFlush: false },
+      })
+      const result = await runner.run()
+      assert.equal(reconciles.length, 1)
+      assert.equal(result.leader.evaluation.score, 4)
+    })
+  })
+})
+
+describe('R25: a resumed epoch failure keeps its own dirty workspace', () => {
+  it('detaches the epoch-1 row and commits the epoch-2 orphan as unverified', async () => {
+    await withTemp(async root => {
+      const branchPath = join(root, 'epoch-2-workspace')
+      await writeWorkspace(branchPath, { score: 2, metrics: { score: 2 } })
+      const state: any = { id: 'epoch-2', backend: 'snapshot', path: branchPath, branch: null }
+      const commits: string[] = []
+      const releases: any[] = []
+      const manager: any = {
+        kind: 'snapshot',
+        async baseline() { throw new Error('unused') },
+        async fork() { throw new Error('unused') },
+        async commit(_state: any, options: any) { commits.push(options?.message) },
+        async release(_state: any, options: any) { releases.push(options?.discard) },
+        async retainCompletedState() { return '' },
+        async restoreCompletedState() { throw new Error('unused') },
+        async reconcile() { throw new Error('sandbox reconcile failed') },
+      }
+      const { runner } = await setupRunner(root, {
+        manager,
+        worker: async () => ({ output: [], stopReason: 'completed' }),
+      })
+      const parent: any = {
+        id: 'epoch-1',
+        parent: 'initial',
+        workspace: branchPath,
+        provider_session: 'child-1',
+        evaluation: { valid: true, score: 2 },
+        _state: state,
+        _ownsState: true,
+      }
+      const now = runner.now()
+      await assert.rejects(
+        runner.branch(parent, 0, 'continue', join(root, 'out', 'epoch-2'), { definitions: [], diagnostics: [], rows: [] }, {
+          resume: true,
+          bundle: null,
+          deadline: now + 60_000,
+          shareAt: now + 30_000,
+          count: 1,
+          seconds: 60,
+          index: 0,
+          sharedContext: null,
+        }),
+        /sandbox reconcile failed/,
+      )
+      assert.equal(parent._state, null)
+      assert.equal(parent._ownsState, false)
+      assert.equal(runner.abandoned.length, 1)
+      assert.equal(runner.abandoned[0]!._ownsState, true)
+      assert.equal(runner.abandoned[0]!._released, true)
+      assert.equal(runner.releasedStates.has(state), true)
+      assert.ok(commits.includes('auto-research: unverified epoch-2'))
+      assert.equal(commits.some(message => /retained epoch-1/.test(message)), false)
+      assert.deepEqual(releases, [false])
+    })
+  })
+})
+
+describe('R26: LayerFS completion checkpoints own a branch', () => {
+  it('commits a verified epoch before retaining and restores onto a branch', async () => {
+    await withTemp(async root => {
+      const actions: any[] = []
+      const client = sandboxClientWith(actions)
+      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'r26' })
+      const workspace = join(root, 'workspace')
+      await writeWorkspace(workspace, { score: 2, metrics: { score: 2 } })
+      const manifest = await inventory(workspace)
+      const row: any = {
+        id: 'epoch-1',
+        parent: 'initial',
+        workspace,
+        evaluation: { valid: true, score: 2, workspace_manifest_sha256: jsonDigest(manifest) },
+        _state: {
+          id: 'epoch-1',
+          backend: 'layerfs',
+          path: workspace,
+          branch: 'ar-run-r26-epoch-1',
+          handle: { sandbox: 'r26', path: SANDBOX_PATH },
+        },
+        _ownsState: true,
+      }
+      const checkpoint = await backend.retainCompletedState(row)
+      assert.equal(actions[0]![0], 'commit')
+      assert.equal(actions[0]![2], 'auto-research: verified epoch-1')
+      assert.equal(existsSync(checkpoint), true)
+
+      const failed: any = { id: 'epoch-2', workspace: join(root, 'failed-successor') }
+      const restored = await backend.restoreCompletedState(checkpoint, failed)
+      assert.equal(restored._state?.backend, 'layerfs')
+      assert.equal(typeof restored._state?.branch, 'string')
+      assert.equal(restored._ownsState, true)
+      assert.equal(restored.workspace, restored._state?.path)
+      assert.match(await readFile(join(restored.workspace, 'state.json'), 'utf8'), /"score": 2/)
+    })
+  })
+})
+
+describe('R27: concurrent LayerFS environment leases stay isolated', () => {
+  it('restores the true baseline only after the last lease ends', () => {
+    const target: Record<string, unknown> = {
+      DSH_LAYERFS_HOME: 'base',
+      LAYERFS_HOME: 'base',
+      LAYERFS_NATIVE: 'native-base',
+    }
+    const settingsA = resolveLayerfsConfig({
+      DSH_LAYERFS_PROJECT: 'a',
+      DSH_LAYERFS_SDK: '/sdk',
+      DSH_LAYERFS_HOME: '/a',
+    })!
+    const settingsB = resolveLayerfsConfig({
+      DSH_LAYERFS_PROJECT: 'b',
+      DSH_LAYERFS_SDK: '/sdk',
+      DSH_LAYERFS_HOME: '/b',
+    })!
+    const leaseA = applyLayerfsEnvironment(settingsA, target)
+    const leaseB = applyLayerfsEnvironment(settingsB, target)
+    assert.equal(target.DSH_LAYERFS_HOME, '/b')
+    leaseA.activate()
+    assert.equal(target.DSH_LAYERFS_HOME, '/a')
+    leaseA()
+    assert.equal(target.DSH_LAYERFS_HOME, '/b')
+    leaseB()
+    assert.equal(target.DSH_LAYERFS_HOME, 'base')
+    assert.equal(target.LAYERFS_HOME, 'base')
+
+    // A value-less lease observes LAYERFS_NATIVE without rewriting it.
+    const nativeLease = applyEnvironmentPatch([['LAYERFS_NATIVE', undefined]], target)
+    assert.equal(target.LAYERFS_NATIVE, 'native-base')
+    nativeLease()
+    assert.equal(target.LAYERFS_NATIVE, 'native-base')
+  })
+
+  it('re-asserts this batch environment before each SDK call', async () => {
+    const target: Record<string, unknown> = { LAYERFS_NATIVE: 'native' }
+    const client: any = {
+      branch: { async fork() {} },
+      workspace: { async mount() { return { sandbox: 's', path: '/workspaces/r27' } } },
+    }
+    const backend = new LayerFSBackend({
+      client,
+      output: '/tmp/r27-output',
+      activateEnvironment: () => {
+        target.LAYERFS_NATIVE = 'native'
+      },
+    })
+    target.LAYERFS_NATIVE = 'other-batch'
+    assert.equal(await backend.retry(async () => target.LAYERFS_NATIVE), 'native')
+  })
+})
+
+describe('R28: worker environment declarations and config validation', () => {
+  it('never declares reserved, LayerFS, secret, or non-string keys', () => {
+    const declared = declaredWorkerEnvKeys({
+      DSH_HOME: '/home',
+      DSH_SHELL: 'zsh',
+      DSH_SESSION_ID: 's',
+      DSH_PROFILE: 'p',
+      DSH_PROFILE_DIR: '/p',
+      DSH_LAYERFS_HOME: '/layerfs',
+      DSH_API_TOKEN: 'secret',
+      DSH_KEY: 'k',
+      DSH_PASSWORD: 'p',
+      DSH_GOOD: '1',
+      DSH_NUM: 42,
+      OTHER: 'x',
+    })
+    for (const reserved of DSH_RESERVED_ENV_KEYS) assert.equal(Object.hasOwn(declared, reserved), false, reserved)
+    for (const name of ['DSH_LAYERFS_HOME', 'DSH_API_TOKEN', 'DSH_KEY', 'DSH_PASSWORD', 'DSH_NUM', 'OTHER']) {
+      assert.equal(Object.hasOwn(declared, name), false, name)
+    }
+    assert.equal(Object.hasOwn(declared, 'DSH_GOOD'), true)
+    assert.equal(Object.hasOwn(declared, 'DSH_AUTO_RESEARCH_WORKER'), true)
+    assert.equal(Object.hasOwn(declaredWorkerEnvKeys(null), 'DSH_GOOD'), false)
+    assert.equal(Object.hasOwn(declaredWorkerEnvKeys([] as any), 'DSH_GOOD'), false)
+  })
+
+  it('rejects non-object config and workerEnv values', () => {
+    for (const value of [null, [], 'x', 7]) {
+      assert.throws(() => resolveConfig(value), /config must be an object/, JSON.stringify(value))
+    }
+    for (const value of [null, [], 'x', 7]) {
+      assert.throws(() => resolveConfig({ workerEnv: value }), /workerEnv must be an object/, JSON.stringify(value))
+    }
+    assert.equal(resolveConfig({ workerEnv: { DSH_GOOD: '1' } }).workerEnv.DSH_GOOD, '1')
+  })
+})
+
+describe('R29: LayerFS project probes handle empty and WSL entries', () => {
+  it('removes an empty project entry and initializes it', async () => {
+    await withTemp(async root => {
+      const home = join(root, 'home')
+      await mkdir(join(home, 'proj'), { recursive: true })
+      const source = join(root, 'source')
+      await writeWorkspace(source)
+      const actions: any[] = []
+      const client: any = {
+        options: { home },
+        project: {
+          async init(path: string) {
+            actions.push(['init', path])
+            await mkdir(join(home, 'proj'), { recursive: true })
+            await writeFile(join(home, 'proj', 'owner'), 'layerfs\n')
+          },
+        },
+        branch: {
+          async fork(name: string) {
+            actions.push(['fork', name])
+            if (!existsSync(join(home, 'proj', 'owner'))) {
+              throw Object.assign(new Error('project proj does not exist'), { code: 'NoSuchProject' })
+            }
+          },
+        },
+        workspace: {
+          async mount() { return { sandbox: '1', path: '/workspaces/r29a' } },
+          async commit() {},
+          async unmount() {},
+        },
+        fs: { async apply() {} },
+      }
+      const backend = new LayerFSBackend({ client, project: 'proj', output: join(root, 'out'), runId: 'r29a' })
+      await backend.baseline(source, 'initial')
+      assert.deepEqual(actions, [
+        ['init', source],
+        ['fork', 'ar-r29a-initial'],
+      ])
+    })
+  })
+
+  it('retries project.init when a present entry still has no usable main', async () => {
+    await withTemp(async root => {
+      const home = join(root, 'home')
+      await mkdir(join(home, 'proj'), { recursive: true })
+      await writeFile(join(home, 'proj', 'owner'), 'layerfs\n')
+      const source = join(root, 'source')
+      await writeWorkspace(source)
+      const actions: any[] = []
+      let forks = 0
+      const client: any = {
+        options: { home },
+        project: {
+          async init(path: string) {
+            actions.push(['init', path])
+            throw Object.assign(new Error('project exists'), { code: 'Exists' })
+          },
+        },
+        branch: {
+          async fork(name: string) {
+            actions.push(['fork', name])
+            forks += 1
+            if (forks === 1) throw Object.assign(new Error('no usable main'), { code: 'NoSuchBranch' })
+          },
+        },
+        workspace: {
+          async mount() { return { sandbox: '1', path: '/workspaces/r29b' } },
+          async commit() {},
+          async unmount() {},
+        },
+        fs: { async apply() {} },
+      }
+      const backend = new LayerFSBackend({ client, project: 'proj', output: join(root, 'out'), runId: 'r29b' })
+      await backend.baseline(source, 'initial')
+      assert.deepEqual(actions.map(action => action[0]), ['fork', 'init', 'fork'])
+    })
+  })
+
+  it('does not probe the home directory for a WSL binding', async () => {
+    await withTemp(async root => {
+      const home = join(root, 'home')
+      await mkdir(join(home, 'proj'), { recursive: true })
+      await writeFile(join(home, 'proj', 'owner'), 'layerfs\n')
+      const source = join(root, 'source')
+      await writeWorkspace(source)
+      const actions: any[] = []
+      let forks = 0
+      const client: any = {
+        options: { home, deploy: { wslEndpoint: '/run/wsl-layerfs.sock' } },
+        project: { async init(path: string) { actions.push(['init', path]) } },
+        branch: {
+          async fork(name: string) {
+            actions.push(['fork', name])
+            forks += 1
+            if (forks === 1) throw Object.assign(new Error('endpoint not ready'), { code: 'NoSuchProject' })
+          },
+        },
+        workspace: {
+          async mount() { return { sandbox: '1', path: '/workspaces/r29c' } },
+          async commit() {},
+          async unmount() {},
+        },
+        fs: { async apply() {} },
+      }
+      const backend = new LayerFSBackend({ client, project: 'proj', output: join(root, 'out'), runId: 'r29c' })
+      await backend.baseline(source, 'initial')
+      assert.deepEqual(actions.map(action => action[0]), ['fork', 'init', 'fork'])
+    })
+  })
+})
+
+describe('R30: evidence must be normalized and present before evaluation', () => {
+  it('rejects traversal, absolute, empty, and absent evidence paths', async () => {
+    await withTemp(async root => {
+      const workspace = join(root, 'workspace')
+      await writeWorkspace(workspace)
+      const evaluatorPath = join(root, 'evaluator.mjs')
+      await writeFile(evaluatorPath, 'process.exit(0)\n')
+      const evaluator = new FrozenEvaluator({ plan: { evaluator: evaluatorPath } as any, output: join(root, 'out') })
+      const before = await inventory(workspace)
+      for (const evidence of [
+        ['ghost.json'],
+        ['./state.json'],
+        ['a//b'],
+        ['a/../state.json'],
+        ['a\\b'],
+        [join(workspace, 'state.json')],
+      ]) {
+        await assert.rejects(
+          evaluator.validateCandidate({ valid: true, score: 1, metrics: {}, evidence }, before, workspace),
+          /Evidence must exist within the evaluated workspace/,
+          JSON.stringify(evidence),
+        )
+      }
+      await assert.rejects(
+        evaluator.validateCandidate({ valid: true, score: 1, metrics: {}, evidence: [] }, before, workspace),
+        /No evaluation evidence/,
+      )
+      const accepted = await evaluator.validateCandidate(
+        { valid: true, score: 1, metrics: {}, evidence: ['state.json'] },
+        before,
+        workspace,
+      )
+      assert.equal(accepted.evidence?.['state.json'], before['state.json'])
+    })
+  })
+})
+
+describe('R31: provider RESULT.json writes are atomic', () => {
+  it('writes a parseable FAILED result with no partial temporary files', async () => {
+    await withTemp(async root => {
+      const workspace = join(root, 'workspace')
+      await writeWorkspace(workspace)
+      const evaluator = join(root, 'evaluator.mjs')
+      await writeFile(evaluator, 'process.exit(1)\n')
+      const ctx: any = {
+        subagents: {
+          list: () => ['worker'],
+          registerProvider() {},
+          async startActivation() {
+            return { childId: 'unused', result: Promise.resolve({ output: [], stopReason: 'completed' }), async dispose() {} }
+          },
+        },
+        logger: { info() {}, warn() {} },
+      }
+      const provider = new AutoResearchProvider({
+        ctx,
+        config: {
+          planPath: join(root, 'plan.json'),
+          workspaceBackend: 'snapshot',
+          plan: {
+            objective: 'atomic result',
+            worker_prompt: 'w',
+            evaluator,
+            evaluation_seconds: 5,
+            metrics: [],
+            selection_metrics: [],
+            options: { rounds: 1, branches: 2 },
+          },
+        },
+      })
+      const run = await provider.start({ cwd: workspace, parent: { id: 'parent' }, prompt: 'go' })
+      await run.result
+      const runDirectory = join(workspace, '.auto-research-methods', 'runs', String(run.id))
+      const result = JSON.parse(await readFile(join(runDirectory, 'RESULT.json'), 'utf8'))
+      assert.equal(result.status, 'FAILED')
+      const leftovers = (await readdir(runDirectory)).filter(name => name.endsWith('.new'))
+      assert.deepEqual(leftovers, [])
+    })
+  })
+
+  it('uses writeJsonAtomic for both FAILED and STOPPED results', async () => {
+    const source = await readFile(join(fileURLToPath(new URL('..', import.meta.url)), 'src/provider.ts'), 'utf8')
+    assert.doesNotMatch(source, /fsp\.writeFile\(join\(output, 'RESULT\.json'\)/)
+    assert.match(source, /writeJsonAtomic\(join\(output, 'RESULT\.json'\), \{\s*status: 'FAILED'/)
+    assert.match(source, /writeJsonAtomic\(join\(output, 'RESULT\.json'\), \{\s*status: 'STOPPED'/)
+  })
+})
+
+describe('R32: the Chinese README documents the real LayerFS binding', () => {
+  it('lists every DSH_LAYERFS_* variable and host staging', async () => {
+    const zh = await readFile(join(fileURLToPath(new URL('..', import.meta.url)), 'README.zh.md'), 'utf8')
+    for (const key of LAYERFS_ENV_KEYS) assert.ok(zh.includes(key), key)
+    assert.match(zh, /workspaces\/<n>/)
+    assert.match(zh, /宿主暂存/)
+    assert.doesNotMatch(zh, /假定 LayerFS 挂载暴露主机可访问/)
+  })
+})
+
+describe('R33: post-re-audit edge cases (NEW-01..NEW-03)', () => {
+  it('reconciles Sandbox in-place inode edits and worker-committed branches even with prelaunch handoff files', async () => {
+    await withTemp(async root => {
+      const source = join(root, 'source')
+      await writeWorkspace(source, { score: 1 })
+      const branchFiles: Record<string, string> = {
+        '/state.json': JSON.stringify({ score: 1, metrics: { score: 1 }, evidence: ['state.json'] }),
+      }
+      let committedInSandbox = false
+      const client: any = {
+        project: { async init() {} },
+        branch: { async fork() {} },
+        workspace: {
+          async mount(branch: string) {
+            return { branch, path: '/workspaces/1', sandbox: '1' }
+          },
+          async status() {
+            return {
+              overlay: { entries: 0, inodes: committedInSandbox ? 0 : 1, pendingMerge: false },
+              headMovedSinceMount: false,
+            }
+          },
+          async commit() {
+            committedInSandbox = true
+            branchFiles['/state.json'] = JSON.stringify({ score: 9, metrics: { score: 9 }, evidence: ['state.json'] })
+          },
+          async unmount() {},
+        },
+        fs: {
+          async apply() {},
+          async list() {
+            return {
+              items: Object.keys(branchFiles).map(name => ({ name: name.slice(1), type: 'file' })),
+              hasMore: false,
+            }
+          },
+          async read(_branch: string, path: string) {
+            return { text: branchFiles[path] ?? '', nextLine: null }
+          },
+        },
+      }
+      const backend = new LayerFSBackend({ client, project: 'proj', output: join(root, 'out'), runId: 'r33' })
+      const base = await backend.baseline(source, 'initial')
+      const child = await backend.fork(base, 'round-1-continue-1')
+      // Simulate Runner.branch() writing .auto-research-methods-handoff.md before launch
+      await writeFile(join(child.path, '.auto-research-methods-handoff.md'), 'handoff notes\n')
+      child.prelaunchInventory = await inventory(child.path)
+      await backend.reconcile(child)
+      const after = JSON.parse(await readFile(join(child.path, 'state.json'), 'utf8'))
+      assert.equal(after.score, 9)
+      assert.equal(await readFile(join(child.path, '.auto-research-methods-handoff.md'), 'utf8'), 'handoff notes\n')
+    })
+  })
+
+  it('never matches the coordinator parent session even when its cwd is inside a live worker checkout', () => {
+    const registry = new WorkerEnvRegistry()
+    const checkout = '/tmp/ar-r33-checkout'
+    const lease = registry.register({
+      id: 'b1',
+      checkout,
+      parentSessionId: 'coord-session-1',
+      childSessionId: 'worker-session-1',
+      env: { DSH_AUTO_RESEARCH_CHECKOUT: checkout },
+    })
+    try {
+      const coordEnv = registry.resolve({
+        cwd: checkout,
+        session: { header: { id: 'coord-session-1', cwd: checkout } },
+      })
+      assert.deepEqual(coordEnv, {})
+      const workerEnv = registry.resolve({
+        cwd: checkout,
+        session: { header: { id: 'worker-session-1', parentId: 'coord-session-1', cwd: '/repo' } },
+      })
+      assert.equal(workerEnv.DSH_AUTO_RESEARCH_WORKER, '1')
+    } finally {
+      lease.dispose()
+    }
   })
 })

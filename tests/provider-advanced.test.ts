@@ -6,9 +6,9 @@ import {
   AutoResearchProvider,
   acquireRunnerLock,
 } from '../lib/provider.js'
-import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.mjs'
+import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
 
-function planObject(root, extra = {}) {
+function planObject(root: string, extra: Record<string, any> = {}): any {
   return {
     objective: 'Fixture objective',
     worker_prompt: 'Do one experiment and save evidence.',
@@ -25,12 +25,18 @@ function planObject(root, extra = {}) {
   }
 }
 
-async function fixture(root, {
+async function fixture(root: string, {
   config = {},
   worker = null,
   shellEnv = null,
   planExtra = {},
   writePlan = true,
+}: {
+  config?: any
+  worker?: any
+  shellEnv?: any
+  planExtra?: any
+  writePlan?: boolean
 } = {}) {
   const cwd = join(root, 'repo')
   await writeWorkspace(cwd, { score: 1, metrics: { score: 1 } })
@@ -38,11 +44,11 @@ async function fixture(root, {
   const plan = planObject(cwd, planExtra)
   await mkdir(join(cwd, '.auto-research-methods'), { recursive: true })
   if (writePlan) await writeFile(join(cwd, '.auto-research-methods', 'plan.json'), JSON.stringify(plan))
-  const subagents = fakeSubagents(worker ?? (async spec => {
+  const subagents = fakeSubagents(worker ?? (async (spec: any) => {
     await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
     return { output: [{ type: 'text', text: 'worker output' }], stopReason: 'completed' }
   }))
-  const ctx = { subagents, logger: { info() {}, warn() {} } }
+  const ctx: any = { subagents, logger: { info() {}, warn() {} } }
   if (shellEnv) ctx.shellEnv = shellEnv
   const provider = new AutoResearchProvider({
     ctx,
@@ -58,14 +64,14 @@ async function fixture(root, {
   return { cwd, provider, subagents, plan }
 }
 
-function abortableWorker(gates) {
-  return async spec => {
+function abortableWorker(gates: any) {
+  return async (spec: any) => {
     gates.resolveStarted()
     await Promise.race([
       gates.promise,
-      new Promise(resolve => {
+      new Promise<void>(resolve => {
         if (spec.signal?.aborted) resolve()
-        else spec.signal?.addEventListener('abort', resolve, { once: true })
+        else spec.signal?.addEventListener('abort', () => resolve(), { once: true })
       }),
     ])
     return { output: [], stopReason: spec.signal?.aborted ? 'aborted' : 'completed' }
@@ -73,14 +79,14 @@ function abortableWorker(gates) {
 }
 
 function gatePair() {
-  let release
-  const promise = new Promise(resolve => { release = resolve })
-  let resolveStarted
-  const started = new Promise(resolve => { resolveStarted = resolve })
+  let release: () => void = () => {}
+  const promise = new Promise<void>(resolve => { release = resolve })
+  let resolveStarted: () => void = () => {}
+  const started = new Promise<void>(resolve => { resolveStarted = resolve })
   return { promise, release, started, resolveStarted }
 }
 
-function sdkModule(path) {
+function sdkModule(path: string): string {
   return `import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 const mounts = ${JSON.stringify(path)}
@@ -138,7 +144,7 @@ describe('P0: LayerFS environment from ctx.shellEnv', () => {
         assert.match(latest.leader_branch, /^ar-/)
         const runs = await readdir(join(cwd, '.auto-research-methods', 'runs'))
         assert.equal(runs.length, 1)
-        const launches = await readdir(join(cwd, '.auto-research-methods', 'runs', runs[0]))
+        const launches = await readdir(join(cwd, '.auto-research-methods', 'runs', runs[0]!))
         assert.ok(launches.includes('round-1-continue-1'))
         assert.ok((await readdir(mounts)).length >= 2)
         await handle.dispose()
@@ -196,7 +202,7 @@ describe('P0/P1: leader adoption, seed runtime, and cancellation artifacts', () 
       assert.equal(pointer.runtime, join(realSeed, '.auto-research-methods'))
       assert.equal(pointer.latest, join(realSeed, '.auto-research-methods', 'LATEST.json'))
       assert.ok(await readFile(join(seed, '.auto-research-methods', 'LATEST.json'), 'utf8'))
-      let cwdRuns = []
+      let cwdRuns: string[] = []
       try { cwdRuns = await readdir(join(cwd, '.auto-research-methods', 'runs')) } catch { cwdRuns = [] }
       assert.deepEqual(cwdRuns, [])
       await handle.dispose()
@@ -213,9 +219,9 @@ describe('P0/P1: leader adoption, seed runtime, and cancellation artifacts', () 
       const result = await handle.result
       await disposing
       assert.equal(result.stopReason, 'aborted')
-      assert.match(result.output[0].text, /STOPPED/)
-      assert.match(result.output[0].text, /pending_workspaces: 1/)
-      const stopped = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'runs', (await readdir(join(cwd, '.auto-research-methods', 'runs')))[0], 'RESULT.json'), 'utf8'))
+      assert.match((result.output as any)[0].text, /STOPPED/)
+      assert.match((result.output as any)[0].text, /pending_workspaces: 1/)
+      const stopped = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'runs', (await readdir(join(cwd, '.auto-research-methods', 'runs')))[0]!, 'RESULT.json'), 'utf8'))
       assert.equal(stopped.status, 'STOPPED')
       assert.equal(stopped.stop_reason, 'stopped')
       assert.equal(stopped.artifacts_preserved, true)
@@ -279,47 +285,47 @@ describe('P1: checkout lock and worker selection', () => {
   })
 
   it('prefers external non-inheriting worker providers and blocks recursion', async () => {
-    const providers = {
+    const providers: Record<string, { inheritsParentContext: boolean }> = {
       fork: { inheritsParentContext: true },
       'claude-code': { inheritsParentContext: false },
       codex: { inheritsParentContext: false },
       acp: { inheritsParentContext: false },
     }
-    const ctx = {
+    const ctx: any = {
       subagents: {
         list: () => ['fork', 'claude-code', 'codex'],
-        get: name => providers[name],
+        get: (name: string) => providers[name],
       },
     }
     assert.equal(new AutoResearchProvider({ ctx, config: {} }).workerProviderName(), 'claude-code')
     const getter = new AutoResearchProvider({
-      ctx: { subagents: { list: () => ['fork', 'acp'], getProvider: name => providers[name] } },
+      ctx: { subagents: { list: () => ['fork', 'acp'], getProvider: (name: string) => providers[name] } } as any,
       config: {},
     })
     assert.equal(getter.workerProviderName(), 'acp')
 
     const onlyFork = new AutoResearchProvider({
-      ctx: { subagents: { list: () => ['fork'], get: name => providers[name] } },
+      ctx: { subagents: { list: () => ['fork'], get: (name: string) => providers[name] } } as any,
       config: {},
     })
     assert.equal(onlyFork.workerProviderName(), 'fork')
 
     const recursive = new AutoResearchProvider({
-      ctx: { subagents: { list: () => ['auto-research', 'fork'], describe: name => providers[name] } },
+      ctx: { subagents: { list: () => ['auto-research', 'fork'], describe: (name: string) => providers[name] } } as any,
       config: {},
     })
     assert.equal(recursive.workerProviderName(), 'fork')
     assert.throws(() => new AutoResearchProvider({
-      ctx: { subagents: { list: () => ['auto-research'] } },
+      ctx: { subagents: { list: () => ['auto-research'] } } as any,
       config: { workerProvider: 'auto-research' },
     }).workerProviderName(), /cannot delegate to itself/)
     assert.throws(() => new AutoResearchProvider({
-      ctx: { subagents: { list: () => ['auto-research'] } },
+      ctx: { subagents: { list: () => ['auto-research'] } } as any,
       config: {},
     }).workerProviderName(), /at least one other/)
   })
 })
 
-async function fspWrite(path, body) {
+async function fspWrite(path: string, body: string) {
   await writeFile(path, body)
 }

@@ -145,6 +145,10 @@ export interface WorkspaceState {
   staging?: boolean
   /** Inventory captured when the staging directory was created. */
   stagingInventory?: Record<string, string>
+  /** Host staging inventory right before worker launch (includes handoff/peer context). */
+  prelaunchInventory?: Record<string, string>
+  /** Adopted files `fs.read`/`workspace.exec` could not materialize. */
+  skippedFiles?: string[]
   [key: string]: unknown
 }
 
@@ -297,6 +301,11 @@ export interface PluginContext {
     }) => unknown
   }
   shellEnv?: ShellEnvService
+  /** `dsh` `ctx.workingDirectory` service (per-session assigned checkout). */
+  workingDirectory?: {
+    get?: (session: unknown) => unknown
+    set?: (session: unknown, cwd: string) => unknown
+  }
   subprocess?: unknown
   logger?: Logger
   get?: (name: string) => unknown
@@ -407,6 +416,7 @@ export interface LayerFSClient {
     mount?: (branch: string) => Promise<LayerFSMount>
     commit?: (workspace: LayerFSMount, message?: string, force?: boolean) => Promise<unknown>
     unmount?: (workspace: LayerFSMount, discard?: boolean) => Promise<unknown>
+    status?: (workspace: LayerFSMount) => Promise<unknown>
     exec?: (...args: unknown[]) => Promise<unknown>
     [key: string]: unknown
   }
@@ -524,5 +534,7 @@ export interface WorkspaceManagerLike {
   release: (state: WorkspaceState, options?: { discard?: boolean }) => Promise<void>
   retainCompletedState: (row: TrajectoryRow) => Promise<string>
   restoreCompletedState: (checkpoint: string, failedRow: TrajectoryRow) => Promise<TrajectoryRow>
+  /** Fold changes made inside a live Sandbox mount back into the host copy. */
+  reconcile?: (state: WorkspaceState) => Promise<void>
   close?: () => Promise<void>
 }

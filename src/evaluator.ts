@@ -276,7 +276,18 @@ export class FrozenEvaluator {
     }
     const receipts: Record<string, string> = {}
     for (const relative of evidence) {
-      if (typeof relative !== 'string' || relative.length === 0 || isAbsolute(relative)) {
+      // Evidence is matched against the pre-evaluation inventory, so a path
+      // that only appears after evaluation cannot be cited. Normalize first:
+      // `./x`, `a//b`, `a/../b`, backslashes and absolute paths are all
+      // rejected instead of being silently resolved.
+      if (typeof relative !== 'string' || relative.length === 0 || isAbsolute(relative) || relative.includes('\\')) {
+        throw new Error('Evidence must exist within the evaluated workspace')
+      }
+      const segments = relative.split('/')
+      if (segments.some(segment => segment === '' || segment === '.' || segment === '..')) {
+        throw new Error('Evidence must exist within the evaluated workspace')
+      }
+      if (!Object.hasOwn(before, relative)) {
         throw new Error('Evidence must exist within the evaluated workspace')
       }
       const path = resolve(workspace, relative)

@@ -11,26 +11,29 @@ import {
   resolveShellEnvironment,
   withBusyRetry,
 } from '../lib/layerfs-workspace.js'
-import { setState, withTemp, writeWorkspace } from './helpers.mjs'
+import { setState, withTemp, writeWorkspace } from './helpers.ts'
 
 const SANDBOX_PATH = `/workspaces/auto-research-${process.pid}`
 
-function sandboxClient(actions, { path = SANDBOX_PATH, apply = true } = {}) {
-  const client = {
+function sandboxClient(
+  actions: any[],
+  { path = SANDBOX_PATH, apply = true }: { path?: string; apply?: boolean } = {},
+): any {
+  const client: any = {
     branch: {
-      async fork(name, from) {
+      async fork(name: any, from: any) {
         actions.push(['fork', name, from])
       },
     },
     workspace: {
-      async mount(name) {
+      async mount(name: any) {
         actions.push(['mount', name])
         return { sandbox: 'sandbox-1', path }
       },
-      async commit(handle, message) {
+      async commit(handle: any, message: any) {
         actions.push(['commit', handle.sandbox, message])
       },
-      async unmount(handle, discard) {
+      async unmount(handle: any, discard: any) {
         actions.push(['unmount', handle.sandbox, discard])
       },
     },
@@ -40,11 +43,11 @@ function sandboxClient(actions, { path = SANDBOX_PATH, apply = true } = {}) {
   }
   if (apply) {
     client.fs = {
-      async apply(branch, changes, message) {
+      async apply(branch: any, changes: any[], message: any) {
         actions.push([
           'apply',
           branch,
-          changes.map(change => ({
+          changes.map((change: any) => ({
             op: change.op,
             path: change.path,
             content: change.content === undefined ? undefined : Buffer.from(change.content).toString('utf8'),
@@ -55,10 +58,10 @@ function sandboxClient(actions, { path = SANDBOX_PATH, apply = true } = {}) {
     }
   } else {
     client.fs = {
-      async write(branch, path, content) {
+      async write(branch: any, path: any, content: any) {
         actions.push(['write', branch, path, Buffer.from(content).toString('utf8')])
       },
-      async rm(branch, path) {
+      async rm(branch: any, path: any) {
         actions.push(['rm', branch, path])
       },
     }
@@ -69,7 +72,7 @@ function sandboxClient(actions, { path = SANDBOX_PATH, apply = true } = {}) {
 describe('withBusyRetry', () => {
   it('retries Busy with exponential backoff and returns the eventual value', async () => {
     let attempts = 0
-    const delays = []
+    const delays: number[] = []
     const value = await withBusyRetry(async () => {
       attempts += 1
       if (attempts < 3) throw Object.assign(new Error('workspace is busy'), { code: 'Busy' })
@@ -118,12 +121,12 @@ describe('LayerFS branch names and adoption', () => {
   })
 
   it('never closes a host-injected shared client but closes an owned client', async () => {
-    const injectedActions = []
+    const injectedActions: any[] = []
     const injected = new LayerFSBackend({ client: sandboxClient(injectedActions), output: '/tmp' })
     await injected.close()
     assert.deepEqual(injectedActions, [])
 
-    const ownedActions = []
+    const ownedActions: any[] = []
     const owned = new LayerFSBackend({ client: sandboxClient(ownedActions), output: '/tmp', ownsClient: true })
     await owned.close()
     assert.deepEqual(ownedActions, [['close']])
@@ -135,7 +138,7 @@ describe('Sandbox-internal mounting bridge', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const backend = new LayerFSBackend({
         client: sandboxClient(actions),
         output: join(root, 'out'),
@@ -150,7 +153,7 @@ describe('Sandbox-internal mounting bridge', () => {
 
       const baselineApply = actions.find(action => action[0] === 'apply')
       assert.ok(baselineApply)
-      assert.deepEqual(baselineApply[2].map(change => change.path).sort(), ['/notes.md', '/state.json'])
+      assert.deepEqual(baselineApply[2].map((change: any) => change.path).sort(), ['/notes.md', '/state.json'])
       assert.ok(actions.some(action => action[0] === 'commit' && action[2] === 'auto-research: baseline initial'))
 
       await setState(state.path, { score: 9, metrics: { score: 9 } })
@@ -160,10 +163,10 @@ describe('Sandbox-internal mounting bridge', () => {
       await backend.commit(state, { message: 'auto-research: verified initial' })
       const apply = actions.find(action => action[0] === 'apply')
       assert.ok(apply)
-      const writes = apply[2].filter(change => change.op === 'write').map(change => change.path).sort()
+      const writes = apply[2].filter((change: any) => change.op === 'write').map((change: any) => change.path).sort()
       assert.deepEqual(writes, ['/extra.txt', '/state.json'])
-      assert.deepEqual(apply[2].filter(change => change.op === 'rm').map(change => change.path), ['/notes.md'])
-      const stateWrite = apply[2].find(change => change.path === '/state.json')
+      assert.deepEqual(apply[2].filter((change: any) => change.op === 'rm').map((change: any) => change.path), ['/notes.md'])
+      const stateWrite = apply[2].find((change: any) => change.path === '/state.json')
       assert.match(stateWrite.content, /"score": 9/)
       assert.ok(actions.some(action => action[0] === 'commit'))
 
@@ -176,7 +179,7 @@ describe('Sandbox-internal mounting bridge', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const backend = new LayerFSBackend({
         client: sandboxClient(actions, { apply: false }),
         output: join(root, 'out'),
@@ -193,9 +196,9 @@ describe('Sandbox-internal mounting bridge', () => {
 
   it('materializes an adopted Sandbox branch through fs.list/fs.read', async () => {
     await withTemp(async root => {
-      const actions = []
+      const actions: any[] = []
       const client = sandboxClient(actions)
-      client.fs.list = async (branch, path) => {
+      client.fs.list = async (branch: string, path: string) => {
         if (path === '/') {
           return { items: [{ name: 'state.json', type: 'file' }, { name: 'RESEARCH_CONTEXT', type: 'directory' }], hasMore: false }
         }
@@ -204,7 +207,7 @@ describe('Sandbox-internal mounting bridge', () => {
         }
         return { items: [], hasMore: false }
       }
-      client.fs.read = async (branch, path) => {
+      client.fs.read = async (branch: string, path: string) => {
         if (path === '/state.json') return '{"score":4}\n'
         if (path.endsWith('.md')) return '# topic\n'
         throw new Error('missing')
@@ -221,11 +224,11 @@ describe('Sandbox-internal mounting bridge', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       let attempts = 0
       const client = sandboxClient(actions, { path: join(root, 'host-mount') })
       const fork = client.branch.fork
-      client.branch.fork = async (...args) => {
+      client.branch.fork = async (...args: any[]) => {
         attempts += 1
         if (attempts < 3) throw Object.assign(new Error('Busy'), { code: 'Busy' })
         await mkdir(join(root, 'host-mount'), { recursive: true })
@@ -268,9 +271,9 @@ export class LayerFS {
         DSH_LAYERFS_DAEMON: 'daemon',
         DSH_LAYERFS_CONTAINER_PREFIX: 'prefix',
         DSH_LAYERFS_DAEMON_HOST: 'host.docker.internal',
-      })
+      })!
       const { loadLayerfs } = await import('../lib/layerfs-workspace.js')
-      const loaded = await loadLayerfs(settings)
+      const loaded: any = await loadLayerfs(settings)
       assert.equal(loaded.client.projectName, 'proj')
       assert.equal(loaded.client.options.storePath, '/store')
       assert.equal(loaded.client.options.home, '/home')
@@ -326,7 +329,7 @@ export class LayerFS {
         DSH_LAYERFS_STORE_CONTAINER: 'prefix-store',
         DSH_LAYERFS_BUNDLE: '/bundle',
         DSH_LAYERFS_TRACE_START: '1',
-      })
+      })!
       assert.equal(settings.storeContainer, 'prefix-store')
       assert.equal(settings.bundle, '/bundle')
       assert.equal(settings.traceStart, '1')
@@ -344,7 +347,7 @@ export class LayerFS {
       delete process.env.LAYERFS_STORE_CONTAINER
       delete process.env.DSH_LAYERFS_BUNDLE
       const { loadLayerfs } = await import('../lib/layerfs-workspace.js')
-      const loaded = await loadLayerfs(settings)
+      const loaded: any = await loadLayerfs(settings)
       assert.equal(loaded.client.bundleAtImport, '/bundle', 'the bundle is visible at import time')
       assert.deepEqual(await loaded.client.call(), {
         storeContainer: 'prefix-store',
@@ -370,11 +373,11 @@ describe('LayerFS project initialization', () => {
       const home = join(root, 'home')
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const client = {
         options: { home, deploy: {} },
         project: {
-          async init(path) {
+          async init(path: string) {
             actions.push(['init', path])
             // project.init records the project as a directory under the home
             await mkdir(join(home, 'proj'), { recursive: true })
@@ -382,13 +385,13 @@ describe('LayerFS project initialization', () => {
           },
         },
         branch: {
-          async fork(name, from) {
+          async fork(name: string, from: string | undefined) {
             actions.push(['fork', name, from])
             if (!existsSync(join(home, 'proj'))) throw Object.assign(new Error('project proj does not exist'), { code: 'NoSuchProject' })
           },
         },
         workspace: {
-          async mount(branch) { return { sandbox: '1', path: `/workspaces/${branch}` } },
+          async mount(branch: string) { return { sandbox: '1', path: `/workspaces/${branch}` } },
           async commit() {},
           async unmount() {},
         },
@@ -408,13 +411,15 @@ describe('LayerFS project initialization', () => {
     await withTemp(async root => {
       const home = join(root, 'home')
       await mkdir(join(home, 'proj'), { recursive: true })
+      // A non-empty entry is a real project; only an empty leftover is removed.
+      await writeFile(join(home, 'proj', 'owner'), 'layerfs\n')
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const client = {
         options: { home },
         project: { async init() { actions.push('init') } },
-        branch: { async fork(name) { actions.push(['fork', name]) } },
+        branch: { async fork(name: string) { actions.push(['fork', name]) } },
         workspace: {
           async mount() { return { sandbox: '1', path: '/workspaces/1' } },
           async commit() {},
@@ -446,7 +451,7 @@ describe('session environment resolution', () => {
     const viaGet = await resolveShellEnvironment({ get: name => name === 'shellEnv' ? { env: { F: '6' } } : null })
     assert.deepEqual(viaGet, { F: '6' })
     const viaCollect = await resolveShellEnvironment({
-      shellEnv: { collect: execution => ({ G: '7', agent: String(execution.agent?.id ?? '') }) },
+      shellEnv: { collect: execution => ({ G: '7', agent: String((execution.agent as any)?.id ?? '') }) },
     }, { id: 'parent-1' })
     assert.deepEqual(viaCollect, { G: '7', agent: 'parent-1' })
     assert.deepEqual(await resolveShellEnvironment({}), {})
@@ -461,7 +466,7 @@ describe('session environment resolution', () => {
       DSH_LAYERFS_DAEMON: 'daemon',
       DSH_LAYERFS_CONTAINER_PREFIX: 'prefix',
       DSH_LAYERFS_DAEMON_HOST: 'host',
-    })
+    })!
     assert.equal(settings.image, 'image')
     assert.equal(settings.daemonHost, 'host')
     assert.equal(resolveLayerfsConfig({}), null)
@@ -477,7 +482,7 @@ describe('session environment resolution', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const manager = new WorkspaceManager(
         new LayerFSBackend({ client: sandboxClient(actions), output: join(root, 'out'), runId: 'run-5' }),
         { output: join(root, 'out') },
@@ -486,6 +491,7 @@ describe('session environment resolution', () => {
       await manager.release(state)
       await manager.release(state)
       assert.deepEqual(actions.filter(action => action[0] === 'unmount'), [
+        ['unmount', 'sandbox-1', true],
         ['unmount', 'sandbox-1', false],
         ['unmount', 'sandbox-1', false],
       ])

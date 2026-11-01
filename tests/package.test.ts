@@ -6,13 +6,13 @@ import { fileURLToPath } from 'node:url'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 
-async function json(relative_) {
+async function json(relative_: string): Promise<any> {
   return JSON.parse(await readFile(join(root, relative_), 'utf8'))
 }
 
 /** Every regular file under `directory` (recursive, stable order). */
-async function walkFiles(directory) {
-  const files = []
+async function walkFiles(directory: string): Promise<string[]> {
+  const files: string[] = []
   const entries = await readdir(directory, { withFileTypes: true })
   entries.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
   for (const entry of entries) {
@@ -32,9 +32,9 @@ describe('package metadata', () => {
     assert.equal(pkg.main, 'lib/index.js')
     assert.equal(pkg.types, 'lib/index.d.ts')
     assert.equal(pkg.icon, './icon.svg')
-    assert.equal(pkg.scripts.typecheck, 'tsc --noEmit')
+    assert.equal(pkg.scripts.typecheck, 'tsc --noEmit && tsc -p tsconfig.test.json --noEmit')
     assert.equal(pkg.scripts.build, 'tsc')
-    assert.equal(pkg.scripts.test, 'npm run typecheck && npm run build && node --test tests/*.test.mjs')
+    assert.equal(pkg.scripts.test, 'npm run typecheck && npm run build && node --test tests/*.test.ts')
     assert.equal(pkg.dsh.bundle.patch, './cordis.patch.yml')
     assert.deepEqual(pkg.exports['.'], { types: './lib/index.d.ts', default: './lib/index.js' })
     assert.equal(pkg.exports['./package.json'], './package.json')
@@ -109,8 +109,17 @@ describe('package metadata', () => {
     assert.equal(tsconfig.compilerOptions.outDir, 'lib')
     assert.match(tsconfig.compilerOptions.target, /^es2024$/i)
     for (const test of ['protocols', 'evaluator', 'workspace', 'runner', 'provider', 'policies', 'package']) {
-      assert.equal((await stat(join(root, `tests/${test}.test.mjs`))).isFile(), true, test)
+      assert.equal((await stat(join(root, `tests/${test}.test.ts`))).isFile(), true, test)
     }
+    const testFiles = await readdir(join(root, 'tests'))
+    assert.deepEqual(testFiles.filter(name => name.endsWith('.mjs')), [], 'tests must only contain TypeScript sources')
+    assert.ok(testFiles.filter(name => name.endsWith('.ts')).length >= 15, 'every test module is TypeScript')
+    const testConfig = await json('tsconfig.test.json')
+    assert.equal(testConfig.extends, './tsconfig.json')
+    assert.equal(testConfig.compilerOptions.noEmit, true)
+    assert.equal(testConfig.compilerOptions.allowImportingTsExtensions, true)
+    assert.equal(testConfig.compilerOptions.rootDir, '.')
+    assert.deepEqual(testConfig.include, ['src/**/*.ts', 'tests/**/*.ts'])
     for (const name of ['README.md', 'README.zh.md', 'LICENSE']) {
       assert.equal((await stat(join(root, name))).isFile(), true, name)
     }
@@ -168,11 +177,11 @@ describe('package metadata', () => {
   it('ships no SPEC.md and never lists it in files', async () => {
     await assert.rejects(stat(join(root, 'SPEC.md')), { code: 'ENOENT' })
     const pkg = await json('package.json')
-    assert.equal(pkg.files.some(entry => /^SPEC\.md$/i.test(entry)), false)
+    assert.equal(pkg.files.some((entry: string) => /^SPEC\.md$/i.test(entry)), false)
   })
 
   it('keeps the real E2E harness portable and contract-faithful', async () => {
-    const e2e = await readFile(join(root, 'tests/e2e-real.test.mjs'), 'utf8')
+    const e2e = await readFile(join(root, 'tests/e2e-real.test.ts'), 'utf8')
     // Live mounts the real registry contract (`register` + `collect(execution)`)
     // instead of a fake `resolve()` that no `dsh` version implements.
     assert.match(e2e, /ctx\.shellEnv\.collect\(/)
@@ -187,7 +196,7 @@ describe('package metadata', () => {
     assert.match(e2e, /`name=\$\{prefix\}`/)
     assert.match(e2e, /`volume=\$\{volume\}`/)
     assert.match(e2e, /for \(let attempt = 0; attempt < 3; attempt \+= 1\)/)
-    const support = await readFile(join(root, 'tests/e2e-support.mjs'), 'utf8')
+    const support = await readFile(join(root, 'tests/e2e-support.ts'), 'utf8')
     assert.match(support, /execFileSync\('docker', \['-H', `unix:\/\/\$\{LAYERFS_DOCKER\}`, 'version'/)
   })
 })

@@ -23,7 +23,7 @@ import {
   snapshot,
   writeJsonAtomic,
 } from '../lib/layerfs-workspace.js'
-import { withTemp, writeWorkspace } from './helpers.mjs'
+import { withTemp, writeWorkspace } from './helpers.ts'
 
 describe('inventory and snapshot', () => {
   it('hashes regular files and omits runtime, provider, env and shared-method state', async () => {
@@ -70,7 +70,7 @@ describe('inventory and snapshot', () => {
     assert.equal(sha256('a'), 'ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb')
     assert.equal(jsonDigest({ b: 1, a: [2] }), sha256('{"a":[2],"b":1}'))
     assert.equal(jsonEqual({ a: 1, b: 2 }, { b: 2, a: 1 }), true)
-    assert.deepEqual(publicRow({ id: 'x', _state: {}, _ownsState: true }), { id: 'x' })
+    assert.deepEqual(publicRow({ id: 'x', _state: {}, _ownsState: true } as any), { id: 'x' })
   })
 })
 
@@ -96,7 +96,7 @@ describe('snapshot backend and completion checkpoints', () => {
       await writeWorkspace(workspace, { score: 4, metrics: { score: 4 } })
       const output = join(root, 'out')
       const before = await inventory(workspace)
-      const row = {
+      const row: any = {
         id: 'round-1-explore-1',
         workspace,
         evaluation: {
@@ -114,7 +114,7 @@ describe('snapshot backend and completion checkpoints', () => {
       const restored = await restoreCompletedState(output, checkpoint, {
         id: 'round-1-explore-1-epoch-2',
         workspace,
-      })
+      } as any)
       assert.equal(restored.retained_completed_id, 'round-1-explore-1')
       assert.equal(restored.pending_workspace, workspace)
       assert.deepEqual(await inventory(restored.workspace), before)
@@ -131,7 +131,7 @@ describe('snapshot backend and completion checkpoints', () => {
         id: 'bad',
         workspace,
         evaluation: { valid: true, evidence: { 'state.json': '0'.repeat(64) } },
-      }), /evidence drift/)
+      } as any), /evidence drift/)
     })
     await withTemp(async root => {
       const workspace = join(root, 'workspace')
@@ -142,35 +142,35 @@ describe('snapshot backend and completion checkpoints', () => {
         id: 'good',
         workspace,
         evaluation: { valid: true, workspace_manifest_sha256: jsonDigest(before) },
-      })
+      } as any)
       const saved = JSON.parse(await readFile(checkpoint, 'utf8'))
       await chmod(join(output, 'checkpoint-objects', saved.files['notes.md']), 0o644)
       await writeFile(join(output, 'checkpoint-objects', saved.files['notes.md']), 'tampered')
-      await assert.rejects(restoreCompletedState(output, checkpoint, { id: 'next', workspace }), /object drift/)
+      await assert.rejects(restoreCompletedState(output, checkpoint, { id: 'next', workspace } as any), /object drift/)
     })
   })
 })
 
-function fakeLayerfs(root, actions) {
+function fakeLayerfs(root: string, actions: any[]) {
   const mounts = join(root, 'mounts')
   return {
     branch: {
-      async fork(name, from) {
+      async fork(name: string, from: string | undefined) {
         actions.push(['fork', name, from])
         await mkdir(join(mounts, name), { recursive: true })
       },
     },
     workspace: {
-      async mount(name) {
+      async mount(name: string) {
         actions.push(['mount', name])
         const path = join(mounts, name)
         await mkdir(path, { recursive: true })
         return { sandbox: 'sandbox-1', path }
       },
-      async commit(handle, message) {
+      async commit(handle: any, message: any) {
         actions.push(['commit', handle.sandbox, message])
       },
-      async unmount(handle, discard) {
+      async unmount(handle: any, discard: any) {
         actions.push(['unmount', handle.sandbox, discard])
       },
     },
@@ -185,7 +185,7 @@ describe('LayerFS backend', () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const actions = []
+      const actions: any[] = []
       const backend = new LayerFSBackend({
         client: fakeLayerfs(root, actions),
         project: 'p',
@@ -218,7 +218,7 @@ describe('LayerFS backend', () => {
 
   it('adopts a saved LayerFS branch and refuses adoption on snapshot backends', async () => {
     await withTemp(async root => {
-      const actions = []
+      const actions: any[] = []
       const output = join(root, 'out')
       const backend = new LayerFSBackend({
         client: fakeLayerfs(root, actions),
@@ -242,7 +242,7 @@ describe('LayerFS backend', () => {
   it('rejects incomplete LayerFS clients and parents without a workspace', async () => {
     assert.throws(() => new LayerFSBackend({ client: {}, output: '/tmp' }), /requires branch.fork/)
     const backend = new LayerFSBackend({ client: fakeLayerfs('/tmp', []), output: '/tmp' })
-    await assert.rejects(backend.fork({ id: 'x' }, 'child'), /parent workspace/)
+    await assert.rejects(backend.fork({ id: 'x' } as any, 'child'), /parent workspace/)
   })
 })
 
@@ -253,7 +253,7 @@ describe('LayerFS configuration', () => {
       DSH_LAYERFS_SDK: 'file:///sdk/index.js',
       DSH_LAYERFS_OPERATOR: 'file:///sdk/operator.js',
       DSH_LAYERFS_STORE_PATH: '/store',
-    })
+    })!
     assert.equal(config.project, 'proj')
     assert.equal(config.storePath, '/store')
     assert.equal(resolveLayerfsConfig({}), null)
@@ -277,17 +277,17 @@ export class LayerFS {
 }
 export class LayerFSOperator { constructor(client) { this.client = client } }
 `)
-      const loaded = await loadLayerfs({
+      const loaded: any = await loadLayerfs({
         project: 'proj',
         sdk,
         operator: sdk,
         storePath: '/store',
         home: '/home',
-      })
+      } as any)
       assert.equal(loaded.client.projectName, 'proj')
       assert.equal(loaded.client.options.storePath, '/store')
       assert.equal(loaded.operator.client, loaded.client)
-      await assert.rejects(loadLayerfs({ project: 'p', sdk: join(root, 'missing.mjs') }))
+      await assert.rejects(loadLayerfs({ project: 'p', sdk: join(root, 'missing.mjs') } as any))
     })
   })
 })

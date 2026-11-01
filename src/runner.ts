@@ -896,7 +896,10 @@ export class Runner {
       for (let index = 0; index < candidates.length; index += 1) {
         const row = candidates[index]
         if (row && row.completed && row.evaluation?.valid === true && !row.collaboration_failed) {
-          checkpoints[index] = await this.manager.retainCompletedState(publicRow(row))
+          // The live row (not `publicRow`) carries the epoch's mounted branch,
+          // so a LayerFS backend can commit the verified files before the next
+          // epoch mutates the same workspace in place.
+          checkpoints[index] = await this.manager.retainCompletedState(row)
         }
       }
       const publication = join(this.output, `${prefix}-shared`)
@@ -928,7 +931,11 @@ export class Runner {
           const checkpoint = checkpoints[index]
           if (checkpoint && broken) {
             await this.preserveUnverified(row)
-            restored.push(await this.manager.restoreCompletedState(checkpoint, publicRow(row)))
+            const restoredRow = await this.manager.restoreCompletedState(checkpoint, publicRow(row))
+            if (restoredRow._state) {
+              this.trackState(restoredRow._state, { id: restoredRow.id, parent: restoredRow.parent })
+            }
+            restored.push(restoredRow)
           } else {
             restored.push(row)
           }
@@ -1058,6 +1065,9 @@ export class Runner {
         await fsp.writeFile(handoffPath, parent.last_output, { mode: 0o600 })
         handoff = { from: parent.id, text: parent.last_output, path: handoffPath }
       }
+      if (state.staging) {
+        state.prelaunchInventory = await inventory(checkout)
+      }
 
       const branchEnv: Record<string, string> = { ...this.workerEnv }
       // The worker flag belongs to the live registry entry, never to a copied
@@ -1174,6 +1184,9 @@ export class Runner {
         clearTimeout(timer)
         workerRegistration?.dispose()
       }
+      // A Sandbox-internal worker edits `/workspaces/<n>`, not the host
+      // staging copy: fold its committed overlay back before evaluating.
+      if (typeof this.manager.reconcile === 'function') await this.manager.reconcile(state)
       this.checkCancelled()
       const assistantText = outputText(result?.output)
       providerEvents.push({
@@ -1252,8 +1265,16 @@ export class Runner {
       this.activeStates.delete(state)
       return { ...row, _state: state, _ownsState: ownsState }
     } catch (error) {
-      if (ownsState && state) {
+      if ((ownsState || resume) && state) {
         const stopped = this.intentionalStop()
+        if (resume) {
+          // The epoch-1 row still points at this same state with `valid: true`
+          // in its header; leaving it owned would let `releaseAll()` commit
+          // this dirty epoch-2 workspace as `retained <epoch-1-id>`. The
+          // orphan below is the only owner from here on.
+          parent._ownsState = false
+          parent._state = null
+        }
         const orphan: TrajectoryRow = {
           id: basename(folder),
           parent: parent.id,

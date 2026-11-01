@@ -12,9 +12,9 @@ import {
 } from '../lib/provider.js'
 import { Config, apply, coordinatorPolicy, name as pluginName, inject } from '../lib/index.js'
 import { ResearchStoppedError } from '../lib/runner.js'
-import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.mjs'
+import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
 
-function planObject(root, extra = {}) {
+function planObject(root: string, extra: Record<string, any> = {}): any {
   return {
     objective: 'Fixture objective',
     worker_prompt: 'Do one experiment and save evidence.',
@@ -31,7 +31,11 @@ function planObject(root, extra = {}) {
   }
 }
 
-async function fixture(root, { plan = {}, worker = null, config = {} } = {}) {
+async function fixture(root: string, {
+  plan = {},
+  worker = null,
+  config = {},
+}: { plan?: any; worker?: any; config?: any } = {}) {
   const cwd = join(root, 'repo')
   await writeWorkspace(cwd, { score: 1, metrics: { score: 1 } })
   await writeStateEvaluator(join(cwd, 'evaluator.mjs'))
@@ -40,7 +44,7 @@ async function fixture(root, { plan = {}, worker = null, config = {} } = {}) {
   if (plan !== null) {
     await writeFile(join(cwd, '.auto-research-methods', 'plan.json'), JSON.stringify(value))
   }
-  const subagents = fakeSubagents(worker ?? (async spec => {
+  const subagents = fakeSubagents(worker ?? (async (spec: any) => {
     await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
     return { output: [], stopReason: 'completed' }
   }), ['worker'])
@@ -59,26 +63,26 @@ async function fixture(root, { plan = {}, worker = null, config = {} } = {}) {
 }
 
 
-function fakeLayerfs(root, actions) {
+function fakeLayerfs(root: string, actions: any[]) {
   const mounts = join(root, 'mounts')
   return {
     branch: {
-      async fork(name, from) {
+      async fork(name: string, from: string) {
         actions.push(['fork', name, from])
         await mkdir(join(mounts, name), { recursive: true })
       },
     },
     workspace: {
-      async mount(name) {
+      async mount(name: string) {
         actions.push(['mount', name])
         const path = join(mounts, name)
         await mkdir(path, { recursive: true })
         return { sandbox: 'sandbox-1', path }
       },
-      async commit(handle, message) {
+      async commit(handle: any, message: string) {
         actions.push(['commit', handle.sandbox, message])
       },
-      async unmount(handle, discard) {
+      async unmount(handle: any, discard: boolean) {
         actions.push(['unmount', handle.sandbox, discard])
       },
     },
@@ -107,47 +111,47 @@ describe('provider parsing helpers', () => {
 
   it('prefers config, then the plan file, then the prompt', async () => {
     await withTemp(async root => {
-      const config = { plan: { objective: 'o', evaluator: 'e' }, planPath: '.auto-research-methods/plan.json' }
+      const config = { plan: { objective: 'o', evaluator: 'e' }, planPath: '.auto-research-methods/plan.json' } as any
       assert.equal((await resolvePlan({ cwd: root, config, promptText: '' })).source, 'config')
     })
     await withTemp(async root => {
       await mkdir(join(root, '.auto-research-methods'), { recursive: true })
       await writeFile(join(root, '.auto-research-methods', 'plan.json'), JSON.stringify({ objective: 'o', evaluator: 'e' }))
-      const result = await resolvePlan({ cwd: root, config: { planPath: '.auto-research-methods/plan.json' }, promptText: '' })
+      const result = await resolvePlan({ cwd: root, config: { planPath: '.auto-research-methods/plan.json' } as any, promptText: '' })
       assert.equal(result.source.endsWith('plan.json'), true)
     })
     await withTemp(async root => {
       const result = await resolvePlan({
         cwd: root,
-        config: { planPath: '.auto-research-methods/plan.json' },
+        config: { planPath: '.auto-research-methods/plan.json' } as any,
         promptText: '```json\n{"objective":"o","evaluator":"e"}\n```',
       })
       assert.equal(result.source, 'prompt')
     })
     await withTemp(async root => {
-      await assert.rejects(resolvePlan({ cwd: root, config: { planPath: 'none.json' }, promptText: '' }), /No research plan/)
+      await assert.rejects(resolvePlan({ cwd: root, config: { planPath: 'none.json' } as any, promptText: '' }), /No research plan/)
     })
   })
 })
 
 describe('plugin entry', () => {
   it('validates config through the standard schema', () => {
-    assert.equal(Config['~standard'].validate({}).value.providerName, 'auto-research')
-    assert.equal(Config['~standard'].validate({ branches: 2 }).value.branches, 2)
-    assert.deepEqual(Config['~standard'].validate(null).value.workerEnv, {})
+    assert.equal((Config['~standard'].validate({}) as any).value.providerName, 'auto-research')
+    assert.equal((Config['~standard'].validate({ branches: 2 }) as any).value.branches, 2)
+    assert.deepEqual((Config['~standard'].validate(null) as any).value.workerEnv, {})
     assert.equal(resolveConfig({}).rounds, 1)
   })
 
   it('registers the provider and the coordinator prompt section', () => {
-    const registered = []
-    const sections = []
-    const ctx = {
+    const registered: any[] = []
+    const sections: any[] = []
+    const ctx: any = {
       subagents: {
-        registerProvider(provider) { registered.push(provider) },
+        registerProvider(provider: any) { registered.push(provider) },
       },
       systemPrompt: {
-        getSectionOrder(name) { return name === 'PLAN_POLICY' ? 500 : 999 },
-        section(section) { sections.push(section) },
+        getSectionOrder(name: any) { return name === 'PLAN_POLICY' ? 500 : 999 },
+        section(section: any) { sections.push(section) },
       },
     }
     apply(ctx, { branches: 2, rsiTop: false })
@@ -167,11 +171,11 @@ describe('plugin entry', () => {
   })
 
   it('falls back to a numeric order when the host lacks getSectionOrder', () => {
-    const sections = []
+    const sections: any[] = []
     apply({
       subagents: { registerProvider() {} },
-      systemPrompt: { section(section) { sections.push(section) } },
-    }, {})
+      systemPrompt: { section(section: any) { sections.push(section) } },
+    } as any, {})
     assert.equal(sections[0].order, 500)
   })
 })
@@ -189,12 +193,12 @@ describe('AutoResearchProvider', () => {
       })
       const result = await handle.result
       assert.equal(result.stopReason, 'completed')
-      assert.match(result.output[0].text, /Auto-research batch COMPLETED/)
-      assert.match(result.output[0].text, /leader: round-1-continue-1/)
+      assert.match((result.output as any)[0].text, /Auto-research batch COMPLETED/)
+      assert.match((result.output as any)[0].text, /leader: round-1-continue-1/)
       assert.equal(subagents.calls.length, 1)
       const runs = await readdir(join(cwd, '.auto-research-methods', 'runs'))
       assert.equal(runs.length, 1)
-      assert.equal(JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'runs', runs[0], 'RESULT.json'), 'utf8')).status, 'COMPLETED')
+      assert.equal(JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'runs', runs[0]!, 'RESULT.json'), 'utf8')).status, 'COMPLETED')
       assert.equal(JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'LATEST.json'), 'utf8')).leader_workspace.includes('runs'), true)
       await handle.dispose()
       await handle.dispose()
@@ -220,7 +224,7 @@ describe('AutoResearchProvider', () => {
       })
       const result = await handle.result
       assert.equal(result.stopReason, 'completed')
-      assert.match(result.output[0].text, /score: 5/)
+      assert.match((result.output as any)[0].text, /score: 5/)
       await handle.dispose()
     })
   })
@@ -279,7 +283,7 @@ describe('AutoResearchProvider', () => {
     await withTemp(async root => {
       const { cwd } = await fixture(root)
       const provider = new AutoResearchProvider({
-        ctx: { subagents: { list: () => ['auto-research'], startActivation() {} } },
+        ctx: { subagents: { list: () => ['auto-research'], startActivation() {} } } as any,
         config: { workerProvider: 'auto-research' },
       })
       await assert.rejects(provider.start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }), /cannot delegate to itself/)
@@ -287,7 +291,7 @@ describe('AutoResearchProvider', () => {
     await withTemp(async root => {
       const { cwd } = await fixture(root)
       const provider = new AutoResearchProvider({
-        ctx: { subagents: { list: () => ['auto-research'], startActivation() {} } },
+        ctx: { subagents: { list: () => ['auto-research'], startActivation() {} } } as any,
         config: {},
       })
       await assert.rejects(provider.start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }), /at least one other/)
@@ -295,7 +299,7 @@ describe('AutoResearchProvider', () => {
     await withTemp(async root => {
       const { cwd } = await fixture(root)
       const provider = new AutoResearchProvider({
-        ctx: { subagents: { list: () => ['worker'], startActivation() {} } },
+        ctx: { subagents: { list: () => ['worker'], startActivation() {} } } as any,
         config: { workerProvider: 'missing' },
       })
       await assert.rejects(provider.start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }), /not registered/)
@@ -315,11 +319,11 @@ describe('AutoResearchProvider', () => {
       }), error => error instanceof ResearchStoppedError)
     })
     await withTemp(async root => {
-      let startedResolve
-      const started = new Promise(resolve => { startedResolve = resolve })
-      let release
-      const gate = new Promise(resolve => { release = resolve })
-      const worker = async spec => {
+      let startedResolve: any
+      const started = new Promise<void>(resolve => { startedResolve = resolve })
+      let release: any
+      const gate = new Promise<void>(resolve => { release = resolve })
+      const worker = async (spec: any) => {
         startedResolve()
         await gate
         return { output: [], stopReason: spec.signal?.aborted ? 'aborted' : 'completed' }
@@ -337,13 +341,13 @@ describe('AutoResearchProvider', () => {
       const result = await handle.result
       await disposing
       assert.equal(result.stopReason, 'aborted')
-      assert.match(result.output[0].text, /STOPPED/)
+      assert.match((result.output as any)[0].text, /STOPPED/)
     })
   })
 
   it('remounts the saved LayerFS leader branch on the next batch', async () => {
     await withTemp(async root => {
-      const actions = []
+      const actions: any[] = []
       const client = fakeLayerfs(root, actions)
       const { cwd, provider } = await fixture(root, {
         config: { layerfs: { client, project: 'p' } },

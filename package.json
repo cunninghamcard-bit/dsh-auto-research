@@ -29,9 +29,9 @@
     "tsconfig.json"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
     "build": "tsc",
-    "test": "npm run typecheck && npm run build && node --test tests/*.test.mjs"
+    "test": "npm run typecheck && npm run build && node --test tests/*.test.ts"
   },
   "keywords": [
     "dsh",

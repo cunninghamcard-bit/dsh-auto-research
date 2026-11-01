@@ -9,11 +9,11 @@ import {
 } from '../lib/runner.js'
 import { LayerFSBackend, WorkspaceManager, createWorkspaceManager, inventory } from '../lib/layerfs-workspace.js'
 import { SHARED_CONTEXT_POLICY } from '../lib/policies.js'
-import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.mjs'
+import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
 
-const sha256 = data => createHash('sha256').update(data).digest('hex')
+const sha256 = (data: any) => createHash('sha256').update(data).digest('hex')
 
-function planFor(root, extra = {}) {
+function planFor(root: string, extra: any = {}): any {
   return {
     objective: 'Improve the fixture score',
     worker_prompt: 'Run one bounded fixture experiment and save evidence.',
@@ -40,7 +40,7 @@ function planFor(root, extra = {}) {
   }
 }
 
-async function setup(root, {
+async function setup(root: string, {
   state = { score: 1, metrics: { score: 1, progress: 0 } },
   worker,
   extraPlan = {},
@@ -48,6 +48,14 @@ async function setup(root, {
   manager = null,
   subagents = null,
   clock = fakeClock(),
+}: {
+  state?: any
+  worker?: any
+  extraPlan?: any
+  options?: any
+  manager?: any
+  subagents?: any
+  clock?: any
 } = {}) {
   const workspace = join(root, 'workspace')
   await writeWorkspace(workspace, state)
@@ -77,7 +85,7 @@ async function setup(root, {
   return { runner, subagents: service, manager: workspaceManager, output, workspace, plan, clock }
 }
 
-async function writePortfolio(cwd, size = 2, parent = 'initial') {
+async function writePortfolio(cwd: string, size = 2, parent = 'initial') {
   await writeFile(join(cwd, 'PORTFOLIO.json'), JSON.stringify(Array.from({ length: size }, (_, index) => ({
     bottleneck: 'b' + index,
     mechanism: 'm' + index,
@@ -87,7 +95,7 @@ async function writePortfolio(cwd, size = 2, parent = 'initial') {
   }))))
 }
 
-async function writeCheckpoint(cwd, index) {
+async function writeCheckpoint(cwd: string, index: number) {
   await writeFile(join(cwd, 'RESEARCH_CHECKPOINT.md'), `# checkpoint ${index}\n`)
   await mkdir(join(cwd, 'RESEARCH_CONTEXT'), { recursive: true })
   await writeFile(join(cwd, 'RESEARCH_CONTEXT', `topic${index}__method__result__verified.md`), '# topic\n')
@@ -100,10 +108,10 @@ async function writeCheckpoint(cwd, index) {
   const bundle = files.find(name => name.startsWith('peer-evidence-'))
   if (!bundle) return
   const body = await readFile(join(cwd, 'SHARED_CONTEXT', bundle))
-  const parsed = JSON.parse(body)
+  const parsed = JSON.parse(body as any)
   await writeFile(join(cwd, 'PEER-REVIEW.json'), JSON.stringify({
     manifest_sha256: sha256(body),
-    reviews: parsed.peers.map(peer => ({
+    reviews: parsed.peers.map((peer: any) => ({
       peer_id: peer.id,
       finding: 'observed ' + peer.id,
       action: 'independent check',
@@ -111,26 +119,26 @@ async function writeCheckpoint(cwd, index) {
   }))
 }
 
-function hostLayerfs(root, actions) {
+function hostLayerfs(root: string, actions: any[]): any {
   const mounts = join(root, 'mounts')
   return {
     branch: {
-      async fork(name, from) {
+      async fork(name: string, from: string) {
         actions.push(['fork', name, from])
         await mkdir(join(mounts, name), { recursive: true })
       },
     },
     workspace: {
-      async mount(name) {
+      async mount(name: string) {
         actions.push(['mount', name])
         const path = join(mounts, name)
         await mkdir(path, { recursive: true })
         return { sandbox: name, path }
       },
-      async commit(handle, message) {
+      async commit(handle: any, message: string) {
         actions.push(['commit', handle.sandbox, message])
       },
-      async unmount(handle, discard) {
+      async unmount(handle: any, discard: boolean) {
         actions.push(['unmount', handle.sandbox, discard])
       },
     },
@@ -143,7 +151,7 @@ function hostLayerfs(root, actions) {
 describe('P0: full RSI view, provider archival, and continuation handoff', () => {
   it('serializes the complete view in prompt/LAUNCH, archives provider.jsonl, and hands off output', async () => {
     await withTemp(async root => {
-      const worker = async (spec, index) => {
+      const worker = async (spec: any, index: number) => {
         const text = spec.request.prompt[0].text
         await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index, progress: 2 + index } })
         if (text.includes('RSI-top dashboard view')) await writePortfolio(spec.request.cwd, 2)
@@ -161,16 +169,16 @@ describe('P0: full RSI view, provider archival, and continuation handoff', () =>
       assert.equal(launch.metric_view.definitions.length, 1)
       assert.ok(Array.isArray(launch.metric_view.diagnostics))
       assert.ok(Array.isArray(launch.metric_view.rows))
-      const exploreCall = subagents.calls.find(call => call.label.includes('explore'))
+      const exploreCall = subagents.calls.find((call: any) => call.label.includes('explore'))
       assert.ok(exploreCall)
-      const line = exploreCall.request.prompt[0].text.split('\n').find(value => value.startsWith('RSI-top dashboard view'))
+      const line = exploreCall.request.prompt[0].text.split('\n').find((value: any) => value.startsWith('RSI-top dashboard view'))
       assert.ok(line)
       const promptView = JSON.parse(line.slice(line.indexOf(':') + 2))
       assert.deepEqual(Object.keys(promptView).sort(), ['definitions', 'diagnostics', 'rows'])
       assert.equal(promptView.definitions.length, 1)
       assert.ok(Array.isArray(promptView.rows))
 
-      const continueCall = subagents.calls.find(call => call.label.includes('continue'))
+      const continueCall = subagents.calls.find((call: any) => call.label.includes('continue'))
       assert.ok(continueCall)
       const continuePrompt = continueCall.request.prompt[0].text
       const continueLaunch = JSON.parse(await readFile(join(runner.output, 'round-1-continue-1', 'LAUNCH.json'), 'utf8'))
@@ -192,7 +200,7 @@ describe('P0: full RSI view, provider archival, and continuation handoff', () =>
       assert.match(transcript[0].text, /Objective: Improve the fixture score/)
 
       const dashboard = JSON.parse(await readFile(join(runner.output, 'DASHBOARD.json'), 'utf8'))
-      for (const row of dashboard.trajectories.filter(row => row.phase)) {
+      for (const row of dashboard.trajectories.filter((row: any) => row.phase)) {
         assert.equal(typeof row.last_output, 'string')
       }
       assert.equal(result.leader.id, 'round-1-continue-1')
@@ -204,7 +212,7 @@ describe('P0: full RSI view, provider archival, and continuation handoff', () =>
 describe('P0/P1: rejected branch preservation and cooperative fidelity', () => {
   it('commits completed rejected branches and never discards them', async () => {
     await withTemp(async root => {
-      const actions = []
+      const actions: any[] = []
       const workspace = join(root, 'workspace')
       await writeWorkspace(workspace)
       await writeStateEvaluator(join(root, 'evaluator.mjs'))
@@ -213,7 +221,7 @@ describe('P0/P1: rejected branch preservation and cooperative fidelity', () => {
         new LayerFSBackend({ client: hostLayerfs(root, actions), output, runId: 'run' }),
         { output },
       )
-      const worker = async (spec, index) => {
+      const worker = async (spec: any, index: number) => {
         if (index === 0) {
           await setState(spec.request.cwd, { valid: false, score: 0, reason: 'scientifically rejected' })
         } else {
@@ -232,7 +240,7 @@ describe('P0/P1: rejected branch preservation and cooperative fidelity', () => {
       assert.ok(commits.some(message => /^auto-research: verified round-1-explore-[12]$/.test(message)), commits.join('\n'))
       assert.ok(!actions.some(action => action[0] === 'unmount' && action[2] === true))
       const dashboard = JSON.parse(await readFile(join(runner.output, 'DASHBOARD.json'), 'utf8'))
-      const rejected = dashboard.trajectories.filter(row => row.phase === 'explore' && row.evaluation.valid === false)
+      const rejected = dashboard.trajectories.filter((row: any) => row.phase === 'explore' && row.evaluation.valid === false)
       assert.equal(rejected.length, 1)
       await runner.releaseAll()
     })
@@ -240,8 +248,8 @@ describe('P0/P1: rejected branch preservation and cooperative fidelity', () => {
 
   it('publishes policy, peer paths, and copies shared-context.md into later branches', async () => {
     await withTemp(async root => {
-      const prompts = []
-      const worker = async (spec, index) => {
+      const prompts: any[] = []
+      const worker = async (spec: any, index: number) => {
         const text = spec.request.prompt[0].text
         prompts.push({ index, text, cwd: spec.request.cwd })
         await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index, progress: 2 + index } })
@@ -293,12 +301,12 @@ describe('P0/P1: rejected branch preservation and cooperative fidelity', () => {
 describe('P1: sibling aborts, disposal, dedupe, cancellation artifacts', () => {
   it('aborts siblings and always disposes activations when one result rejects', async () => {
     await withTemp(async root => {
-      const calls = []
+      const calls: any[] = []
       let disposed = 0
       let siblingAborted = false
       const subagents = {
         list: () => ['worker'],
-        async startActivation(spec) {
+        async startActivation(spec: any) {
           const index = calls.length
           calls.push(spec)
           if (index === 0) {
@@ -330,8 +338,8 @@ describe('P1: sibling aborts, disposal, dedupe, cancellation artifacts', () => {
       let releases = 0
       const commit = manager.commit.bind(manager)
       const release = manager.release.bind(manager)
-      manager.commit = async (...args) => { commits += 1; return commit(...args) }
-      manager.release = async (...args) => { releases += 1; return release(...args) }
+      manager.commit = async (...args: any[]) => { commits += 1; return commit(...args) }
+      manager.release = async (...args: any[]) => { releases += 1; return release(...args) }
       await assert.rejects(runner.run(), /worker exploded/)
       assert.equal(siblingAborted, true)
       assert.equal(disposed, 2)
@@ -353,8 +361,8 @@ describe('P1: sibling aborts, disposal, dedupe, cancellation artifacts', () => {
       let releases = 0
       const commit = manager.commit.bind(manager)
       const release = manager.release.bind(manager)
-      manager.commit = async (...args) => { commits += 1; return commit(...args) }
-      manager.release = async (...args) => { releases += 1; return release(...args) }
+      manager.commit = async (...args: any[]) => { commits += 1; return commit(...args) }
+      manager.release = async (...args: any[]) => { releases += 1; return release(...args) }
       await runner.releaseAll()
       assert.equal(commits, 1)
       assert.equal(releases, 1)
@@ -363,7 +371,7 @@ describe('P1: sibling aborts, disposal, dedupe, cancellation artifacts', () => {
 
   it('writes a STOPPED RESULT.json with pending workspaces and preserves the branch', async () => {
     await withTemp(async root => {
-      const actions = []
+      const actions: any[] = []
       const workspace = join(root, 'workspace')
       await writeWorkspace(workspace)
       await writeStateEvaluator(join(root, 'evaluator.mjs'))
@@ -372,11 +380,11 @@ describe('P1: sibling aborts, disposal, dedupe, cancellation artifacts', () => {
         new LayerFSBackend({ client: hostLayerfs(root, actions), output, runId: 'run' }),
         { output },
       )
-      let startedResolve
+      let startedResolve: any
       const started = new Promise(resolve => { startedResolve = resolve })
-      let release
+      let release: any
       const gate = new Promise(resolve => { release = resolve })
-      const worker = async spec => {
+      const worker = async (spec: any) => {
         startedResolve()
         await gate
         return { output: [], stopReason: spec.signal?.aborted ? 'aborted' : 'completed' }

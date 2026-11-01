@@ -159,9 +159,9 @@ Real LayerFS mounts return a Sandbox-internal path such as `/workspaces/1`. When
 ## Tests
 
 ```bash
-npm run typecheck   # strict tsc --noEmit
+npm run typecheck   # strict tsc --noEmit for src and tests
 npm run build       # tsc -> lib/index.js + lib/*.d.ts
-npm test            # typecheck + build + node --test tests/*.test.mjs
+npm test            # typecheck + build + node --test tests/*.test.ts
 ```
 
 The `node:test` suite covers protocols (full RSI views, reservoir sampling, portfolios, checkpoint auto-discovery, peer review, shared-context fidelity), evaluator freezing/integrity/shebang handling, both workspace backends, LayerFS staging and Busy retries, completion restoration, full runner batches (fork-and-flush, RSI stall, cooperation, sibling aborts, provider.jsonl handoff, failure/timeout distinctions), the checkout lock, cancellation artifacts, provider/plugin lifecycle, and TypeScript build outputs.
@@ -169,6 +169,6 @@ The `node:test` suite covers protocols (full RSI views, reservoir sampling, port
 ## Limitations
 
 - The generic `startActivation` seam cannot resume a provider's own CLI session. Continuation fidelity is preserved by archiving each turn in `provider.jsonl` and handing the previous assistant output plus `.auto-research-methods-handoff.md` to the next worker.
-- Sandbox-internal LayerFS mounts are bridged through a host staging directory; very large workspaces pay a copy cost, and binary adopted files that `fs.read` refuses are skipped with a warning.
+- Sandbox-internal LayerFS mounts are bridged through a host staging directory; very large workspaces pay a copy cost. Binary adopted files that `fs.read` refuses are copied through `workspace.exec` + `base64`; when that is unavailable they are skipped with a warning and never removed from the branch.
 - Cooperative epochs reuse a branch workspace and require the worker to finish within the share window; the hard phase deadline still applies.
 - The evaluator must be a local executable script; there is no built-in sandbox beyond the accepted workspace and inventory checks.

@@ -141,9 +141,11 @@
 
 ## LayerFS 集成
 
-存在 `DSH_LAYERFS_PROJECT` 与 `DSH_LAYERFS_SDK`（或 `config.layerfs` 提供）时，分支使用 `branch.fork`、`workspace.mount`、`workspace.commit` 与 `workspace.unmount`。`Busy` 拒绝会以指数退避重试；分支名保持在 63 字符以内；验证通过的状态会提交；已完成的科学拒绝分支会以 `rejected` 提交并以 `discard: false` 卸载，保留在 LayerFS 历史中；provider 失败与超时的工作会作为未验证状态提交并保留以供审阅。Sandbox 内部挂载路径会通过宿主暂存目录桥接，并用 `fs.apply`/`workspace.commit` 同步。没有绑定项目时，使用全量拷贝快照后端与内容寻址检查点对象。
+存在 `DSH_LAYERFS_PROJECT` 与 `DSH_LAYERFS_SDK`（或 `config.layerfs` 提供）时，分支使用 `branch.fork`、`workspace.mount`、`workspace.commit` 与 `workspace.unmount`。`Busy` 拒绝会以指数退避重试；分支名保持在 63 字符以内；被采用的分支名会先校验。验证通过的状态会提交，并以其 LayerFS 分支作为检查点；已完成的科学拒绝分支会以 `rejected` 提交并以 `discard: false` 卸载，保留在 LayerFS 历史中；provider 失败与超时的工作会作为未验证状态提交并保留以供审阅。没有绑定项目时，使用全量拷贝快照后端与内容寻址检查点对象。
 
-provider 读取 `DSH_LAYERFS_PROJECT`、`DSH_LAYERFS_SDK`、`DSH_LAYERFS_OPERATOR`、`DSH_LAYERFS_STORE_PATH`、`DSH_LAYERFS_HOME`。显式 `config.layerfs` 优先于环境变量。
+真实 LayerFS 挂载返回 Sandbox 内部路径（如 `/workspaces/1`）。当该路径在宿主上不可访问时，后端在 `<run>/<branch>/workspace` 暂存宿主副本，并在该副本上执行评估与 worker，同时在提交时用 `client.fs.apply`（或 `fs.write`/`fs.rm`）发布新增/修改/删除的文件，再调用 `workspace.commit`。冻结基线后会重新挂载分支，使 Sandbox 内的 `/workspaces/<n>` 与宿主暂存副本一致；worker 轮次结束后会把已提交的 Sandbox 覆盖层同步回宿主副本再评估。`fs.read` 无法表示的二进制文件通过 `workspace.exec` + `base64` 原样复制，无法复制时标记为跳过且绝不会被误删。worker 还会收到 `DSH_AUTO_RESEARCH_BRANCH` 与 `DSH_AUTO_RESEARCH_SANDBOX_PATH`。
+
+provider 从 `config.layerfs`、`process.env` 与会话的 `ctx.shellEnv` contributor 解析 `DSH_LAYERFS_PROJECT`、`DSH_LAYERFS_SDK`、`DSH_LAYERFS_OPERATOR`、`DSH_LAYERFS_CLI`、`DSH_LAYERFS_SKILL`、`DSH_LAYERFS_HOME`、`DSH_LAYERFS_STORE_PATH`、`DSH_LAYERFS_DOCKER`、`DSH_LAYERFS_IMAGE`、`DSH_LAYERFS_VOLUME`、`DSH_LAYERFS_DAEMON`、`DSH_LAYERFS_CONTAINER_PREFIX`、`DSH_LAYERFS_DAEMON_HOST`、`DSH_LAYERFS_STORE_CONTAINER`、`DSH_LAYERFS_BUNDLE`、`DSH_LAYERFS_WSL_ENDPOINT`、`DSH_LAYERFS_TRACE`、`DSH_LAYERFS_TRACE_STEP` 与 `DSH_LAYERFS_TRACE_START`。显式 `config.layerfs` 优先；宿主注入的 `layerfs.client` 从不由本插件关闭。
 
 ## 安全
 
@@ -156,7 +158,7 @@ provider 读取 `DSH_LAYERFS_PROJECT`、`DSH_LAYERFS_SDK`、`DSH_LAYERFS_OPERATO
 
 ## 构建
 
-源码位于 `src/*.ts`（严格 TypeScript），`npm run build` 编译到 `lib/`（`lib/index.js`、`lib/*.d.ts`），`npm test` 依次执行 typecheck、build 和 `node --test`。
+源码位于 `src/*.ts`（严格 TypeScript），`npm run build` 编译到 `lib/`（`lib/index.js`、`lib/*.d.ts`），`npm test` 依次执行 typecheck、build 和 `node --test tests/*.test.ts`。测试也全部是严格 TypeScript（`tsconfig.test.json` 同时检查 `src` 与 `tests`）。
 
 ## 测试
 
@@ -169,6 +171,6 @@ npm test
 ## 限制
 
 - worker 的 provider session 会被记录，但通用 `startActivation` 接口无法恢复会话；每个 worker 轮次都收到全新提示词。
-- 假定 LayerFS 挂载暴露主机可访问的工作区路径。
+- Sandbox 内部的 LayerFS 挂载通过宿主暂存目录桥接；超大工作区需要复制成本。二进制文件通过 `workspace.exec` 原样复制，无法复制时跳过并告警，且不会被删除。
 - 协作 epoch 复用分支工作区，要求 worker 在共享窗口内完成；硬性阶段截止时间仍然生效。
 - 评估器必须是本地可执行脚本；除已接受的工作区与清单检查外没有额外沙箱。

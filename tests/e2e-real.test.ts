@@ -41,7 +41,7 @@ import {
   dshStackAvailable,
   layerfsHostAvailable,
   liveLayerfsAvailable,
-} from './e2e-support.mjs'
+} from './e2e-support.ts'
 
 const AUTO_RESEARCH = new URL('../lib/index.js', import.meta.url).href
 const SHELL_ENV = `${DSH_ROOT}/packages/shell/shell-env/lib/index.js`
@@ -72,7 +72,7 @@ async function dshModules() {
   return { Context: cordis.Context, testkit, SubagentRuntime: subagent.default }
 }
 
-function digest(text) {
+function digest(text: string | Buffer) {
   return createHash('sha256').update(text).digest('hex')
 }
 
@@ -85,14 +85,14 @@ function digest(text) {
  * created, so the scenario can ask the real `ctx.shellEnv` registry what a
  * worker's own bash call would receive.
  */
-function workerProvider(probe = null) {
-  const starts = []
+function workerProvider(probe: any = null) {
+  const starts: any[] = []
   const provider = {
     name: 'e2e-worker',
     capabilities: { agentOptions: false, agentPreset: false, outputSchema: false, depthLimit: false },
     inheritsParentContext: false,
     starts,
-    async start(request) {
+    async start(request: any) {
       starts.push({ cwd: request.cwd })
       const stateFile = join(request.cwd, 'state.json')
       const state = JSON.parse(readFileSync(stateFile, 'utf8'))
@@ -137,7 +137,7 @@ function workerProvider(probe = null) {
 }
 
 /** Write the worker's peer review when the branch received a peer snapshot. */
-function writePeerReview(cwd) {
+function writePeerReview(cwd: string) {
   const dir = join(cwd, 'SHARED_CONTEXT')
   if (!existsSync(dir)) return
   // A resumed branch keeps earlier epochs' snapshots in the same folder; the
@@ -147,12 +147,12 @@ function writePeerReview(cwd) {
     .map(name => ({ name, at: statSync(join(dir, name)).mtimeMs }))
     .sort((a, b) => b.at - a.at)
   if (entries.length === 0) return
-  const text = readFileSync(join(dir, entries[0].name), 'utf8')
+  const text = readFileSync(join(dir, entries[0]!.name), 'utf8')
   const bundle = JSON.parse(text)
   const peers = Array.isArray(bundle.peers) ? bundle.peers : []
   writeFileSync(join(cwd, 'PEER-REVIEW.json'), JSON.stringify({
     manifest_sha256: digest(Buffer.from(text)),
-    reviews: peers.map(peer => ({
+    reviews: peers.map((peer: any) => ({
       peer_id: peer.id,
       finding: `peer ${peer.id} reported a verified score`,
       action: 'independent check of its stated evidence',
@@ -161,7 +161,7 @@ function writePeerReview(cwd) {
 }
 
 /** The dsh subagent service plus one ready parent agent, as dsh builds them. */
-async function mountDshContext(modules) {
+async function mountDshContext(modules: any) {
   const ctx = new modules.Context()
   await modules.testkit.mountAgentLoopTestDependencies(ctx, {
     workingDirectory: true,
@@ -182,13 +182,13 @@ async function mountDshContext(modules) {
 function fallbackShellEnvRegistry() {
   const contributors = new Map()
   return {
-    register(contributor) {
+    register(contributor: any) {
       if (contributors.has(contributor.name)) throw new Error(`bash env contributor "${contributor.name}" is already registered`)
       contributors.set(contributor.name, contributor)
       return () => contributors.delete(contributor.name)
     },
-    collect(execution) {
-      const values = {}
+    collect(execution: any) {
+      const values: Record<string, string> = {}
       for (const contributor of [...contributors.values()].sort((left, right) => left.name.localeCompare(right.name))) {
         for (const [key, value] of Object.entries(contributor.resolve(execution))) {
           if (!Object.hasOwn(contributor.variables, key)) throw new Error(`undeclared bash env key "${key}"`)
@@ -209,12 +209,12 @@ function fallbackShellEnvRegistry() {
  * real `ctx.shellEnv` registry, whose contract is `register(contributor)` plus
  * `collect(execution)`.
  */
-async function mountShellEnv(ctx, env) {
+async function mountShellEnv(ctx: any, env: any) {
   const variables = Object.fromEntries(Object.keys(env).map(key => [key, { description: `e2e LayerFS fact ${key}` }]))
   const contributor = {
     name: 'layerfs',
     variables,
-    resolve(execution) {
+    resolve(execution: any) {
       assert.ok(execution.callId, 'collect() receives a complete tool execution with a callId')
       assert.ok(execution.rootCallId, 'collect() receives a complete tool execution with a rootCallId')
       return { ...env }
@@ -231,7 +231,7 @@ async function mountShellEnv(ctx, env) {
 }
 
 /** The shell environment a worker's own bash call resolves through `ctx.shellEnv`. */
-function collectFor(ctx, agent, callId = 'bash-1') {
+function collectFor(ctx: any, agent: any, callId = 'bash-1') {
   return ctx.shellEnv.collect({
     agent,
     callId,
@@ -243,7 +243,7 @@ function collectFor(ctx, agent, callId = 'bash-1') {
 }
 
 /** Mount the worker backend and the real plugin, and start one batch. */
-async function runBatch({ ctx, agent, workspace, pluginConfig }) {
+async function runBatch({ ctx, agent, workspace, pluginConfig }: any) {
   const activation = await ctx.subagents.startActivation({
     provider: 'auto-research',
     label: 'e2e-batch',
@@ -263,7 +263,7 @@ async function runBatch({ ctx, agent, workspace, pluginConfig }) {
 }
 
 /** A fixture checkout with state, checkpoint, evaluator and plan. */
-function makeWorkspace(root) {
+function makeWorkspace(root: string) {
   const workspace = join(root, 'repo')
   mkdirSync(workspace, { recursive: true })
   writeFileSync(join(workspace, 'state.json'), JSON.stringify({ score: 1, trials: 0 }, null, 2) + '\n')
@@ -286,22 +286,22 @@ function makeWorkspace(root) {
   return workspace
 }
 
-function readJson(path) {
+function readJson(path: string) {
   return JSON.parse(readFileSync(path, 'utf8'))
 }
 
 /** Run one backend's two batches and assert the full batch + adoption contract. */
-async function scenario(backend) {
+async function scenario(backend: string) {
   const modules = await dshModules()
   const host = await import(pathToFileURL(`${LAYERFS_HOST}/src/box.js`).href)
   const root = mkdtempSync(join(tmpdir(), `dsh-ar-e2e-${backend}-`))
   const workspace = makeWorkspace(root)
   const live = backend === 'live' ? await setUpLive(host, root) : null
   const env = live ? live.env : simulatedEnv(root, simulatedProjectName())
-  let ctx = null
+  let ctx: any = null
   /** What each worker's own bash call would receive from `ctx.shellEnv`. */
-  const workerEnvironments = []
-  const worker = workerProvider((cwd, childId) => {
+  const workerEnvironments: any[] = []
+  const worker = workerProvider((cwd: string, childId: string) => {
     workerEnvironments.push({
       cwd,
       bySession: collectFor(ctx, { session: { header: { id: childId, cwd, origin: 'subagent' } } }),
@@ -316,7 +316,7 @@ async function scenario(backend) {
     await ctx.plugin({
       name: 'e2e-worker-backend',
       inject: ['subagents'],
-      apply(context) { context.subagents.registerProvider(worker) },
+      apply(context: any) { context.subagents.registerProvider(worker) },
     })
     const plugin = await import(AUTO_RESEARCH)
     await ctx.plugin(plugin, {
@@ -336,12 +336,12 @@ async function scenario(backend) {
       shareContext: true,
       sharingIntervalMinutes: 0.042,
     })
-    assert.deepEqual(ctx.subagents.list().filter(name => name === 'auto-research'), ['auto-research'])
+    assert.deepEqual(ctx.subagents.list().filter((name: string) => name === 'auto-research'), ['auto-research'])
 
     // One batch: two rounds, each explore (cohort, 2 branches) + continue.
     const first = await runBatch({ ctx, agent, workspace })
     assert.equal(first.stopReason, 'completed', String(first.diagnostic ?? ''))
-    assert.match(first.output.map(block => block.text ?? '').join('\n'), /Auto-research batch COMPLETED/)
+    assert.match(first.output.map((block: any) => block.text ?? '').join('\n'), /Auto-research batch COMPLETED/)
 
     // The provider registered a `shellEnv` contributor that resolves each
     // running worker's branch environment for its own bash calls, while the
@@ -370,10 +370,10 @@ async function scenario(backend) {
 
     const runDir = latest.run
     const selections = readJson(join(runDir, 'SELECTIONS.json'))
-    assert.deepEqual(selections.map(entry => entry.phase), ['explore', 'continue', 'explore', 'continue'])
+    assert.deepEqual(selections.map((entry: any) => entry.phase), ['explore', 'continue', 'explore', 'continue'])
     const collaboration = readJson(join(runDir, 'round-1-explore-COLLABORATION.json'))
     assert.ok(collaboration.epochs.length >= 2, 'the cooperative cohort shared at least once')
-    assert.ok(collaboration.epochs.some(epoch => epoch.peer_bundle), 'a later epoch received peer evidence')
+    assert.ok(collaboration.epochs.some((epoch: any) => epoch.peer_bundle), 'a later epoch received peer evidence')
     const dashboard = readJson(join(runDir, 'DASHBOARD.json'))
     assert.ok(dashboard, 'dashboard written')
 
@@ -386,7 +386,7 @@ async function scenario(backend) {
     const secondInitial = readJson(join(latest2.run, 'initial', 'INPUT-MANIFEST.json'))
     assert.ok(Object.keys(secondInitial).length > 0, 'the adopted branch materialized files')
     const secondDashboard = readJson(join(latest2.run, 'DASHBOARD.json'))
-    const adopted = secondDashboard.trajectories.find(row => row.id === 'initial')
+    const adopted = secondDashboard.trajectories.find((row: any) => row.id === 'initial')
     assert.ok(adopted, 'the second batch evaluated an initial candidate')
     assert.ok(adopted.evaluation.score >= leaderState.score,
       `the adopted branch carried the leader score (${adopted.evaluation.score} >= ${leaderState.score})`)
@@ -409,7 +409,7 @@ function simulatedProjectName() {
   return simulatedProject
 }
 
-function simulatedEnv(root, project) {
+function simulatedEnv(root: string, project: string) {
   const home = join(root, 'home')
   mkdirSync(home, { recursive: true, mode: 0o700 })
   return {
@@ -434,10 +434,10 @@ function simulatedEnv(root, project) {
  * while the daemon already listens inside the container. The build context is
  * a unique temporary directory and is always removed, whatever the build does.
  */
-let wrappedImage = null
+let wrappedImage: any = null
 async function wrappedRuntimeImage() {
   if (wrappedImage) return wrappedImage
-  const docker = (...args) => execFileSync('docker', ['-H', `unix://${LAYERFS_DOCKER}`, ...args], { encoding: 'utf8' }).trim()
+  const docker = (...args: any[]) => execFileSync('docker', ['-H', `unix://${LAYERFS_DOCKER}`, ...args], { encoding: 'utf8' }).trim()
   const base = docker('image', 'inspect', '--format', '{{.Id}}', RUNTIME_TAG)
   const context = mkdtempSync(join(tmpdir(), 'dsh-ar-e2e-runtime-'))
   try {
@@ -453,8 +453,8 @@ async function wrappedRuntimeImage() {
 }
 
 /** A real Store container plus the LayerFS home for one live scenario. */
-async function setUpLive(host, root) {
-  const docker = (...args) => execFileSync('docker', ['-H', `unix://${LAYERFS_DOCKER}`, ...args], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }).trim()
+async function setUpLive(host: any, root: string) {
+  const docker = (...args: any[]) => execFileSync('docker', ['-H', `unix://${LAYERFS_DOCKER}`, ...args], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }).trim()
   const id = Date.now().toString(36)
   const home = join(root, 'home')
   mkdirSync(home, { recursive: true, mode: 0o700 })

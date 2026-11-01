@@ -88,6 +88,14 @@ export declare class SnapshotBackend {
 /** Sanitize a value into a Docker/LayerFS-safe name fragment. */
 export declare function branchSafe(value: unknown, max?: number): string;
 /**
+ * Whether `fs.read` refused a file because it is not UTF-8 text.
+ *
+ * A binary adopted file has no text representation to stage, but it is not a
+ * lost file: `workspace.exec` can copy the exact bytes, or the file is reported
+ * as skipped and never removed from the branch.
+ */
+export declare function isSkippableAdoptedFile(error: unknown): boolean;
+/**
  * Whether a commit/unmount refusal only means the mount is behind its branch.
  *
  * `fs.apply` creates a commit on the branch, so right after publishing the
@@ -156,6 +164,8 @@ export declare class LayerFSBackend {
     readonly retryBaseDelayMs: number;
     /** Close of the client `loadLayerfs` built, which also restores the environment. */
     readonly releaseEnvironment: (() => Promise<void> | void) | null;
+    /** Re-assert this backend's LayerFS environment lease before each SDK call. */
+    readonly activateEnvironment: (() => void) | null;
     constructor(options: {
         client: LayerFSClient;
         operator?: unknown;
@@ -167,6 +177,7 @@ export declare class LayerFSBackend {
         ownsClient?: boolean;
         retryBaseDelayMs?: number;
         releaseEnvironment?: (() => Promise<void> | void) | null;
+        activateEnvironment?: (() => void) | null;
     });
     /** @returns a branch name that always fits Docker's 63-character limit. */
     branchName(id: string): string;
@@ -177,6 +188,12 @@ export declare class LayerFSBackend {
      * error.
      */
     private discardMount;
+    /**
+     * Remount a staged branch after its HEAD moved (baseline publish / Sandbox
+     * commit), so the Sandbox view and the host staging copy describe the same
+     * branch state.
+     */
+    private remountStaging;
     private mountBranch;
     private syncStaging;
     private materializeBranch;
@@ -219,6 +236,15 @@ export declare class LayerFSBackend {
     }): Promise<WorkspaceState>;
     fork(parent: WorkspaceState, id: string): Promise<WorkspaceState>;
     adopt(branch: string, id: string): Promise<WorkspaceState>;
+    /**
+     * Fold changes made inside a live Sandbox mount back into the host staging
+     * copy before it is evaluated.
+     *
+     * A worker calls `bash` inside `/workspaces/<n>`; those edits stay in the
+     * Sandbox overlay until they are committed. Host edits take precedence: if
+     * the staging directory changed, `commit()` is the writer and this returns.
+     */
+    reconcile(state: WorkspaceState): Promise<void>;
     commit(state: WorkspaceState, { message }?: {
         message?: string;
     }): Promise<void>;
@@ -244,6 +270,7 @@ export declare class WorkspaceManager implements WorkspaceManagerLike {
         }) => Promise<void>;
         retainCompletedState: (row: TrajectoryRow) => Promise<string>;
         restoreCompletedState: (checkpoint: string, failedRow: TrajectoryRow) => Promise<TrajectoryRow>;
+        reconcile?: (state: WorkspaceState) => Promise<void>;
         close?: () => Promise<void>;
     };
     readonly output: string | undefined;
@@ -262,6 +289,7 @@ export declare class WorkspaceManager implements WorkspaceManagerLike {
     }): Promise<void>;
     retainCompletedState(row: TrajectoryRow): Promise<string>;
     restoreCompletedState(checkpoint: string, failedRow: TrajectoryRow): Promise<TrajectoryRow>;
+    reconcile(state: WorkspaceState): Promise<void>;
     close(): Promise<void>;
 }
 /** Every `DSH_LAYERFS_*` name a `dsh` session may publish. */
@@ -309,9 +337,24 @@ export declare const SHELL_ENV_CALL_ID = "auto-research-env";
  * publishes for a session, keyed without the prefix.
  */
 export declare function layerfsDeployment(settings: LayerFSSettings): Record<string, string>;
+/** A published environment patch: call it to release, `.activate()` to re-assert. */
+export type EnvironmentLease = (() => void) & {
+    activate: () => void;
+};
+/**
+ * Set `patch` on `target` until the returned lease is released.
+ *
+ * A patch value of `undefined` only *observes* the key: it establishes a lease
+ * (so a concurrent release cannot restore over it) without changing the value.
+ * `activate()` re-asserts this lease's own values, which lets a caller keep its
+ * binding active across another caller's release. Releasing a lease while
+ * another one is live makes that other lease's newest value active again, and
+ * the true baseline is restored only when the last lease ends.
+ */
+export declare function applyEnvironmentPatch(patch: Array<[string, string | undefined]>, target: NodeJS.ProcessEnv | Record<string, unknown>): EnvironmentLease;
 /**
  * Publish one session's LayerFS binding on `process.env` until the returned
- * function runs.
+ * lease is released.
  *
  * The SDK constructor, its ported entry (`@dsh-layerfs/host/src/port/sdk.js`,
  * which reads `DSH_LAYERFS_BUNDLE` at import time) and its ported native
@@ -323,7 +366,7 @@ export declare function layerfsDeployment(settings: LayerFSSettings): Record<str
  * and the bare `LAYERFS_` spelling are set, because the SDK prefers the bare
  * one and a stale bare value would otherwise silently win.
  */
-export declare function applyLayerfsEnvironment(settings: LayerFSSettings, target?: NodeJS.ProcessEnv | Record<string, unknown>): () => void;
+export declare function applyLayerfsEnvironment(settings: LayerFSSettings, target?: NodeJS.ProcessEnv | Record<string, unknown>): EnvironmentLease;
 /**
  * Import the LayerFS SDK and construct its client and optional operator.
  *
@@ -336,6 +379,7 @@ export declare function loadLayerfs(settings: LayerFSSettings): Promise<{
     client: LayerFSClient;
     operator: unknown;
     close: () => Promise<void>;
+    activate: () => void;
 }>;
 /**
  * Build the workspace manager, preferring LayerFS when bound.

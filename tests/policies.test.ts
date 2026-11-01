@@ -178,7 +178,7 @@ describe('buildWorkerPrompt', () => {
   })
 
   it('requires a worker prompt', () => {
-    assert.throws(() => buildWorkerPrompt({ plan: { objective: 'o' } }), /worker_prompt/)
-    assert.throws(() => buildWorkerPrompt(), /worker_prompt/)
+    assert.throws(() => buildWorkerPrompt({ plan: { objective: 'o' } } as any), /worker_prompt/)
+    assert.throws(() => buildWorkerPrompt({} as any), /worker_prompt/)
   })
 })

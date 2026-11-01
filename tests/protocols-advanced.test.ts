@@ -12,7 +12,7 @@ import {
   writeSharedContextAtomic,
 } from '../lib/protocols.js'
 import { SHARED_CONTEXT_POLICY } from '../lib/policies.js'
-import { withTemp } from './helpers.mjs'
+import { withTemp } from './helpers.ts'
 
 describe('RSI metric-view sampling at scale', () => {
   const metrics = Array.from({ length: 60 }, (_, index) => ({ name: `m${index}`, definition: `metric ${index}` }))
@@ -27,14 +27,14 @@ describe('RSI metric-view sampling at scale', () => {
 
   it('stays deterministic for a seeded RNG and projects diagnostics/rows', () => {
     const rows = [{ id: 'initial', parent: null, workspace: '/w', evaluation: { metrics: { m0: 1, m1: 2 } } }]
-    const diagnostics = [{ name: 'm0' }, { name: 'm1' }]
+    const diagnostics: any[] = [{ name: 'm0' }, { name: 'm1' }]
     const first = sampleMetricViews({ metrics, subset: 5, count: 6, rows, diagnostics, rng: seededRandom(3) })
     const second = sampleMetricViews({ metrics, subset: 5, count: 6, rows, diagnostics, rng: seededRandom(3) })
     assert.deepEqual(first, second)
     for (const view of first) {
       const keys = view.definitions.map(definition => definition.name)
       assert.deepEqual(view.diagnostics.map(item => item.name), diagnostics.filter(item => keys.includes(item.name)).map(item => item.name))
-      assert.deepEqual(Object.keys(view.rows[0].metrics), keys)
+      assert.deepEqual(Object.keys(view.rows[0]!.metrics), keys)
     }
   })
 
@@ -87,7 +87,7 @@ describe('shared-context fidelity', () => {
 })
 
 describe('shared checkpoint auto-discovery', () => {
-  async function setup(root, { listed = [], extra = {} } = {}) {
+  async function setup(root: string, { listed = [], extra = {} }: { listed?: any[]; extra?: Record<string, string> } = {}) {
     for (const [name, body] of Object.entries(extra)) {
       await mkdir(join(root, name, '..'), { recursive: true })
       await writeFile(join(root, name), body)
@@ -115,7 +115,7 @@ describe('shared checkpoint auto-discovery', () => {
         'RESEARCH_CONTEXT/a__b__c__verified.md',
         'evidence.json',
       ])
-      assert.equal(checkpoint.files['RESEARCH_CHECKPOINT.md'].text, '# checkpoint\n')
+      assert.equal(checkpoint.files['RESEARCH_CHECKPOINT.md']!.text, '# checkpoint\n')
     })
   })
 
@@ -146,7 +146,7 @@ describe('shared checkpoint auto-discovery', () => {
   it('builds immutable peer evidence with every peer id', () => {
     const bundle = buildPeerEvidence({ objective: 'o', peers: [{ id: 'p1' }, { id: 'p2' }] })
     assert.equal(bundle.objective, 'o')
-    assert.equal(bundle.peers.length, 2)
-    assert.match(bundle.scope, /not a shared proof/)
+    assert.equal((bundle.peers as unknown[]).length, 2)
+    assert.match(bundle.scope as string, /not a shared proof/)
   })
 })

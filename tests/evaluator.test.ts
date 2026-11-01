@@ -8,9 +8,9 @@ import {
   runEvaluatorProcess,
   scoreValue,
 } from '../lib/evaluator.js'
-import { withTemp, writeStateEvaluator, writeWorkspace } from './helpers.mjs'
+import { withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
 
-async function fixture(root, options = {}) {
+async function fixture(root: string, options: any = {}): Promise<any> {
   const evaluatorPath = join(root, 'evaluator.mjs')
   await writeStateEvaluator(evaluatorPath)
   const output = join(root, 'output')
@@ -203,7 +203,7 @@ describe('FrozenEvaluator', () => {
   })
 
   it('validates required constructor inputs and freeze ordering', async () => {
-    assert.throws(() => new FrozenEvaluator({ plan: {}, output: '/tmp' }), /evaluator/)
+    assert.throws(() => new FrozenEvaluator({ plan: {} as any, output: '/tmp' }), /evaluator/)
     await withTemp(async root => {
       const evaluator = createFrozenEvaluator({
         plan: { evaluator: join(root, 'missing.mjs'), evaluation_seconds: 1, metrics: [] },
