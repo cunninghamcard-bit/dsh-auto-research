@@ -356,6 +356,8 @@ export interface Config {
   forkAndFlush?: boolean
   shareContext?: boolean
   sharingIntervalMinutes?: number
+  /** Explicit workspace backend choice; `auto` is the default resolution. */
+  workspaceBackend?: 'auto' | 'layerfs' | 'snapshot'
   layerfs?: LayerFSBinding | false | null
   workerEnv?: Record<string, unknown>
   plan?: ResearchPlanInput
@@ -375,6 +377,7 @@ export interface ResolvedConfig {
   forkAndFlush: boolean
   shareContext: boolean
   sharingIntervalMinutes: number
+  workspaceBackend?: 'auto' | 'layerfs' | 'snapshot'
   layerfs?: LayerFSBinding | false | null
   workerEnv: Record<string, unknown>
   plan?: ResearchPlanInput
@@ -464,6 +467,32 @@ export interface EvaluatorLike {
   ) => Promise<EvaluationResult>
 }
 
+/** A live branch-worker environment registration. */
+export interface WorkerEnvRegistrationLike {
+  readonly id: string
+  readonly checkout: string
+  setChildSession: (sessionId: string | null) => void
+  dispose: () => void
+}
+
+/**
+ * The provider's registry of live branch-worker environments. The runner
+ * registers each branch here so a `dsh` `shellEnv` contributor can resolve the
+ * worker's `DSH_AUTO_RESEARCH_*` variables during its own `bash` calls.
+ */
+export interface WorkerEnvRegistryLike {
+  readonly size: number
+  register: (input: {
+    id: string
+    checkout: string
+    parentSessionId?: string | null
+    childSessionId?: string | null
+    env?: Record<string, string>
+  }) => WorkerEnvRegistrationLike
+  resolve: (execution: unknown) => Record<string, string>
+  ownsCheckout: (path: string) => boolean
+}
+
 /** Dependency bag for {@link Runner}. */
 export interface RunnerDeps {
   subagents: SubagentsService
@@ -471,10 +500,13 @@ export interface RunnerDeps {
   evaluator?: EvaluatorLike
   initialState?: WorkspaceState
   parent?: unknown
+  /** Runtime session id of the coordinator, used to match worker shell calls. */
+  parentSessionId?: string
   signal?: AbortSignal
   workerProvider: string
   workerEnv?: Record<string, unknown>
   layerfsEnv?: Record<string, unknown>
+  workerEnvRegistry?: WorkerEnvRegistryLike
   clock?: Clock
   rng?: () => number
   logger?: Logger | null

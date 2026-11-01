@@ -8,7 +8,7 @@
 
 import { randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
-import { isAbsolute, join, resolve } from 'node:path'
+import { isAbsolute, join, resolve, sep } from 'node:path'
 import {
   createWorkspaceManager,
   inventory,
@@ -18,6 +18,7 @@ import {
   resolveLayerfsConfig,
   resolveShellEnvironment,
   selectPlanWorkspace,
+  withoutLayerfsTrace,
   writeJsonAtomic,
 } from './layerfs-workspace.js'
 import { FrozenEvaluator } from './evaluator.js'
@@ -54,6 +55,25 @@ export function resolveConfig(input: unknown = {}): ResolvedConfig {
   const config: Config = input && typeof input === 'object' && !Array.isArray(input)
     ? input as Config
     : {}
+  if (config.rounds !== undefined) requirePositiveInteger(config.rounds, 'rounds')
+  if (config.branches !== undefined) requirePositiveInteger(config.branches, 'branches')
+  for (const key of ['explorationMinutes', 'exploitationMinutes', 'sharingIntervalMinutes'] as const) {
+    if (config[key] !== undefined) requirePositiveNumber(config[key], key)
+  }
+  for (const key of ['rsiTop', 'forkAndFlush', 'shareContext'] as const) {
+    if (config[key] !== undefined && typeof config[key] !== 'boolean') {
+      throw new Error(`${key} must be a boolean`)
+    }
+  }
+  if (config.workspaceBackend !== undefined
+    && config.workspaceBackend !== 'auto'
+    && config.workspaceBackend !== 'layerfs'
+    && config.workspaceBackend !== 'snapshot') {
+    throw new Error("workspaceBackend must be 'auto', 'layerfs' or 'snapshot'")
+  }
+  for (const key of ['providerName', 'planPath', 'workerProvider'] as const) {
+    if (config[key] !== undefined) requireNonEmptyString(config[key], key)
+  }
   const resolved: ResolvedConfig = {
     providerName: config.providerName ?? 'auto-research',
     planPath: config.planPath ?? '.auto-research-methods/plan.json',
@@ -68,9 +88,28 @@ export function resolveConfig(input: unknown = {}): ResolvedConfig {
     workerEnv: config.workerEnv ?? {},
   }
   if (config.workerProvider !== undefined) resolved.workerProvider = config.workerProvider
+  if (config.workspaceBackend !== undefined) resolved.workspaceBackend = config.workspaceBackend
   if (config.layerfs !== undefined) resolved.layerfs = config.layerfs
   if (config.plan !== undefined) resolved.plan = config.plan
   return resolved
+}
+
+function requirePositiveInteger(value: unknown, name: string): void {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    throw new Error(`${name} must be a positive integer`)
+  }
+}
+
+function requirePositiveNumber(value: unknown, name: string): void {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a positive finite number`)
+  }
+}
+
+function requireNonEmptyString(value: unknown, name: string): void {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error(`${name} must be a non-empty string`)
+  }
 }
 
 /** Extract the standalone user text from a `ContentBlock[]` or string. */
@@ -378,6 +417,195 @@ export async function acquireRunnerLock(
   throw new Error(`Could not acquire the auto-research runner lock: ${path}`)
 }
 
+/** The worker environment keys this plugin owns in a `dsh` shell registry. */
+export const AUTO_RESEARCH_ENV_KEYS = [
+  'DSH_AUTO_RESEARCH_WORKER',
+  'DSH_AUTO_RESEARCH_BRANCH',
+  'DSH_AUTO_RESEARCH_CHECKOUT',
+  'DSH_AUTO_RESEARCH_SANDBOX_PATH',
+] as const
+
+/** A `DSH_*` name a `dsh` shell registry accepts as a contributor key. */
+const REGISTRY_KEY = /^DSH_[A-Z][A-Z0-9_]*$/
+
+interface WorkerEnvEntry {
+  key: number
+  id: string
+  checkout: string
+  parentSessionId: string | null
+  childSessionId: string | null
+  env: Record<string, string>
+}
+
+/** Live handle for one running branch worker. */
+export interface WorkerEnvRegistration {
+  readonly id: string
+  readonly checkout: string
+  /** Bind the worker's real child session id once the provider reports it. */
+  setChildSession: (sessionId: string | null) => void
+  dispose: () => void
+}
+
+/**
+ * The branch environments of the workers that are running right now.
+ *
+ * `dsh` rebuilds the `DSH_*` namespace for every model shell call and asks each
+ * registered contributor for the values of the calling execution. The runner
+ * registers a worker's branch environment before starting its activation and
+ * removes it in `finally`, so a worker's own `bash` calls receive
+ * `DSH_AUTO_RESEARCH_*` (and the configured `workerEnv`) in their real process
+ * environment, while the coordinator's calls receive nothing.
+ */
+export class WorkerEnvRegistry {
+  private readonly entries = new Map<number, WorkerEnvEntry>()
+  private nextKey = 1
+
+  get size(): number {
+    return this.entries.size
+  }
+
+  /** @returns every checkout that currently has a live worker. */
+  checkouts(): string[] {
+    return [...this.entries.values()].map(entry => entry.checkout)
+  }
+
+  /** Whether `path` is one of the live worker checkouts (or inside it). */
+  ownsCheckout(path: string): boolean {
+    const target = resolve(path)
+    for (const entry of this.entries.values()) {
+      if (isContained(resolve(entry.checkout), target)) return true
+    }
+    return false
+  }
+
+  register({
+    id,
+    checkout,
+    parentSessionId = null,
+    childSessionId = null,
+    env = {},
+  }: {
+    id: string
+    checkout: string
+    parentSessionId?: string | null
+    childSessionId?: string | null
+    env?: Record<string, string>
+  }): WorkerEnvRegistration {
+    const key = this.nextKey
+    this.nextKey += 1
+    const entry: WorkerEnvEntry = {
+      key,
+      id,
+      checkout: resolve(checkout),
+      parentSessionId,
+      childSessionId,
+      env: { ...env },
+    }
+    this.entries.set(key, entry)
+    let disposed = false
+    return {
+      id,
+      checkout: entry.checkout,
+      setChildSession: sessionId => {
+        if (!this.entries.has(key)) return
+        entry.childSessionId = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : null
+      },
+      dispose: () => {
+        if (disposed) return
+        disposed = true
+        this.entries.delete(key)
+      },
+    }
+  }
+
+  /** The branch environment for one shell tool execution, or `{}`. */
+  resolve(execution: unknown): Record<string, string> {
+    const entry = this.match(execution)
+    if (!entry) return {}
+    // The flag is forced last: a configured `workerEnv` must never be able to
+    // claim it is outside a worker session.
+    return { ...entry.env, DSH_AUTO_RESEARCH_WORKER: '1' }
+  }
+
+  /** The registered entry that belongs to `execution`, if any. */
+  private match(execution: unknown): WorkerEnvEntry | null {
+    if (!execution || typeof execution !== 'object') return null
+    const agent = (execution as { agent?: unknown }).agent
+    const session = agent && typeof agent === 'object'
+      ? (agent as { session?: { header?: Record<string, unknown> } }).session
+      : undefined
+    const header = session?.header ?? null
+    const sessionId = typeof header?.id === 'string' ? header.id : null
+    const cwd = typeof header?.cwd === 'string' ? header.cwd : null
+    const parentSession = typeof header?.parentSession === 'string' ? header.parentSession : null
+    const origin = header?.origin
+    if (sessionId) {
+      for (const entry of this.entries.values()) {
+        if (entry.childSessionId !== null && entry.childSessionId === sessionId) return entry
+      }
+    }
+    if (!cwd) return null
+    const target = resolve(cwd)
+    const matches = [...this.entries.values()]
+      .filter(entry => isContained(entry.checkout, target))
+      .sort((left, right) => right.checkout.length - left.checkout.length)
+    const exact = matches.find(entry => entry.checkout === target)
+    if (exact) return exact
+    if (matches.length === 1) return matches[0] as WorkerEnvEntry
+    if (matches.length === 0) return null
+    // Several workers share this checkout tree (cooperative epochs reuse one
+    // branch): a declared child/parent session decides, then the newest entry.
+    if (origin === 'subagent' || parentSession !== null) {
+      const related = matches.find(entry => parentSession !== null && entry.parentSessionId === parentSession)
+      return related ?? (matches.at(-1) as WorkerEnvEntry)
+    }
+    return null
+  }
+}
+
+/** The runtime session id of a live agent, when the host exposes one. */
+export function sessionIdOf(agent: unknown): string | null {
+  const header = (agent as { session?: { header?: { id?: unknown } } } | null | undefined)?.session?.header
+  return typeof header?.id === 'string' && header.id.length > 0 ? header.id : null
+}
+
+/** Whether `path` sits inside a `.auto-research-methods/runs/` runtime tree. */
+export function isInsideRuntimeRuns(path: string): boolean {
+  const parts = resolve(path).split(sep)
+  const index = parts.lastIndexOf('.auto-research-methods')
+  return index >= 0 && parts[index + 1] === 'runs'
+}
+
+/** One-line description for each environment key this plugin owns. */
+const WORKER_KEY_DESCRIPTIONS: Record<(typeof AUTO_RESEARCH_ENV_KEYS)[number], string> = {
+  DSH_AUTO_RESEARCH_WORKER: '1 inside an auto-research branch worker; absent for the coordinator',
+  DSH_AUTO_RESEARCH_BRANCH: 'LayerFS branch of this worker checkout (when the workspace backend has one)',
+  DSH_AUTO_RESEARCH_CHECKOUT: 'Absolute host checkout this branch worker edits',
+  DSH_AUTO_RESEARCH_SANDBOX_PATH: 'Sandbox-internal mount path of this worker checkout (LayerFS only)',
+}
+
+/**
+ * The `DSH_*` keys the `auto-research` contributor declares.
+ *
+ * The owned worker keys are always declared; a configured `workerEnv` adds
+ * every well-formed `DSH_*` name (except `DSH_LAYERFS_*`, owned by
+ * `@dsh-layerfs/host`). Other names cannot travel through a `dsh` shell
+ * registry at all, so they stay in the prompt environment only.
+ */
+export function declaredWorkerEnvKeys(
+  workerEnv: Record<string, unknown> = {},
+): Record<string, { description: string }> {
+  const keys: Record<string, { description: string }> = {}
+  for (const name of AUTO_RESEARCH_ENV_KEYS) {
+    keys[name] = { description: WORKER_KEY_DESCRIPTIONS[name] }
+  }
+  for (const name of Object.keys(workerEnv)) {
+    if (!REGISTRY_KEY.test(name) || name.startsWith('DSH_LAYERFS_') || Object.hasOwn(keys, name)) continue
+    keys[name] = { description: 'Configured auto-research worker environment value' }
+  }
+  return keys
+}
+
 /** One provider instance, normally created by the Cordis plugin entry. */
 export class AutoResearchProvider implements SubagentProvider {
   readonly ctx: PluginContext
@@ -385,6 +613,20 @@ export class AutoResearchProvider implements SubagentProvider {
   readonly name: string
   readonly capabilities: Record<string, unknown>
   readonly inheritsParentContext: boolean
+  /** Branch environments of the workers that are running right now. */
+  readonly workerEnvs = new WorkerEnvRegistry()
+  /**
+   * `DSH_*` keys the shell contributor may return.
+   *
+   * A `dsh` registry refuses an undeclared key, so the owned keys plus every
+   * `DSH_*` name from `config.workerEnv` are declared up front. `DSH_LAYERFS_*`
+   * is never declared here: `@dsh-layerfs/host` owns those keys for the same
+   * session and a second owner is a hard registration error.
+   */
+  readonly workerEnvKeys: Readonly<Record<string, { description: string }>>
+  /** Batches whose runner is still alive (used to reject recursive delegation). */
+  activeBatches = 0
+  private disposeShellEnv: (() => void) | null = null
 
   constructor({ ctx, config = {} }: { ctx: PluginContext; config?: Config }) {
     if (!ctx) throw new Error('AutoResearchProvider requires a plugin context')
@@ -393,6 +635,95 @@ export class AutoResearchProvider implements SubagentProvider {
     this.name = this.config.providerName
     this.capabilities = NO_START_CAPABILITIES
     this.inheritsParentContext = false
+    this.workerEnvKeys = declaredWorkerEnvKeys(this.config.workerEnv)
+    this.installShellEnvContributor()
+  }
+
+  /** Release the shell-env registration (the Cordis fiber normally owns it). */
+  dispose(): void {
+    this.disposeShellEnv?.()
+    this.disposeShellEnv = null
+  }
+
+  /** The `ctx.shellEnv` service, read without tripping Cordis's inject guard. */
+  private shellEnvService(context: unknown = this.ctx): PluginContext['shellEnv'] {
+    const holder = context as { get?: (name: string) => unknown; shellEnv?: unknown } | null | undefined
+    if (!holder) return undefined
+    if (typeof holder.get === 'function') {
+      try {
+        const value = holder.get('shellEnv')
+        if (value) return value as PluginContext['shellEnv']
+      } catch {
+        // The service is not injected in this host; try the property fallback.
+      }
+    }
+    try {
+      return holder.shellEnv as PluginContext['shellEnv']
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * Register the branch `shellEnv` contributor once a `dsh` shell registry is
+   * available. The registry may be injected after this provider is built, so
+   * `ctx.inject` is used when the service is not there yet.
+   */
+  private installShellEnvContributor(): void {
+    const install = (service: PluginContext['shellEnv'] | null | undefined): void => {
+      if (!service || typeof service.register !== 'function' || this.disposeShellEnv) return
+      try {
+        this.disposeShellEnv = service.register(this.workerEnvContributor())
+      } catch (error) {
+        // A host that refuses the registration still runs; workers then rely on
+        // the documented prompt environment only.
+        this.ctx.logger?.warn?.(`[auto-research] shellEnv contributor unavailable: ${(error as Error).message}`)
+      }
+    }
+    const existing = this.shellEnvService()
+    if (existing) {
+      install(existing)
+      return
+    }
+    const inject = (this.ctx as { inject?: unknown }).inject
+    if (typeof inject !== 'function') return
+    try {
+      ;(inject as (names: string[], callback: (child: unknown) => void) => unknown).call(
+        this.ctx,
+        ['shellEnv'],
+        child => install(this.shellEnvService(child)),
+      )
+    } catch {
+      // shellEnv is optional for this plugin.
+    }
+  }
+
+  /** The contributor handed to `ctx.shellEnv.register`. */
+  workerEnvContributor(): {
+    name: string
+    variables: Record<string, { description: string }>
+    resolve: (execution: unknown) => Record<string, string>
+  } {
+    return {
+      name: 'auto-research',
+      variables: this.workerEnvKeys,
+      resolve: execution => this.workerEnvFor(execution),
+    }
+  }
+
+  /**
+   * The branch environment for one shell execution, filtered to declared keys.
+   *
+   * `resolve` is only invoked for a worker's own session (see
+   * {@link WorkerEnvRegistry.match}); a coordinator's call gets nothing.
+   */
+  workerEnvFor(execution: unknown): Record<string, string> {
+    const resolved = this.workerEnvs.resolve(execution)
+    const allowed: Record<string, string> = {}
+    for (const [key, value] of Object.entries(resolved)) {
+      if (Object.hasOwn(this.workerEnvKeys, key) && typeof value === 'string') allowed[key] = value
+    }
+    return allowed
   }
 
   private providerInfo(name: string): { inheritsParentContext?: boolean; name?: string } | null {
@@ -418,6 +749,25 @@ export class AutoResearchProvider implements SubagentProvider {
 
   private isRecursiveWorker(name: string): boolean {
     return name === this.name || name === 'auto-research'
+  }
+
+  /**
+   * Refuse `subagent_auto_research` from a branch worker.
+   *
+   * A worker already owns one branch of a running batch: delegating another
+   * batch from inside it would recurse forever, race the runner lock of its own
+   * checkout, and corrupt `plan.json`. A delegation whose cwd is a live worker
+   * checkout or any `runs/` runtime tree is rejected the same way.
+   */
+  private assertNotRecursive(request: SubagentStartRequest, cwd: string): void {
+    const parent = request.parent as
+      | { session?: { header?: { origin?: unknown } } }
+      | null
+      | undefined
+    const origin = parent?.session?.header?.origin
+    if (origin === 'subagent' || this.workerEnvs.ownsCheckout(cwd) || isInsideRuntimeRuns(cwd)) {
+      throw new Error('subagent_auto_research cannot be called recursively by a worker subagent')
+    }
   }
 
   /**
@@ -452,6 +802,7 @@ export class AutoResearchProvider implements SubagentProvider {
     if (typeof cwd !== 'string' || !isAbsolute(cwd)) {
       throw new Error('auto-research child cwd must be an absolute path: ' + String(cwd))
     }
+    this.assertNotRecursive(request, cwd)
     const stat = await fsp.stat(cwd).catch(() => null)
     if (!stat?.isDirectory()) throw new Error('auto-research child cwd is not an accessible directory: ' + cwd)
     if (!request.parent) throw new Error('auto-research requires the exact live parent agent')
@@ -469,20 +820,18 @@ export class AutoResearchProvider implements SubagentProvider {
     const workspaceRoot = await selectPlanWorkspace(cwd, plan as { workspace?: unknown })
     const runtimeRoot = join(workspaceRoot, '.auto-research-methods')
     await assertRuntimeRootContained(workspaceRoot, runtimeRoot)
+    await assertRuntimeRootContained(workspaceRoot, join(runtimeRoot, 'runs'))
     const seed = resolve(workspaceRoot) !== resolve(cwd)
+    if (seed) {
+      await assertRuntimeRootContained(cwd, join(cwd, '.auto-research-methods'))
+    }
     const runId = randomUUID()
     const output = join(runtimeRoot, 'runs', runId)
-    await fsp.mkdir(output, { recursive: true })
-    if (seed) {
-      // The runner stores artifacts inside the compact seed; leave a pointer at
-      // the checkout so the coordinator can discover the active seed runtime.
-      await writeJsonAtomic(join(cwd, '.auto-research-methods', 'SEED.json'), {
-        seed: workspaceRoot,
-        runtime: runtimeRoot,
-        latest: join(runtimeRoot, 'LATEST.json'),
-      })
-    }
+    // Take the checkout lock before creating anything: a concurrent batch on
+    // the same checkout must fail without leaving an orphan `runs/<runId>`
+    // directory or overwriting `SEED.json`.
     const lock = await acquireRunnerLock(runtimeRoot, runId, { cwd })
+    this.activeBatches += 1
     let manager: Awaited<ReturnType<typeof createWorkspaceManager>> | null = null
     let initialState: WorkspaceState | null = null
     let runner: Runner | null = null
@@ -490,24 +839,36 @@ export class AutoResearchProvider implements SubagentProvider {
     const releaseLock = async (): Promise<void> => {
       if (released) return
       released = true
+      this.activeBatches = Math.max(0, this.activeBatches - 1)
       await lock.release()
     }
     try {
+      await fsp.mkdir(output, { recursive: true })
+      if (seed) {
+        // The runner stores artifacts inside the compact seed; leave a pointer at
+        // the checkout so the coordinator can discover the active seed runtime.
+        await writeJsonAtomic(join(cwd, '.auto-research-methods', 'SEED.json'), {
+          seed: workspaceRoot,
+          runtime: runtimeRoot,
+          latest: join(runtimeRoot, 'LATEST.json'),
+        })
+      }
       const originalManifest = await inventory(workspaceRoot)
       const selectionFile = join(runtimeRoot, 'LATEST.json')
 
       const shellEnv = await resolveShellEnvironment(this.ctx, request.parent)
       const env: NodeJS.ProcessEnv & Record<string, unknown> = { ...process.env, ...shellEnv }
       const explicitLayerfs = this.config.layerfs
-      const layerfsConfig = explicitLayerfs && typeof explicitLayerfs === 'object' ? explicitLayerfs : null
+      const snapshotForced = explicitLayerfs === false || this.config.workspaceBackend === 'snapshot'
+      const layerfsConfig = !snapshotForced && explicitLayerfs && typeof explicitLayerfs === 'object' ? explicitLayerfs : null
       const layerfsSettings: LayerFSSettings | null = layerfsConfig?.client
         ? null
-        : resolveLayerfsConfig(env, explicitLayerfs === false ? false : layerfsConfig ?? undefined)
+        : resolveLayerfsConfig(env, snapshotForced ? false : layerfsConfig ?? undefined)
       // An explicit opt-out also stops the session's LayerFS binding from
       // leaking into worker environments.
-      const layerfsEnv = explicitLayerfs === false
+      const layerfsEnv = snapshotForced
         ? {}
-        : layerfsEnvironment(env, layerfsSettings, explicitLayerfs)
+        : withoutLayerfsTrace(layerfsEnvironment(env, layerfsSettings, explicitLayerfs))
       manager = await createWorkspaceManager({
         output,
         runId,
@@ -532,10 +893,17 @@ export class AutoResearchProvider implements SubagentProvider {
         let adopted = false
         if (savedWorkspace !== null) {
           const candidate = savedWorkspace
+          // Compare resolved paths: `runs` (or the saved workspace) may be a
+          // symlink, and a lexical check alone would let either escape.
+          const [realRuns, realCandidate] = await Promise.all([
+            fsp.realpath(join(runtimeRoot, 'runs')).catch(() => null),
+            fsp.realpath(candidate).catch(() => null),
+          ])
           if (isAbsolute(candidate)
-            && isContained(join(runtimeRoot, 'runs'), candidate)
-            && await pathExists(candidate)) {
-            const candidateStat = await fsp.stat(candidate).catch(() => null)
+            && realRuns !== null
+            && realCandidate !== null
+            && isContained(realRuns, realCandidate)) {
+            const candidateStat = await fsp.stat(realCandidate).catch(() => null)
             if (candidateStat?.isDirectory()) {
               sourceWorkspace = candidate
               adopted = true
@@ -557,6 +925,11 @@ export class AutoResearchProvider implements SubagentProvider {
             `Previous leader workspace is missing or inaccessible (workspace=${savedWorkspace ?? '(none)'}, branch=${savedBranch ?? '(none)'})`,
           )
         }
+        if (savedWorkspace === null && savedBranch === null) {
+          throw new Error(
+            `Previous run selection in ${selectionFile} has no leader_workspace or leader_branch`,
+          )
+        }
       }
       const evaluator = new FrozenEvaluator({ plan: plan as unknown as import('./evaluator.js').EvaluatorPlan, output, logger: this.ctx.logger ?? null })
       runner = new Runner({
@@ -572,10 +945,12 @@ export class AutoResearchProvider implements SubagentProvider {
           evaluator,
           ...(initialState ? { initialState } : {}),
           parent: request.parent,
+          ...(sessionIdOf(request.parent) ? { parentSessionId: sessionIdOf(request.parent) as string } : {}),
           ...(request.signal ? { signal: request.signal } : {}),
           workerProvider,
           workerEnv: this.config.workerEnv,
           layerfsEnv,
+          workerEnvRegistry: this.workerEnvs,
           ...(this.ctx.logger ? { logger: this.ctx.logger } : {}),
           runId,
         },

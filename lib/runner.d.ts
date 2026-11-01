@@ -15,6 +15,7 @@ import type { BatchResult, Clock, Config, EvaluationResult, MetricDiagnostic, Me
 export declare class ResearchStoppedError extends Error {
     constructor(message?: string);
 }
+declare const DEFAULT_CLOCK: Clock;
 /** Merge plan-level option overrides over plugin configuration. */
 export declare function normalizeOptions(config?: Config, plan?: ResearchPlanInput): ResearchOptions;
 /**
@@ -54,6 +55,10 @@ export declare class Runner {
     readonly parent: unknown;
     readonly signal: AbortSignal | undefined;
     readonly workerEnv: Record<string, string>;
+    /** Provider-owned registry of live branch environments (for `ctx.shellEnv`). */
+    readonly workerEnvRegistry: RunnerDeps['workerEnvRegistry'];
+    /** Runtime session id of the coordinator that owns this batch. */
+    readonly parentSessionId: string | null;
     readonly evaluator: RunnerDeps['evaluator'] & {
         hash: string | null;
     };
@@ -104,6 +109,14 @@ export declare class Runner {
     signalForWork(): AbortSignal;
     /** Remember a created state so a failed sibling or cohort cannot leak it. */
     private trackState;
+    /**
+     * Record rows in the dashboard exactly once.
+     *
+     * Cooperative cohorts record each epoch as it finishes (so earlier epochs
+     * keep their trajectories) while `runBatch` records the final epoch, so this
+     * has to be idempotent.
+     */
+    recordRows(rows: TrajectoryRow[]): void;
     /** Clear the row handles that point at a state whose release succeeded. */
     private markReleased;
     /**
@@ -134,6 +147,16 @@ export declare class Runner {
     private peerSlotsOf;
     publishPeers(rows: TrajectoryRow[], folder: string): Promise<string | null>;
     cooperativeCohort(leader: TrajectoryRow, count: number, phase: Phase, roundNumber: number, views: MetricView[]): Promise<TrajectoryRow[]>;
+    /**
+     * Hand branch ownership to the rows a cohort returns.
+     *
+     * Epoch 0 forks a state (`_ownsState: true`); epoch 1+ resumes that same
+     * state (`_ownsState: false`). `recycle` only commits/unmounts rows it owns,
+     * so without this transfer every multi-epoch cooperative branch would leak
+     * its Sandbox mount until the batch ended and the leader would never be
+     * committed.
+     */
+    private claimCohortOwnership;
     branch(parent: TrajectoryRow, index: number, phase: Phase, folder: string, view?: MetricView, cooperation?: {
         resume: boolean;
         bundle: string | null;
@@ -150,7 +173,9 @@ export declare class Runner {
      * science is preserved as `rejected`, never discarded; only a branch that
      * never completed is treated as unverified. No state is released twice.
      */
-    recycle(candidates: TrajectoryRow[], leader: TrajectoryRow): Promise<void>;
+    recycle(candidates: TrajectoryRow[], leader: TrajectoryRow, previous?: TrajectoryRow): Promise<void>;
+    /** Commit and release the state of a leader that lost the selection. */
+    private releaseSuperseded;
     finish(leader: TrajectoryRow, reason?: string, pending?: TrajectoryRow[] | null): Promise<BatchResult>;
     /** Release every mounted workspace at the end of a batch. */
     releaseAll(): Promise<void>;
@@ -158,4 +183,5 @@ export declare class Runner {
     preserveUnverified(row: TrajectoryRow): Promise<void>;
 }
 export { jsonDigest, buildZeroSynthesisContext, publicRow };
+export { DEFAULT_CLOCK };
 //# sourceMappingURL=runner.d.ts.map

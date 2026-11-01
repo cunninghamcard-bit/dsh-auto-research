@@ -7,6 +7,7 @@
  * tests can exercise the policy without a real checkout.
  */
 
+import { randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { digestFile, isContained } from './layerfs-workspace.js'
@@ -497,14 +498,19 @@ export async function writeSharedContextAtomic(
   { mode = 0o600 }: { mode?: number } = {},
 ): Promise<string> {
   await fsp.mkdir(dirname(path), { recursive: true })
-  const temporary = `${path}.${process.pid}.${Date.now()}.new`
+  const temporary = `${path}.${process.pid}.${randomUUID()}.new`
   await fsp.writeFile(temporary, text, { mode })
   try {
     await fsp.chmod(temporary, mode)
   } catch {
     // Filesystems without POSIX modes still get atomic replacement.
   }
-  await fsp.rename(temporary, path)
+  try {
+    await fsp.rename(temporary, path)
+  } catch (error) {
+    await fsp.unlink(temporary).catch(() => {})
+    throw error
+  }
   try {
     await fsp.chmod(path, mode)
   } catch {

@@ -149,7 +149,7 @@ describe('normalizeOptions / validatePlan', () => {
     assert.throws(() => validatePlan(base, { ...options, branches: 2, shareContext: true, sharingIntervalMinutes: 0 }), /sharing interval/)
     assert.throws(() => validatePlan({ ...base, metric_subset: 2 }, { ...options, branches: 2, rsiTop: true }), /metric definitions/)
     assert.throws(() => validatePlan({ ...base, stall_seconds: 0 }, { ...options, branches: 2, rsiTop: true, metric_subset: 1, portfolio_size: 2, meaningful_gain: 0 }), /RSI/)
-    assert.throws(() => validatePlan({ ...base, meaningful_gain: -1 }, { ...options, branches: 2, rsiTop: true, metric_subset: 1, portfolio_size: 2, stall_seconds: 1 }), /RSI/)
+    assert.throws(() => validatePlan({ ...base, meaningful_gain: -1 }, { ...options, branches: 2, rsiTop: true, metric_subset: 1, portfolio_size: 2, stall_seconds: 1 }), /meaningful_gain must be non-negative/)
     assert.throws(() => validatePlan({ ...base, portfolio_size: 1 }, { ...options, branches: 2, rsiTop: true, metric_subset: 1, stall_seconds: 1, meaningful_gain: 0 }), /RSI/)
   })
 

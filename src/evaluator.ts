@@ -38,13 +38,25 @@ export interface EvaluatorPlan {
   [key: string]: unknown
 }
 
+/** A plain decimal number (no hex/binary/octal or `Infinity`). */
+const DECIMAL = /^[+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i
+
 /**
  * Parse a finite numeric score. Booleans are not scores; neither is an empty
  * string, a non-finite number, or a value that only coerces to one.
+ *
+ * String input must be a decimal literal: `"0x10"`, `"0b11"`, `"0o7"` and
+ * `"Infinity"` are rejected instead of being silently coerced by `Number`.
  */
 export function scoreValue(value: unknown, label = 'score'): number {
   if (typeof value === 'boolean') throw new Error(`${label} is not a score`)
-  if (typeof value === 'string' && value.trim() === '') throw new Error(`${label} must be finite`)
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (trimmed === '' || !DECIMAL.test(trimmed)) throw new Error(`${label} must be finite`)
+    const parsed = Number(trimmed)
+    if (!Number.isFinite(parsed)) throw new Error(`${label} must be finite`)
+    return parsed
+  }
   if (value === null || value === undefined || typeof value === 'object') {
     throw new Error(`${label} must be finite`)
   }
@@ -252,7 +264,7 @@ export class FrozenEvaluator {
     }
     const observed = metrics as Record<string, number | string>
     for (const spec of this.plan.metrics ?? []) {
-      if (spec.optional === true && !(spec.name in observed)) continue
+      if (spec.optional === true && !Object.hasOwn(observed, spec.name)) continue
       scoreValue(observed[spec.name], `metric ${spec.name}`)
     }
     for (const spec of this.plan.selection_metrics ?? []) {

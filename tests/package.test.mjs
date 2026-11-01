@@ -1,13 +1,26 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { readFile, readdir, stat } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
 
-async function json(relative) {
-  return JSON.parse(await readFile(join(root, relative), 'utf8'))
+async function json(relative_) {
+  return JSON.parse(await readFile(join(root, relative_), 'utf8'))
+}
+
+/** Every regular file under `directory` (recursive, stable order). */
+async function walkFiles(directory) {
+  const files = []
+  const entries = await readdir(directory, { withFileTypes: true })
+  entries.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0))
+  for (const entry of entries) {
+    const full = join(directory, entry.name)
+    if (entry.isDirectory()) files.push(...await walkFiles(full))
+    else if (entry.isFile()) files.push(full)
+  }
+  return files
 }
 
 describe('package metadata', () => {
@@ -125,6 +138,57 @@ describe('package metadata', () => {
     const zh = await readFile(join(root, 'README.zh.md'), 'utf8')
     assert.ok(zh.includes('自动研究'))
     assert.ok(zh.includes('LayerFS'))
+  })
+
+  it('contains no machine-specific absolute path or user name', async () => {
+    // A hardcoded absolute home path (or the author's user name) makes the
+    // published package unusable on any other machine and leaks the
+    // development machine into the artifacts. Every path must be derived or
+    // configurable. The needles are assembled so this guard does not flag its
+    // own source.
+    const forbidden = new RegExp(['/' + 'Users' + '/', 'chen' + 'haonan'].join('|'), 'i')
+    const targets = [
+      ...await walkFiles(join(root, 'src')),
+      ...await walkFiles(join(root, 'tests')),
+      ...await walkFiles(join(root, 'locale')),
+      ...[
+        'README.md',
+        'README.zh.md',
+        'package.json',
+        'cordis.patch.yml',
+        'tsconfig.json',
+      ].map(name => join(root, name)),
+    ]
+    for (const path of targets) {
+      const text = await readFile(path, 'utf8')
+      assert.doesNotMatch(text, forbidden, `${relative(root, path)} must not contain a local path or user name`)
+    }
+  })
+
+  it('ships no SPEC.md and never lists it in files', async () => {
+    await assert.rejects(stat(join(root, 'SPEC.md')), { code: 'ENOENT' })
+    const pkg = await json('package.json')
+    assert.equal(pkg.files.some(entry => /^SPEC\.md$/i.test(entry)), false)
+  })
+
+  it('keeps the real E2E harness portable and contract-faithful', async () => {
+    const e2e = await readFile(join(root, 'tests/e2e-real.test.mjs'), 'utf8')
+    // Live mounts the real registry contract (`register` + `collect(execution)`)
+    // instead of a fake `resolve()` that no `dsh` version implements.
+    assert.match(e2e, /ctx\.shellEnv\.collect\(/)
+    assert.match(e2e, /\.register\(contributor\)/)
+    assert.match(e2e, /callId: 'bash-1'|callId,/)
+    // The daemon wrapper's build context is unique and always removed.
+    assert.match(e2e, /mkdtempSync\(join\(tmpdir\(\), 'dsh-ar-e2e-runtime-'\)\)/)
+    assert.match(e2e, /rmSync\(context, \{ recursive: true, force: true \}\)/)
+    assert.doesNotMatch(e2e, /mkdirSync\(join\(tmpdir\(\), 'dsh-ar-e2e-runtime'\)/)
+    // Cleanup removes containers by prefix AND by volume, then retries the
+    // volume removal.
+    assert.match(e2e, /`name=\$\{prefix\}`/)
+    assert.match(e2e, /`volume=\$\{volume\}`/)
+    assert.match(e2e, /for \(let attempt = 0; attempt < 3; attempt \+= 1\)/)
+    const support = await readFile(join(root, 'tests/e2e-support.mjs'), 'utf8')
+    assert.match(support, /execFileSync\('docker', \['-H', `unix:\/\/\$\{LAYERFS_DOCKER\}`, 'version'/)
   })
 })
 

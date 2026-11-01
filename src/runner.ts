@@ -12,6 +12,7 @@
 import * as fsp from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import {
+  canonicalJson,
   digestFile,
   freeBytes,
   inventory,
@@ -64,16 +65,22 @@ export class ResearchStoppedError extends Error {
 
 const DEFAULT_CLOCK: Clock = {
   now: () => performance.now(),
-  sleep: (milliseconds, signal) => new Promise<void>((resolve, reject) => {
+  sleep: (milliseconds, signal) => new Promise<void>((resolvePromise, reject) => {
     if (signal?.aborted) {
       reject(new ResearchStoppedError())
       return
     }
-    const timer = setTimeout(resolve, Math.max(0, milliseconds))
+    let timer: NodeJS.Timeout | undefined
     const onAbort = (): void => {
-      clearTimeout(timer)
+      if (timer) clearTimeout(timer)
       reject(new ResearchStoppedError())
     }
+    timer = setTimeout(() => {
+      // A normally resolved sleep must not keep the signal (and this closure)
+      // alive for the rest of a long batch.
+      signal?.removeEventListener('abort', onAbort)
+      resolvePromise()
+    }, Math.max(0, milliseconds))
     signal?.addEventListener('abort', onAbort, { once: true })
     timer.unref?.()
   }),
@@ -166,22 +173,19 @@ export function validatePlan(plan: unknown, options: ResearchOptions): ResearchP
   let stall = typeof input.stall_seconds === 'number' ? input.stall_seconds : null
   let subset = typeof input.metric_subset === 'number' ? input.metric_subset : 1
   let portfolio = typeof input.portfolio_size === 'number' ? input.portfolio_size : 2
-  let gain = 0
-  if (input.meaningful_gain !== undefined) {
-    try {
-      gain = scoreValue(input.meaningful_gain, 'meaningful_gain')
-    } catch {
-      if (options.rsiTop) throw new Error('Invalid model-defined RSI intervention parameters')
-    }
-  }
+  const gain = input.meaningful_gain === undefined ? 0 : scoreValue(input.meaningful_gain, 'meaningful_gain')
+  if (gain < 0) throw new Error('meaningful_gain must be non-negative')
   if (options.rsiTop) {
     if (!Number.isInteger(subset) || subset < 1 || subset > names.length) {
       throw new Error('Invalid fixed metric definitions or subset size')
     }
     if (!finitePositive(stall)) throw new Error('Invalid model-defined RSI intervention parameters')
-    if (gain < 0 || !Number.isInteger(portfolio) || portfolio < 2) {
+    if (!Number.isInteger(portfolio) || portfolio < 2) {
       throw new Error('Invalid model-defined RSI intervention parameters')
     }
+  }
+  if ((options.rsiTop || Boolean(input.require_meaningful_gain)) && gain <= 0) {
+    throw new Error('RSI-top requires a positive meaningful_gain')
   }
   const { workspace: rawWorkspace, evaluator_interpreter: rawInterpreter, options: rawOptions, ...rest } = input
   const normalized: ResearchPlan = {
@@ -319,6 +323,10 @@ export class Runner {
   readonly parent: unknown
   readonly signal: AbortSignal | undefined
   readonly workerEnv: Record<string, string>
+  /** Provider-owned registry of live branch environments (for `ctx.shellEnv`). */
+  readonly workerEnvRegistry: RunnerDeps['workerEnvRegistry']
+  /** Runtime session id of the coordinator that owns this batch. */
+  readonly parentSessionId: string | null
   readonly evaluator: RunnerDeps['evaluator'] & { hash: string | null }
   readonly originalManifest: Record<string, string> | null
   readonly selectionFile: string | null
@@ -375,6 +383,10 @@ export class Runner {
     this.parent = deps.parent
     this.signal = deps.signal
     this.workerEnv = mergeEnv(deps.workerEnv ?? config.workerEnv ?? {}, deps.layerfsEnv ?? {})
+    this.workerEnvRegistry = deps.workerEnvRegistry
+    this.parentSessionId = typeof deps.parentSessionId === 'string' && deps.parentSessionId.length > 0
+      ? deps.parentSessionId
+      : null
     this.evaluator = (deps.evaluator ?? new FrozenEvaluator({ plan: this.plan, output, logger: this.logger ?? null })) as RunnerDeps['evaluator'] & { hash: string | null }
     this.originalManifest = originalManifest
     this.selectionFile = selectionFile
@@ -428,6 +440,19 @@ export class Runner {
       parent: info.parent ?? null,
       workspace: state.path,
     })
+  }
+
+  /**
+   * Record rows in the dashboard exactly once.
+   *
+   * Cooperative cohorts record each epoch as it finishes (so earlier epochs
+   * keep their trajectories) while `runBatch` records the final epoch, so this
+   * has to be idempotent.
+   */
+  recordRows(rows: TrajectoryRow[]): void {
+    for (const row of rows) {
+      if (!this.rows.includes(row)) this.rows.push(row)
+    }
   }
 
   /** Clear the row handles that point at a state whose release succeeded. */
@@ -521,9 +546,11 @@ export class Runner {
     const validRows = this.rows.filter(row => row.evaluation?.valid === true)
     return (this.plan.metrics ?? []).map(metric => {
       const values = validRows
-        .filter(row => metric.name in (row.evaluation.metrics ?? {}))
+        .filter(row => Object.hasOwn(row.evaluation.metrics ?? {}, metric.name))
         .map(row => (row.evaluation.metrics ?? {})[metric.name])
-      const distinct = new Set(values.map(value => JSON.stringify(value)))
+      // Canonical JSON keeps `{a,b}` and `{b,a}` comparable, so a metric is not
+      // reported as varying only because its object keys were reordered.
+      const distinct = new Set(values.map(value => canonicalJson(value)))
       return {
         name: metric.name,
         observations: values.length,
@@ -543,7 +570,9 @@ export class Runner {
   }
 
   async checkDisk(workspace: string, count: number): Promise<void> {
-    if (this.manager.kind !== 'snapshot') return
+    // Both backends materialize a host copy per branch (the snapshot backend
+    // duplicates the tree, the LayerFS backend stages Sandbox mounts), so the
+    // free-space check applies to both.
     const files = await inventory(workspace)
     const required = (await inventoryBytes(workspace, files)) * count
     const free = await freeBytes(this.output)
@@ -728,7 +757,7 @@ export class Runner {
             views[index],
           )))
         }
-        this.rows.push(...candidates)
+        this.recordRows(candidates)
         if (candidates.some(candidate => candidate.collaboration_failed)) {
           throw new Error('Peer checkpoint/review protocol failed; all evidence preserved and no candidate promoted')
         }
@@ -743,7 +772,7 @@ export class Runner {
         }
         const previous = leader
         leader = this.choose(leader, candidates)
-        await this.recycle(candidates, leader)
+        await this.recycle(candidates, leader, previous)
         this.selections.push({
           round: roundNumber,
           phase,
@@ -904,14 +933,43 @@ export class Runner {
             restored.push(row)
           }
         }
+        this.claimCohortOwnership(restored, parents, leader)
         return restored
       }
+      // Earlier epochs are real, evaluated trajectories: record them before the
+      // next epoch replaces the working set. `runBatch` records the final epoch
+      // (or its restored rows) through the idempotent `recordRows`.
+      this.recordRows(candidates)
+      this.claimCohortOwnership(candidates, parents, leader)
       parents = candidates
       epoch += 1
       const wait = shareAt - this.now()
       if (wait > 0) await this.sleep(wait)
     }
     return history.length > 0 ? parents : []
+  }
+
+  /**
+   * Hand branch ownership to the rows a cohort returns.
+   *
+   * Epoch 0 forks a state (`_ownsState: true`); epoch 1+ resumes that same
+   * state (`_ownsState: false`). `recycle` only commits/unmounts rows it owns,
+   * so without this transfer every multi-epoch cooperative branch would leak
+   * its Sandbox mount until the batch ended and the leader would never be
+   * committed.
+   */
+  private claimCohortOwnership(
+    returned: TrajectoryRow[],
+    parents: TrajectoryRow[],
+    incumbent?: TrajectoryRow,
+  ): void {
+    for (const parent of parents) {
+      if (parent === incumbent || !parent._state || returned.includes(parent)) continue
+      parent._ownsState = false
+    }
+    for (const row of returned) {
+      if (row._state) row._ownsState = true
+    }
   }
 
   async branch(
@@ -1002,6 +1060,11 @@ export class Runner {
       }
 
       const branchEnv: Record<string, string> = { ...this.workerEnv }
+      // The worker flag belongs to the live registry entry, never to a copied
+      // environment value.
+      for (const key of Object.keys(branchEnv)) {
+        if (key.startsWith('DSH_AUTO_RESEARCH_')) delete branchEnv[key]
+      }
       if (state.branch) branchEnv.DSH_AUTO_RESEARCH_BRANCH = state.branch
       if (state.sandboxPath) branchEnv.DSH_AUTO_RESEARCH_SANDBOX_PATH = state.sandboxPath
       branchEnv.DSH_AUTO_RESEARCH_CHECKOUT = checkout
@@ -1064,6 +1127,15 @@ export class Runner {
         provider: this.workerProvider,
         text: prompt,
       }]
+      // Register the branch environment before the worker starts, so its very
+      // first `bash` call already receives DSH_AUTO_RESEARCH_*: `dsh` resolves
+      // `ctx.shellEnv` per execution, and the resolver matches this checkout.
+      const workerRegistration = this.workerEnvRegistry?.register({
+        id: basename(folder),
+        checkout,
+        parentSessionId: this.parentSessionId,
+        env: branchEnv,
+      }) ?? null
       try {
         const activation = await this.subagents.startActivation({
           provider: this.workerProvider,
@@ -1077,6 +1149,7 @@ export class Runner {
           delivery: 'caller',
         })
         childId = activation.childId ?? null
+        if (childId) workerRegistration?.setChildSession(childId)
         let disposal: Promise<void> | null = null
         const disposeOnce = (): Promise<void> => {
           if (!disposal) {
@@ -1099,6 +1172,7 @@ export class Runner {
         }
       } finally {
         clearTimeout(timer)
+        workerRegistration?.dispose()
       }
       this.checkCancelled()
       const assistantText = outputText(result?.output)
@@ -1192,18 +1266,16 @@ export class Runner {
           _released: false,
         }
         this.abandoned.push(orphan)
-        if (stopped) {
-          // Cancellation preserves the branch for review; the pending path
-          // is reported in RESULT.json before cleanup.
-          try {
-            await this.manager.commit(state, { message: `auto-research: unverified ${orphan.id}` })
-          } catch (commitError) {
-            this.logger?.warn?.(`[auto-research] branch commit failed: ${(commitError as Error).message}`)
-          }
-          await this.releaseTracked(state, false, 'branch', true)
-        } else {
-          await this.releaseTracked(state, true, 'branch')
+        // Cancellation and an unexpected provider error both preserve the
+        // branch: its partial evidence is committed and the mount is released
+        // without discarding, so a reviewer can inspect what the worker did.
+        try {
+          await this.manager.commit(state, { message: `auto-research: unverified ${orphan.id}` })
+        } catch (commitError) {
+          this.logger?.warn?.(`[auto-research] branch commit failed: ${(commitError as Error).message}`)
         }
+        // A stop still reports the pending path in RESULT.json before cleanup.
+        await this.releaseTracked(state, false, 'branch', stopped)
       }
       throw error
     }
@@ -1232,7 +1304,7 @@ export class Runner {
    * science is preserved as `rejected`, never discarded; only a branch that
    * never completed is treated as unverified. No state is released twice.
    */
-  async recycle(candidates: TrajectoryRow[], leader: TrajectoryRow): Promise<void> {
+  async recycle(candidates: TrajectoryRow[], leader: TrajectoryRow, previous?: TrajectoryRow): Promise<void> {
     for (const row of candidates) {
       if (!row._ownsState || !row._state) continue
       if (this.releasedStates.has(row._state)) {
@@ -1265,6 +1337,30 @@ export class Runner {
       // keeps the handle for `releaseAll()` and `pendingWorkspaces()`.
       await this.releaseTracked(state, false, 'release')
     }
+    // A defeated leader (the baseline, or an earlier round's leader) is no
+    // longer the working branch. Commit and unmount it now instead of holding
+    // its Sandbox mount for the rest of the batch.
+    await this.releaseSuperseded(previous, leader)
+  }
+
+  /** Commit and release the state of a leader that lost the selection. */
+  private async releaseSuperseded(previous: TrajectoryRow | undefined, leader: TrajectoryRow): Promise<void> {
+    if (!previous) return
+    if (previous.id === leader.id) return
+    const state = previous._state
+    if (!state) return
+    if (state === leader._state) return
+    if (this.releasedStates.has(state)) {
+      previous._state = null
+      previous._released = true
+      return
+    }
+    try {
+      await this.manager.commit(state, { message: `auto-research: release ${previous.id}` })
+    } catch (error) {
+      this.logger?.warn?.(`[auto-research] superseded commit failed: ${(error as Error).message}`)
+    }
+    await this.releaseTracked(state, false, 'release')
   }
 
   async finish(
@@ -1365,3 +1461,4 @@ export class Runner {
 }
 
 export { jsonDigest, buildZeroSynthesisContext, publicRow }
+export { DEFAULT_CLOCK }

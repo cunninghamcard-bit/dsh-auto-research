@@ -21,6 +21,9 @@ export interface EvaluatorPlan {
 /**
  * Parse a finite numeric score. Booleans are not scores; neither is an empty
  * string, a non-finite number, or a value that only coerces to one.
+ *
+ * String input must be a decimal literal: `"0x10"`, `"0b11"`, `"0o7"` and
+ * `"Infinity"` are rejected instead of being silently coerced by `Number`.
  */
 export declare function scoreValue(value: unknown, label?: string): number;
 /** Result of one evaluator process. */

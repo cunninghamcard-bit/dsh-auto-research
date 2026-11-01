@@ -51,7 +51,7 @@ export declare function freeBytes(path: string): Promise<number>;
 export declare function snapshot(source: string, destination: string): Promise<Record<string, string>>;
 /** Merge `source` into an existing directory (LayerFS baseline / staging copy). */
 export declare function mergeTree(source: string, destination: string): Promise<Record<string, string>>;
-/** Write JSON through a temporary sibling and an atomic rename. */
+/** Write JSON through a unique temporary sibling and an atomic rename. */
 export declare function writeJsonAtomic(path: string, value: unknown): Promise<void>;
 /** Strip live handles from a row before it is serialized. */
 export declare function publicRow(row: TrajectoryRow): TrajectoryRow;
@@ -88,6 +88,14 @@ export declare class SnapshotBackend {
 /** Sanitize a value into a Docker/LayerFS-safe name fragment. */
 export declare function branchSafe(value: unknown, max?: number): string;
 /**
+ * Whether a commit/unmount refusal only means the mount is behind its branch.
+ *
+ * `fs.apply` creates a commit on the branch, so right after publishing the
+ * mount handle is one commit behind (`headMovedSinceMount`) or its overlay
+ * necessarily differs (`Dirty`); the bytes are already safe on the branch.
+ */
+export declare function isStaleMountRefusal(error: unknown): boolean;
+/**
  * Whether a refusal means the LayerFS project does not exist yet or its `main`
  * branch carries no usable state, so `project.init(source)` can recover.
  *
@@ -108,8 +116,21 @@ export declare function isMissingProjectOrMain(error: unknown): boolean;
  */
 export declare function mayNeedProjectInit(error: unknown): boolean;
 /**
- * Retry a LayerFS call that refused with `Busy`, using exponential backoff.
- * All other refusals propagate unchanged.
+ * Whether a LayerFS call failed for a reason that a short retry can fix.
+ *
+ * Two families are transient:
+ * - `Busy`: another writer holds the Store/branch.
+ * - Sandbox daemon / Store container startup: on OrbStack the published port
+ *   starts accepting connections about half a second after `docker start`, so
+ *   the first mount or Store call can be refused while the daemon is still
+ *   binding. There is no user-visible failure to act on, only a delay.
+ */
+export declare function isTransientLayerfsError(error: unknown): boolean;
+/**
+ * Retry a LayerFS call that refused for a transient reason, using exponential
+ * backoff. An OrbStack Sandbox daemon publishes its port about half a second
+ * after the container starts, so the default budget (6 retries, ~9.5 s of
+ * backoff) covers a real cold start while still failing loud.
  */
 export declare function withBusyRetry<T>(fn: () => Promise<T>, options?: {
     retries?: number;
@@ -160,6 +181,13 @@ export declare class LayerFSBackend {
     private syncStaging;
     private materializeBranch;
     /**
+     * Read one branch file completely.
+     *
+     * `fs.read` returns at most 2000 lines / 48 KiB per call and reports the next
+     * `nextLine` cursor; a single call would truncate a large adopted file.
+     */
+    private readBranchFile;
+    /**
      * The LayerFS home a client was built for, when the SDK exposes it.
      *
      * `project.init` records the project as a directory directly under the home,
@@ -186,7 +214,9 @@ export declare class LayerFSBackend {
      * project that exists but whose `main` is unusable is reported clearly.
      */
     private forkBaseline;
-    baseline(source: string, id: string): Promise<WorkspaceState>;
+    baseline(source: string, id: string, { sync }?: {
+        sync?: boolean;
+    }): Promise<WorkspaceState>;
     fork(parent: WorkspaceState, id: string): Promise<WorkspaceState>;
     adopt(branch: string, id: string): Promise<WorkspaceState>;
     commit(state: WorkspaceState, { message }?: {
@@ -254,12 +284,26 @@ export declare function resolveLayerfsConfig(env?: NodeJS.ProcessEnv | Record<st
  * `null` suppress an ambient value.
  */
 export declare function layerfsEnvironment(env?: NodeJS.ProcessEnv | Record<string, unknown>, settings?: LayerFSSettings | null, explicit?: LayerFSBinding | false | null | undefined): Record<string, string>;
+/** `DSH_LAYERFS_*` trace keys that describe one call, never a worker. */
+export declare const LAYERFS_TRACE_KEYS: readonly ['DSH_LAYERFS_TRACE', 'DSH_LAYERFS_TRACE_STEP', 'DSH_LAYERFS_TRACE_START'];
+/**
+ * Drop the transient SDK trace keys from a copied environment.
+ *
+ * The coordinator's `shellEnv` carries `DSH_LAYERFS_TRACE` and a
+ * `DSH_LAYERFS_TRACE_STEP` naming *its* call. A worker that inherited those
+ * would append its SDK calls to the coordinator's trace file under a stale step
+ * id, corrupting both records; the worker's own `ctx.shellEnv` execution sets
+ * them correctly instead.
+ */
+export declare function withoutLayerfsTrace(environment: Record<string, string>): Record<string, string>;
 /**
  * Resolve the environment contributed by `ctx.shellEnv` (the same service
  * `@dsh-layerfs/host` binds). Host versions expose contributors, `resolve`,
  * `snapshot` or a plain `env`; all shapes are handled and merged.
  */
 export declare function resolveShellEnvironment(ctx: Pick<PluginContext, 'shellEnv' | 'get'>, agent?: unknown): Promise<Record<string, string>>;
+/** The synthetic tool-call id used for a session-wide environment snapshot. */
+export declare const SHELL_ENV_CALL_ID = "auto-research-env";
 /**
  * Deployment values as the `DSH_LAYERFS_*` environment `@dsh-layerfs/host`
  * publishes for a session, keyed without the prefix.
