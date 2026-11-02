@@ -99,6 +99,15 @@ export interface Frontier {
   stalled_work_seconds: number
 }
 
+/** One row of {@link Runner.states}. */
+export interface StateEntry {
+  id: string
+  parent: string | null
+  workspace: string
+  active: boolean
+  released: boolean
+}
+
 /** How long a worker activation may take to settle after its signal aborts. */
 const DEFAULT_WORKER_GRACE_MS = 2000
 
@@ -370,10 +379,13 @@ export class Runner {
   readonly abort = new AbortController()
   timedOutRows: TrajectoryRow[] = []
   readonly abandoned: TrajectoryRow[] = []
-  readonly activeStates = new Map<WorkspaceState, { id: string; parent: string | null; workspace: string }>()
-  /** Every state a backend created, from the moment it was returned. */
-  readonly trackedStates = new Map<WorkspaceState, { id: string; parent: string | null; workspace: string }>()
-  readonly releasedStates = new Set<WorkspaceState>()
+  /**
+   * Every state a backend created or this batch adopted, from the moment it
+   * was returned. `active` marks a branch whose worker is still running (or a
+   * stopped branch the result must still report); `released` is set once the
+   * backend confirmed the unmount.
+   */
+  readonly states = new Map<WorkspaceState, StateEntry>()
   readonly workerGraceMs: number
   private managerClosed = false
 
@@ -471,18 +483,18 @@ export class Runner {
     return combineSignals([this.abort.signal, this.signal]) ?? this.abort.signal
   }
 
-  /** Remember a created state so a failed sibling or cohort cannot leak it. */
-  private trackState(
-    state: WorkspaceState | null | undefined,
-    info: { id: string; parent?: string | null },
-  ): void {
-    if (!state) return
-    if (this.trackedStates.has(state)) return
-    this.trackedStates.set(state, {
-      id: info.id,
-      parent: info.parent ?? null,
-      workspace: state.path,
-    })
+  /** The table entry of `state`, created on first sight. */
+  private track(state: WorkspaceState, id: string, parent: string | null): StateEntry {
+    let entry = this.states.get(state)
+    if (!entry) {
+      entry = { id, parent, workspace: state.path, active: false, released: false }
+      this.states.set(state, entry)
+    }
+    return entry
+  }
+
+  private isReleased(state: WorkspaceState): boolean {
+    return this.states.get(state)?.released === true
   }
 
   /**
@@ -500,36 +512,36 @@ export class Runner {
 
   /** Clear the row handles that point at a state whose release succeeded. */
   private markReleased(state: WorkspaceState): void {
-    for (const row of this.rows) {
-      if (row._state !== state) continue
-      row._state = null
-      row._released = true
-    }
-    for (const row of this.abandoned) {
-      if (row._state !== state) continue
-      row._state = null
-      row._released = true
+    for (const row of [...this.rows, ...this.abandoned]) {
+      if (row._state === state) row._state = null
     }
   }
 
   /**
-   * Release one state. The handle is retained when the backend refuses, so a
-   * later `releaseAll()` can retry and `pendingWorkspaces()` still reports it.
+   * Commit `state` with `message`, then release it. A refused commit is
+   * logged and the release still runs; a refused release keeps the handle, so
+   * `releaseAll()` retries it and `pendingWorkspaces()` still reports it.
    */
-  private async releaseTracked(
+  private async commitAndRelease(
     state: WorkspaceState,
-    discard: boolean,
-    label: string,
+    id: string,
+    message: string,
     keepReported = false,
   ): Promise<boolean> {
     try {
-      await this.manager.release(state, { discard })
+      await this.manager.commit(state, { message })
     } catch (error) {
-      this.logger?.warn?.(`[auto-research] ${label} release failed: ${(error as Error).message}`)
+      this.logger?.warn?.(`[auto-research] commit of ${id} failed: ${(error as Error).message}`)
+    }
+    try {
+      await this.manager.release(state, { discard: false })
+    } catch (error) {
+      this.logger?.warn?.(`[auto-research] release of ${id} failed: ${(error as Error).message}`)
       return false
     }
-    this.releasedStates.add(state)
-    if (!keepReported) this.activeStates.delete(state)
+    const entry = this.track(state, id, null)
+    entry.released = true
+    if (!keepReported) entry.active = false
     this.markReleased(state)
     return true
   }
@@ -665,30 +677,22 @@ export class Runner {
   pendingWorkspaces(): Array<Record<string, unknown>> {
     const pending = new Map<string, Record<string, unknown>>()
     for (const row of [...this.rows, ...this.abandoned]) {
-      if (!row._state || row._released || row.id === 'initial') continue
+      if (!row._state || row.id === 'initial') continue
       pending.set(row.workspace, {
         id: row.id,
         workspace: row.workspace,
         branch: row._state.branch ?? null,
       })
     }
-    for (const [state, active] of this.activeStates) {
-      pending.set(active.workspace, {
-        id: active.id,
-        parent: active.parent,
-        workspace: active.workspace,
-        branch: state.branch ?? null,
-      })
-    }
-    // States created for a sibling that never produced a row (or whose row
-    // release failed) still hold a mount and must be reported.
-    for (const [state, info] of this.trackedStates) {
-      if (this.releasedStates.has(state) || info.id === 'initial') continue
-      if (pending.has(info.workspace)) continue
-      pending.set(info.workspace, {
-        id: info.id,
-        parent: info.parent,
-        workspace: info.workspace,
+    // A running (or stopped) branch, and a state created for a sibling that
+    // never produced a row (or whose row release failed), still hold a mount.
+    for (const [state, entry] of this.states) {
+      if (entry.id === 'initial') continue
+      if (!entry.active && (entry.released || pending.has(entry.workspace))) continue
+      pending.set(entry.workspace, {
+        id: entry.id,
+        parent: entry.parent,
+        workspace: entry.workspace,
         branch: state.branch ?? null,
       })
     }
@@ -707,7 +711,7 @@ export class Runner {
     const baseState = this.deps.initialState
       ? { ...this.deps.initialState, id: 'initial' }
       : await this.manager.baseline(this.workspace, 'initial')
-    this.trackState(baseState, { id: 'initial', parent: null })
+    this.track(baseState, 'initial', null)
     const baseManifest = await inventory(baseState.path)
     await writeJsonAtomic(join(initialFolder, 'INPUT-MANIFEST.json'), baseManifest)
     const initial: TrajectoryRow = {
@@ -945,9 +949,7 @@ export class Runner {
           if (checkpoint && broken) {
             await this.preserveUnverified(row)
             const restoredRow = await this.manager.restoreCompletedState(checkpoint, publicRow(row))
-            if (restoredRow._state) {
-              this.trackState(restoredRow._state, { id: restoredRow.id, parent: restoredRow.parent })
-            }
+            if (restoredRow._state) this.track(restoredRow._state, restoredRow.id, restoredRow.parent)
             restored.push(restoredRow)
           } else {
             restored.push(row)
@@ -1023,8 +1025,8 @@ export class Runner {
         ownsState = true
       }
       const checkout = state.path
-      this.trackState(state, { id: basename(folder), parent: parent.id })
-      this.activeStates.set(state, { id: basename(folder), parent: parent.id, workspace: checkout })
+      const entry = this.track(state, basename(folder), parent.id)
+      entry.active = true
       const manifest = await inventory(checkout)
       await writeJsonAtomic(join(folder, 'INPUT-MANIFEST.json'), manifest)
 
@@ -1285,7 +1287,7 @@ export class Runner {
         }
       }
       await writeJsonAtomic(join(folder, 'RESULT.json'), publicRow(row))
-      this.activeStates.delete(state)
+      entry.active = false
       return { ...row, _state: state, _ownsState: ownsState }
     } catch (error) {
       if ((ownsState || resume) && state) {
@@ -1307,19 +1309,13 @@ export class Runner {
           completed: false,
           _state: state,
           _ownsState: true,
-          _released: false,
         }
         this.abandoned.push(orphan)
         // Cancellation and an unexpected provider error both preserve the
         // branch: its partial evidence is committed and the mount is released
         // without discarding, so a reviewer can inspect what the worker did.
-        try {
-          await this.manager.commit(state, { message: `auto-research: unverified ${orphan.id}` })
-        } catch (commitError) {
-          this.logger?.warn?.(`[auto-research] branch commit failed: ${(commitError as Error).message}`)
-        }
-        // A stop still reports the pending path in RESULT.json before cleanup.
-        await this.releaseTracked(state, false, 'branch', stopped)
+        // A stop still reports the pending path in RESULT.json.
+        await this.commitAndRelease(state, orphan.id, `auto-research: unverified ${orphan.id}`, stopped)
       }
       throw error
     }
@@ -1351,60 +1347,34 @@ export class Runner {
   async recycle(candidates: TrajectoryRow[], leader: TrajectoryRow, previous?: TrajectoryRow): Promise<void> {
     for (const row of candidates) {
       if (!row._ownsState || !row._state) continue
-      if (this.releasedStates.has(row._state)) {
+      const state = row._state
+      if (this.isReleased(state)) {
         row._state = null
-        row._released = true
         continue
       }
-      const state = row._state
       if (row.id === leader.id) {
         try {
           await this.manager.commit(state, { message: `auto-research: verified ${row.id}` })
         } catch (error) {
-          this.logger?.warn?.(`[auto-research] commit failed: ${(error as Error).message}`)
+          this.logger?.warn?.(`[auto-research] commit of ${row.id} failed: ${(error as Error).message}`)
         }
         // The leader stays mounted: the next phase continues from this exact
         // workspace, and `releaseAll()` commits/unmounts it at batch end.
         continue
       }
-      {
-        const valid = row.evaluation?.valid === true
-        const completed = row.completed === true
-        const label = valid ? 'verified' : completed ? 'rejected' : 'unverified'
-        try {
-          await this.manager.commit(state, { message: `auto-research: ${label} ${row.id}` })
-        } catch (error) {
-          this.logger?.warn?.(`[auto-research] commit failed: ${(error as Error).message}`)
-        }
-      }
-      // Mark released only after the backend confirms it; a failed release
-      // keeps the handle for `releaseAll()` and `pendingWorkspaces()`.
-      await this.releaseTracked(state, false, 'release')
+      const label = row.evaluation?.valid === true ? 'verified' : row.completed === true ? 'rejected' : 'unverified'
+      await this.commitAndRelease(state, row.id, `auto-research: ${label} ${row.id}`)
     }
     // A defeated leader (the baseline, or an earlier round's leader) is no
     // longer the working branch. Commit and unmount it now instead of holding
     // its Sandbox mount for the rest of the batch.
-    await this.releaseSuperseded(previous, leader)
-  }
-
-  /** Commit and release the state of a leader that lost the selection. */
-  private async releaseSuperseded(previous: TrajectoryRow | undefined, leader: TrajectoryRow): Promise<void> {
-    if (!previous) return
-    if (previous.id === leader.id) return
-    const state = previous._state
-    if (!state) return
-    if (state === leader._state) return
-    if (this.releasedStates.has(state)) {
+    const superseded = previous && previous.id !== leader.id ? previous._state : null
+    if (!previous || !superseded || superseded === leader._state) return
+    if (this.isReleased(superseded)) {
       previous._state = null
-      previous._released = true
       return
     }
-    try {
-      await this.manager.commit(state, { message: `auto-research: release ${previous.id}` })
-    } catch (error) {
-      this.logger?.warn?.(`[auto-research] superseded commit failed: ${(error as Error).message}`)
-    }
-    await this.releaseTracked(state, false, 'release')
+    await this.commitAndRelease(superseded, previous.id, `auto-research: release ${previous.id}`)
   }
 
   async finish(
@@ -1450,31 +1420,20 @@ export class Runner {
 
   /** Release every mounted workspace at the end of a batch. */
   async releaseAll(): Promise<void> {
-    const rows = [...this.rows, ...this.abandoned]
     const byState = new Map<WorkspaceState, TrajectoryRow>()
-    for (const row of rows) {
+    for (const row of [...this.rows, ...this.abandoned]) {
       if (row._state) byState.set(row._state, row)
     }
-    const states = new Set<WorkspaceState>([...this.trackedStates.keys(), ...byState.keys()])
     let incomplete = false
-    for (const state of states) {
-      if (this.releasedStates.has(state)) {
+    for (const state of new Set([...this.states.keys(), ...byState.keys()])) {
+      if (this.isReleased(state)) {
         this.markReleased(state)
         continue
       }
       const row = byState.get(state)
-      const valid = row?.evaluation?.valid === true
-      const completed = row?.completed === true
-      const id = row?.id ?? this.trackedStates.get(state)?.id ?? ''
-      try {
-        if (valid) await this.manager.commit(state, { message: `auto-research: retained ${id}` })
-        else if (completed) await this.manager.commit(state, { message: `auto-research: rejected ${id}` })
-        else await this.manager.commit(state, { message: `auto-research: unverified ${id}` })
-      } catch (error) {
-        this.logger?.warn?.(`[auto-research] final commit failed: ${(error as Error).message}`)
-      }
-      const released = await this.releaseTracked(state, false, 'final')
-      if (!released) incomplete = true
+      const id = row?.id ?? this.states.get(state)?.id ?? ''
+      const label = row?.evaluation?.valid === true ? 'retained' : row?.completed === true ? 'rejected' : 'unverified'
+      if (!await this.commitAndRelease(state, id, `auto-research: ${label} ${id}`)) incomplete = true
     }
     // Keep the manager (and its LayerFS client) open while a state is still
     // mounted, so a later releaseAll() can retry.
@@ -1490,17 +1449,11 @@ export class Runner {
   /** Keep an unverified workspace available for independent review. */
   async preserveUnverified(row: TrajectoryRow): Promise<void> {
     const state = row._state
-    if (!state || this.releasedStates.has(state)) {
+    if (!state || this.isReleased(state)) {
       row._state = null
-      row._released = true
       return
     }
-    try {
-      await this.manager.commit(state, { message: `auto-research: unverified ${row.id}` })
-    } catch (error) {
-      this.logger?.warn?.(`[auto-research] unverified commit failed: ${(error as Error).message}`)
-    }
-    await this.releaseTracked(state, false, 'unverified')
+    await this.commitAndRelease(state, row.id, `auto-research: unverified ${row.id}`)
   }
 }
 

@@ -202,7 +202,6 @@ export interface TrajectoryRow {
   /** Internal live handles; never serialized by `publicRow`. */
   _state?: WorkspaceState | null
   _ownsState?: boolean
-  _released?: boolean
 }
 
 /** One completed-state checkpoint on disk. */

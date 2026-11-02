@@ -294,7 +294,6 @@ export function publicRow(row: TrajectoryRow): TrajectoryRow {
   const copy: TrajectoryRow = { ...row }
   delete copy._state
   delete copy._ownsState
-  delete copy._released
   return copy
 }
 

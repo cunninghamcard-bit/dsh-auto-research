@@ -28,6 +28,14 @@ export interface Frontier {
     anchor_score: string | null;
     stalled_work_seconds: number;
 }
+/** One row of {@link Runner.states}. */
+export interface StateEntry {
+    id: string;
+    parent: string | null;
+    workspace: string;
+    active: boolean;
+    released: boolean;
+}
 /** Merge plan-level option overrides over plugin configuration. */
 export declare function normalizeOptions(config?: Config, plan?: ResearchPlanInput): ResearchOptions;
 /**
@@ -94,18 +102,13 @@ export declare class Runner {
     readonly abort: AbortController;
     timedOutRows: TrajectoryRow[];
     readonly abandoned: TrajectoryRow[];
-    readonly activeStates: Map<WorkspaceState, {
-        id: string;
-        parent: string | null;
-        workspace: string;
-    }>;
-    /** Every state a backend created, from the moment it was returned. */
-    readonly trackedStates: Map<WorkspaceState, {
-        id: string;
-        parent: string | null;
-        workspace: string;
-    }>;
-    readonly releasedStates: Set<WorkspaceState>;
+    /**
+     * Every state a backend created or this batch adopted, from the moment it
+     * was returned. `active` marks a branch whose worker is still running (or a
+     * stopped branch the result must still report); `released` is set once the
+     * backend confirmed the unmount.
+     */
+    readonly states: Map<WorkspaceState, StateEntry>;
     readonly workerGraceMs: number;
     private managerClosed;
     constructor({ config, plan, workspace, output, originalManifest, selectionFile, frontier, deps, }: {
@@ -129,8 +132,9 @@ export declare class Runner {
     /** Whether the configured worker provider accepts `request.agentOptions`. */
     private workerProviderAcceptsAgentOptions;
     signalForWork(): AbortSignal;
-    /** Remember a created state so a failed sibling or cohort cannot leak it. */
-    private trackState;
+    /** The table entry of `state`, created on first sight. */
+    private track;
+    private isReleased;
     /**
      * Record rows in the dashboard exactly once.
      *
@@ -142,10 +146,11 @@ export declare class Runner {
     /** Clear the row handles that point at a state whose release succeeded. */
     private markReleased;
     /**
-     * Release one state. The handle is retained when the backend refuses, so a
-     * later `releaseAll()` can retry and `pendingWorkspaces()` still reports it.
+     * Commit `state` with `message`, then release it. A refused commit is
+     * logged and the release still runs; a refused release keeps the handle, so
+     * `releaseAll()` retries it and `pendingWorkspaces()` still reports it.
      */
-    private releaseTracked;
+    private commitAndRelease;
     /**
      * Await a worker activation, then dispose it. One `workerGraceMs` window,
      * opened by the abort (or by the result when there was none), bounds both
@@ -193,8 +198,6 @@ export declare class Runner {
      * never completed is treated as unverified. No state is released twice.
      */
     recycle(candidates: TrajectoryRow[], leader: TrajectoryRow, previous?: TrajectoryRow): Promise<void>;
-    /** Commit and release the state of a leader that lost the selection. */
-    private releaseSuperseded;
     finish(leader: TrajectoryRow, reason?: string, pending?: TrajectoryRow[] | null): Promise<BatchResult>;
     /** Release every mounted workspace at the end of a batch. */
     releaseAll(): Promise<void>;

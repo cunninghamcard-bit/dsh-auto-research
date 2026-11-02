@@ -404,7 +404,7 @@ describe('P1-3/P1-8: no branch state leaks on sibling or cohort failure', () => 
         return release(state, options)
       }
       await assert.rejects(runner.run(), /retain exploded/)
-      const tracked = runner.trackedStates.size
+      const tracked = runner.states.size
       assert.ok(tracked >= 3, `the baseline and both epoch branches were tracked: ${tracked}`)
       await runner.releaseAll()
       assert.equal(new Set(released).size, tracked, 'releaseAll released every tracked state')
@@ -532,12 +532,10 @@ describe('P1-6: a failed release keeps the state retryable', () => {
       await runner.run()
       const failed = runner.rows.find(row => row.id === 'round-1-explore-1')
       assert.ok(failed?._state, 'the handle is retained after the failed release')
-      assert.notEqual(failed._released, true)
       assert.ok(runner.pendingWorkspaces().some(entry => String(entry.workspace).includes('round-1-explore-1')))
       assert.equal(closes, 0, 'the manager stays open while a state is mounted')
       await runner.releaseAll()
       assert.equal(failed._state, null)
-      assert.equal(failed._released, true)
       assert.equal(runner.pendingWorkspaces().length, 0)
       assert.equal(closes, 1)
     })
@@ -1253,7 +1251,6 @@ describe('R11: a superseded leader is released in recycle', () => {
       const round1 = runner.rows.find(row => row.id === 'round-1-continue-1')
       assert.ok(initial, 'the baseline is recorded')
       assert.equal(initial._state, null, 'the baseline was released during recycle')
-      assert.equal(initial._released, true)
       assert.ok(round1, 'round 1 recorded its leader')
       assert.equal(round1._state, null, 'round 1 leader was released once round 2 defeated it')
       // Only the final leader is still mounted; releaseAll finishes the batch.
@@ -2163,8 +2160,8 @@ describe('R25: a resumed epoch failure keeps its own dirty workspace', () => {
       assert.equal(parent._ownsState, false)
       assert.equal(runner.abandoned.length, 1)
       assert.equal(runner.abandoned[0]!._ownsState, true)
-      assert.equal(runner.abandoned[0]!._released, true)
-      assert.equal(runner.releasedStates.has(state), true)
+      assert.equal(runner.abandoned[0]!._state, null)
+      assert.equal(runner.states.get(state)?.released, true)
       assert.ok(commits.includes('auto-research: unverified epoch-2'))
       assert.equal(commits.some(message => /retained epoch-1/.test(message)), false)
       assert.deepEqual(releases, [false])
