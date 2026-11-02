@@ -219,6 +219,15 @@ describe('Sandbox-internal mounting bridge', () => {
     })
   })
 
+  it('refuses to adopt a Sandbox branch it cannot list', async () => {
+    await withTemp(async root => {
+      const client = sandboxClient([])
+      delete client.fs.list
+      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-4', retryBaseDelayMs: 1 })
+      await assert.rejects(backend.adopt('ar-run-1-leader', 'initial'), /has no fs\.list\/fs\.read/)
+    })
+  })
+
   it('retries Busy refusals on branch.fork', async () => {
     await withTemp(async root => {
       const source = join(root, 'source')

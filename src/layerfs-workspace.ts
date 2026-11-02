@@ -883,9 +883,9 @@ export class LayerFSBackend implements WorkspaceBackend {
   ): Promise<string[]> {
     const skipped: string[] = []
     const fs = this.client.fs
+    // An empty listing would read as "the branch deleted every file".
     if (typeof fs?.list !== 'function' || typeof fs?.read !== 'function') {
-      this.logger?.warn?.('[auto-research] cannot materialize a Sandbox-internal adopted branch: client.fs is unavailable')
-      return skipped
+      throw new Error(`cannot materialize LayerFS branch ${branch}: the client has no fs.list/fs.read`)
     }
     const files = await listBranchFiles(fs, branch)
     for (const name of files) {

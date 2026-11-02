@@ -147,7 +147,7 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
 2. 快照（或建立 LayerFS 基线）起始工作区并评估。基线无效时，在任何 worker 启动前停止。
 3. 每轮判断 `stalled`（`stalled_work_seconds >= stall_seconds`）与 `explore = forkAndFlush || (rsiTop && stalled)`。`stalled_work_seconds` 只累计上次超过 `meaningful_gain` 的提升之后的阶段工作时间，通过 `LATEST.json` 的 `frontier` 跨批次保存，因此单开 RSI-top 在 `rounds: 1` 时也会探索。评估器哈希不同的 frontier 会被丢弃。
 4. 探索阶段运行 `branches` 个并行 worker；继续阶段运行一个。每个分支获得隔离 fork/mount、Worker Prompt、预算预留；RSI-top 下还会获得不同的随机指标视图与 portfolio 协议。
-5. 用冻结评估器评估完成的分支，校验 `PORTFOLIO.json`，选择 leader。
+5. 用冻结评估器评估完成的分支，校验 `PORTFOLIO.json`，选择 leader：主分数（按计划的 `direction`）只要更好就替换 leader，提升再小也替换。主分数相同时依次比较 `selection_metrics`，再优先非基线分支，再取最新的分支。`meaningful_gain` 不参与选择，只用于重置停滞计时。评估器分数有噪声时，应由评估器自己多次试验取平均。
 6. 运行继续阶段，或写出 `RESULT.json` 结束。
 
 启用 `shareContext` 时，每个阶段在总窗口内运行协作 epoch。每个 epoch 发布 `PEER-EVIDENCE.json` 与 `shared-context.md`；分支写 `SHARED_CHECKPOINT.json`（显式文本证据白名单），恢复 epoch 还要写 `PEER-REVIEW.json`，且必须恰好覆盖每个 peer 一次。验证通过的完成状态会按内容寻址保存；若后续 epoch 失败，会恢复到独立的 `<branch>-last-completed/` 目录。
