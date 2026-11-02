@@ -147,12 +147,11 @@ export declare class Runner {
      */
     private releaseTracked;
     /**
-     * Await a worker activation, but never past a short grace after its signal
-     * aborts. A provider that ignores abort gets disposed and the batch moves on.
+     * Await a worker activation, then dispose it. One `workerGraceMs` window,
+     * opened by the abort (or by the result when there was none), bounds both
+     * the result and the disposal: a provider that ignores abort is left behind.
      */
-    private awaitActivationResult;
-    /** Wait for a disposal, but do not let a stuck provider hold the batch. */
-    private disposeWithin;
+    private awaitActivation;
     metricDiagnostics(): MetricDiagnostic[];
     dashboard(): Record<string, unknown>;
     checkDisk(parent: WorkspaceState, count: number): Promise<void>;

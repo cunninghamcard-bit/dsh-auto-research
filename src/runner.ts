@@ -535,52 +535,36 @@ export class Runner {
   }
 
   /**
-   * Await a worker activation, but never past a short grace after its signal
-   * aborts. A provider that ignores abort gets disposed and the batch moves on.
+   * Await a worker activation, then dispose it. One `workerGraceMs` window,
+   * opened by the abort (or by the result when there was none), bounds both
+   * the result and the disposal: a provider that ignores abort is left behind.
    */
-  private async awaitActivationResult(
-    activation: SubagentRun,
-    signal: AbortSignal | undefined,
-    dispose: () => Promise<void>,
-  ): Promise<SubagentResult> {
-    if (!signal) return activation.result
-    if (signal.aborted) {
-      void dispose()
-      throw new ResearchStoppedError('Worker activation aborted before it started')
-    }
-    return new Promise<SubagentResult>((resolvePromise, rejectPromise) => {
-      let settled = false
-      let grace: NodeJS.Timeout | undefined
-      const finish = (callback: () => void): void => {
-        if (settled) return
-        settled = true
-        clearTimeout(grace)
-        signal.removeEventListener('abort', onAbort)
-        callback()
-      }
-      const onAbort = (): void => {
-        void dispose()
-        grace = setTimeout(() => {
-          finish(() => rejectPromise(new ResearchStoppedError('Worker activation ignored abort; bounded wait expired')))
-        }, this.workerGraceMs)
-      }
-      signal.addEventListener('abort', onAbort, { once: true })
-      activation.result.then(
-        value => finish(() => resolvePromise(value)),
-        (error: unknown) => finish(() => rejectPromise(error)),
-      )
+  private async awaitActivation(activation: SubagentRun, signal: AbortSignal | undefined): Promise<SubagentResult> {
+    let disposal: Promise<void> | undefined
+    const dispose = (): Promise<void> => disposal ??= Promise.resolve().then(() => activation.dispose()).catch((error: unknown) => {
+      this.logger?.warn?.(`[auto-research] worker dispose failed: ${(error as Error).message}`)
     })
-  }
-
-  /** Wait for a disposal, but do not let a stuck provider hold the batch. */
-  private async disposeWithin(disposal: Promise<void>): Promise<void> {
     let timer: NodeJS.Timeout | undefined
-    const grace = new Promise<void>(resolvePromise => {
-      timer = setTimeout(resolvePromise, this.workerGraceMs)
-    })
+    let expire: () => void = () => {}
+    const expired = new Promise<'expired'>(resolvePromise => { expire = () => resolvePromise('expired') })
+    const openGrace = (): void => { timer ??= setTimeout(expire, this.workerGraceMs) }
+    const onAbort = (): void => {
+      void dispose()
+      openGrace()
+    }
     try {
-      await Promise.race([disposal, grace])
+      if (signal?.aborted) {
+        onAbort()
+        throw new ResearchStoppedError('Worker activation aborted before it started')
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      const result = await Promise.race([activation.result, expired])
+      if (result === 'expired') throw new ResearchStoppedError('Worker activation ignored abort; bounded wait expired')
+      return result
     } finally {
+      signal?.removeEventListener('abort', onAbort)
+      openGrace()
+      await Promise.race([dispose(), expired])
       clearTimeout(timer)
     }
   }
@@ -1209,26 +1193,7 @@ export class Runner {
         })
         childId = activation.childId ?? null
         if (childId) workerRegistration?.setChildSession(childId)
-        let disposal: Promise<void> | null = null
-        const disposeOnce = (): Promise<void> => {
-          if (!disposal) {
-            disposal = (async () => {
-              try {
-                await activation.dispose()
-              } catch (error) {
-                this.logger?.warn?.(`[auto-research] worker dispose failed: ${(error as Error).message}`)
-              }
-            })()
-          }
-          return disposal
-        }
-        try {
-          result = await this.awaitActivationResult(activation, signal, disposeOnce)
-        } finally {
-          // An abort may have started disposal already; never await it past the
-          // same short grace, so a provider that ignores abort cannot hang.
-          await this.disposeWithin(disposeOnce())
-        }
+        result = await this.awaitActivation(activation, signal)
       } finally {
         clearTimeout(timer)
         workerRegistration?.dispose()

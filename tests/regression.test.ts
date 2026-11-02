@@ -444,6 +444,34 @@ describe('P1-4: bounded worker termination', () => {
       assert.ok(Date.now() - begun < 1000, 'the grace timer bounded the wait')
     })
   })
+
+  it('bounds the result and a hanging dispose by one grace window', async () => {
+    await withTemp(async root => {
+      let started: any
+      const startedPromise = new Promise(resolve => { started = resolve })
+      const subagents = {
+        list: () => ['worker'],
+        async startActivation() {
+          started()
+          return { childId: 'child', result: new Promise(() => {}), dispose: () => new Promise<void>(() => {}) }
+        },
+      }
+      const controller = new AbortController()
+      const { runner } = await setupRunner(root, {
+        subagents,
+        deps: { signal: controller.signal, workerGraceMs: 300 },
+      })
+      const running = runner.run()
+      await startedPromise
+      // Abort while the runner is waiting on the result.
+      await new Promise(resolve => setTimeout(resolve, 50))
+      const begun = Date.now()
+      controller.abort()
+      await assert.rejects(running, error => error instanceof ResearchStoppedError)
+      // Two separate windows would take at least 600 ms.
+      assert.ok(Date.now() - begun < 550, `one window, took ${Date.now() - begun} ms`)
+    })
+  })
 })
 
 describe('P1-5: evaluator abort escalation', () => {
