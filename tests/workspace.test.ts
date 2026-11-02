@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { chmod, lstat, mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
+import { chmod, lstat, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   LayerFSBackend,
@@ -46,11 +47,68 @@ describe('inventory and snapshot', () => {
     })
   })
 
-  it('rejects symlinks and non-regular entries', async () => {
+  it('records symlinks by their text without following them', async () => {
     await withTemp(async root => {
       await writeWorkspace(root)
-      await symlink(join(root, 'notes.md'), join(root, 'link.md'))
-      await assert.rejects(inventory(root), /materializing symlinks/)
+      await mkdir(join(root, 'pkg'), { recursive: true })
+      await writeFile(join(root, 'pkg', 'cli.js'), 'run\n')
+      await mkdir(join(root, 'node_modules', '.bin'), { recursive: true })
+      await symlink('../../pkg/cli.js', join(root, 'node_modules', '.bin', 'cli'))
+      // A directory link (venv lib64 -> lib) is one entry, not a second tree.
+      await symlink('pkg', join(root, 'lib64'))
+      await symlink('/etc/hosts', join(root, '.env'))
+      const files = await inventory(root)
+      assert.equal(files['node_modules/.bin/cli'], 'symlink:../../pkg/cli.js')
+      assert.equal(files['lib64'], 'symlink:pkg')
+      assert.equal(files['lib64/cli.js'], undefined)
+      assert.equal(files['.env'], undefined, 'an env-looking link stays omitted')
+
+      const copy = join(root, '..', 'copy-' + Date.now())
+      try {
+        assert.deepEqual(await snapshot(root, copy), files)
+        assert.equal((await lstat(join(copy, 'node_modules', '.bin', 'cli'))).isSymbolicLink(), true)
+        assert.deepEqual(await inventory(copy), files)
+      } finally {
+        await rm(copy, { recursive: true, force: true })
+      }
+    })
+  })
+
+  it('rejects non-regular entries other than symlinks', async () => {
+    await withTemp(async root => {
+      await writeWorkspace(root)
+      const fifo = join(root, 'pipe')
+      execFileSync('mkfifo', [fifo])
+      await assert.rejects(inventory(root), /Non-regular workspace entry/)
+    })
+  })
+
+  it('keeps symlinks out of checkpoint objects and recreates them on restore', async () => {
+    await withTemp(async root => {
+      const workspace = join(root, 'workspace')
+      await writeWorkspace(workspace)
+      await mkdir(join(workspace, 'node_modules', '.bin'), { recursive: true })
+      await symlink('../pkg/cli.js', join(workspace, 'node_modules', '.bin', 'cli'))
+      const output = join(root, 'out')
+      const before = await inventory(workspace)
+      const checkpoint = await retainCompletedState(output, {
+        id: 'b1',
+        workspace,
+        evaluation: { valid: true, workspace_manifest_sha256: jsonDigest(before), evidence: {} },
+      } as any)
+      const saved = JSON.parse(await readFile(checkpoint, 'utf8'))
+      assert.deepEqual(saved.links, { 'node_modules/.bin/cli': '../pkg/cli.js' })
+      assert.equal(saved.files['node_modules/.bin/cli'], undefined)
+      const restored = await restoreCompletedState(output, checkpoint, { id: 'b1-epoch-2', workspace } as any)
+      assert.deepEqual(await inventory(restored.workspace), before)
+
+      // A checkpoint from before links were recorded restores without them.
+      delete saved.links
+      saved.row.evaluation.workspace_manifest_sha256 = jsonDigest(Object.fromEntries(
+        Object.entries(before).filter(([name]) => name !== 'node_modules/.bin/cli'),
+      ))
+      await writeFile(checkpoint, JSON.stringify(saved))
+      await restoreCompletedState(output, checkpoint, { id: 'b1-epoch-3', workspace } as any)
     })
   })
 

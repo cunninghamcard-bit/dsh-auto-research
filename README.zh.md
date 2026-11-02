@@ -174,6 +174,12 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
 
 真实 LayerFS 挂载返回 Sandbox 内部路径（如 `/workspaces/1`）。当该路径在宿主上不可访问时，后端在 `<run>/<branch>/workspace` 暂存宿主副本，并在该副本上执行评估与 worker，同时在提交时用 `client.fs.apply`（或 `fs.write`/`fs.rm`）发布新增/修改/删除的文件，再调用 `workspace.commit`。冻结基线后会重新挂载分支，使 Sandbox 内的 `/workspaces/<n>` 与宿主暂存副本一致；worker 轮次结束后会把已提交的 Sandbox 覆盖层同步回宿主副本再评估。`fs.read` 无法表示的二进制文件通过 `workspace.exec` + `base64` 原样复制，无法复制时标记为跳过且绝不会被误删。worker 还会收到 `DSH_AUTO_RESEARCH_BRANCH` 与 `DSH_AUTO_RESEARCH_SANDBOX_PATH`。
 
+宿主暂存副本是唯一写入方，Sandbox 挂载只用于执行。worker 返回后，`reconcile` 先把 Sandbox overlay 的改动提交进分支历史，再把两边与暂存副本的初始清单比较：只有 Sandbox 改动时合并回宿主副本；只有宿主改动时由提交发布；两边都改动时分支判为无效（`workspace conflict: host and sandbox both modified: <路径>`），不评估，并以 `rejected` 提交，两边的改动都留在分支历史中。
+
+每个 cohort 开始前由后端估算分支新增的字节数：snapshot 后端与暂存的 LayerFS 挂载按全量宿主副本计算，宿主可直接访问的 LayerFS 挂载（写时复制）计为 0。只有估算值超过可用空间时才拒绝。
+
+符号链接在清单中记为 `symlink:<链接文本>`，不跟随。snapshot 复制时原样重建；已完成状态的检查点记在 `links` 中；暂存的 LayerFS 分支只在宿主副本保留链接（SDK 不能写入链接），并列入 `skippedFiles`。
+
 provider 从 `config.layerfs`、`process.env` 与会话的 `ctx.shellEnv` contributor 解析 `DSH_LAYERFS_PROJECT`、`DSH_LAYERFS_SDK`、`DSH_LAYERFS_OPERATOR`、`DSH_LAYERFS_CLI`、`DSH_LAYERFS_SKILL`、`DSH_LAYERFS_HOME`、`DSH_LAYERFS_STORE_PATH`、`DSH_LAYERFS_DOCKER`、`DSH_LAYERFS_IMAGE`、`DSH_LAYERFS_VOLUME`、`DSH_LAYERFS_DAEMON`、`DSH_LAYERFS_CONTAINER_PREFIX`、`DSH_LAYERFS_DAEMON_HOST`、`DSH_LAYERFS_STORE_CONTAINER`、`DSH_LAYERFS_BUNDLE`、`DSH_LAYERFS_WSL_ENDPOINT`、`DSH_LAYERFS_TRACE`、`DSH_LAYERFS_TRACE_STEP` 与 `DSH_LAYERFS_TRACE_START`。显式 `config.layerfs` 优先；宿主注入的 `layerfs.client` 从不由本插件关闭。
 
 ## 安全

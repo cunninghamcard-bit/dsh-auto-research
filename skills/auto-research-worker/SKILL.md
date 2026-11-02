@@ -18,6 +18,7 @@ You run experiments in one isolated branch of a research batch. A coordinator ow
 ## Rules
 
 - Work only inside `checkout`. Other branches' checkouts may be readable; never edit them or stop their processes.
+- When `sandbox_path` is set, write files only under `checkout`; use `sandbox_path` to run commands. A branch whose files change in both places is invalid. Symlinks under `checkout` are kept but are not written to the LayerFS branch.
 - Never call `subagent_auto_research`, never start other agents or batches, and never edit `.auto-research-methods/plan.json`.
 - Do not publish, merge, push, or send anything.
 - Do not modify the evaluator or weaken any check to make a candidate pass. Do not fabricate results, receipts or passing checks.

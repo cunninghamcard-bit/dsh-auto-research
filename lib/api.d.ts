@@ -5,5 +5,5 @@
  * the shared workspace utilities. This module registers nothing.
  */
 export { OMIT, inventory, jsonDigest, restoreCompletedState, retainCompletedState, sha256, snapshot, writeJsonAtomic, } from './layerfs-workspace.js';
-export type { PluginContext, ResearchWorkspaceService, TrajectoryRow, WorkspaceBackend, WorkspaceBackendCreateOptions, WorkspaceBackendFactory, WorkspaceState, } from './types.js';
+export type { PluginContext, ReconcileOutcome, Reconciliation, ResearchWorkspaceService, TrajectoryRow, WorkspaceBackend, WorkspaceBackendCreateOptions, WorkspaceBackendFactory, WorkspaceState, } from './types.js';
 //# sourceMappingURL=api.d.ts.map

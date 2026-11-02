@@ -17,6 +17,8 @@ export {
 } from './layerfs-workspace.js'
 export type {
   PluginContext,
+  ReconcileOutcome,
+  Reconciliation,
   ResearchWorkspaceService,
   TrajectoryRow,
   WorkspaceBackend,

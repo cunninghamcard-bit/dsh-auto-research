@@ -17,7 +17,7 @@
  * is allowed to inspect) and the retained / restored completed-state objects
  * used by cooperative cohorts.
  */
-import type { LayerFSBinding, LayerFSClient, LayerFSSettings, Logger, PluginContext, TrajectoryRow, WorkspaceBackend, WorkspaceBackendCreateOptions, WorkspaceBackendFactory, WorkspaceManagerLike, WorkspaceState } from './types.js';
+import type { LayerFSBinding, LayerFSClient, LayerFSSettings, Logger, PluginContext, Reconciliation, TrajectoryRow, WorkspaceBackend, WorkspaceBackendCreateOptions, WorkspaceBackendFactory, WorkspaceManagerLike, WorkspaceState } from './types.js';
 /** Harness and provider state that never enters an inventory or a branch. */
 export declare const OMIT: Set<string>;
 /** @returns the lowercase hexadecimal SHA-256 of `data`. */
@@ -34,14 +34,23 @@ export declare function jsonEqual(a: unknown, b: unknown): boolean;
 export declare function isContained(root: string, target: string): boolean;
 /** @returns the path relative to `root`, using POSIX separators. */
 export declare function relativePosix(root: string, target: string): string;
+/** Manifest value prefix for a symlink: `symlink:<link text>`. */
+export declare const SYMLINK = "symlink:";
+/** @returns whether a manifest value records a symlink rather than a content hash. */
+export declare function isLinkEntry(value: string | undefined): boolean;
 /**
  * Snapshot inventory: relative POSIX path -> SHA-256 for every regular,
- * non-omitted file. Symlinks and non-regular entries are rejected instead of
- * being followed, so a snapshot never captures bytes outside the workspace.
+ * non-omitted file, and `symlink:<link text>` for every symlink. Links are
+ * recorded, never followed, so a snapshot never captures bytes outside the
+ * workspace. Other non-regular entries are rejected.
  */
 export declare function inventory(root: string): Promise<Record<string, string>>;
 /** @returns total regular-file bytes represented by `files` under `root`. */
 export declare function inventoryBytes(root: string, files: Record<string, string>): Promise<number>;
+/** @returns the sorted paths whose manifest value differs between `before` and `after`. */
+export declare function changedPaths(before: Record<string, string>, after: Record<string, string>): string[];
+/** @returns the bytes of `count` full host copies of the tree at `path`. */
+export declare function hostCopyBytes(path: string, count: number): Promise<number>;
 /** @returns available bytes of the filesystem holding `path` (or its nearest parent). */
 export declare function freeBytes(path: string): Promise<number>;
 /**
@@ -82,6 +91,7 @@ export declare class SnapshotBackend implements WorkspaceBackend {
     fork(parent: WorkspaceState, id: string): Promise<WorkspaceState>;
     commit(): Promise<void>;
     release(): Promise<void>;
+    estimateForkBytes(parent: WorkspaceState, count: number): Promise<number>;
     retainCompletedState(row: TrajectoryRow): Promise<string>;
     restoreCompletedState(checkpoint: string, failedRow: TrajectoryRow): Promise<TrajectoryRow>;
 }
@@ -237,14 +247,36 @@ export declare class LayerFSBackend implements WorkspaceBackend {
     fork(parent: WorkspaceState, id: string): Promise<WorkspaceState>;
     adopt(branch: string, id: string): Promise<WorkspaceState>;
     /**
-     * Fold changes made inside a live Sandbox mount back into the host staging
-     * copy before it is evaluated.
+     * Settle a staged branch's two writable views before evaluation.
      *
-     * A worker calls `bash` inside `/workspaces/<n>`; those edits stay in the
-     * Sandbox overlay until they are committed. Host edits take precedence: if
-     * the staging directory changed, `commit()` is the writer and this returns.
+     * The host staging copy is the authoritative writer; the Sandbox mount at
+     * `/workspaces/<n>` is for execution. A worker that edits the Sandbox anyway
+     * leaves changes in its overlay. This commits that overlay into the branch
+     * history first, whatever the host did, so it is never dropped, then compares
+     * both sides with the inventory the staging copy started from:
+     *
+     * - neither changed: `unchanged`
+     * - Sandbox only: fold the branch into the host copy, `folded`
+     * - host only: `host`; `commit()` publishes it
+     * - both: `conflict`; the host diff is still published by `commit()`, so
+     *   both sides stay in the branch history, and the row is invalid because
+     *   the evaluated host copy is not the branch state.
      */
-    reconcile(state: WorkspaceState): Promise<void>;
+    reconcile(state: WorkspaceState): Promise<Reconciliation>;
+    /**
+     * Commit a dirty Sandbox overlay and report what the branch now holds that
+     * the staging copy did not start from.
+     *
+     * @returns null when the overlay is clean and the branch head has not moved;
+     *   otherwise the changed paths and a materialized copy of the branch (the
+     *   caller removes `directory`).
+     */
+    private sandboxChanges;
+    /**
+     * A host-accessible LayerFS mount is copy-on-write and adds nothing up
+     * front; a staged mount (or a non-LayerFS parent) is copied to the host.
+     */
+    estimateForkBytes(parent: WorkspaceState, count: number): Promise<number>;
     commit(state: WorkspaceState, { message }?: {
         message?: string;
     }): Promise<void>;
@@ -274,7 +306,8 @@ export declare class WorkspaceManager implements WorkspaceManagerLike {
     }): Promise<void>;
     retainCompletedState(row: TrajectoryRow): Promise<string>;
     restoreCompletedState(checkpoint: string, failedRow: TrajectoryRow): Promise<TrajectoryRow>;
-    reconcile(state: WorkspaceState): Promise<void>;
+    reconcile(state: WorkspaceState): Promise<Reconciliation>;
+    estimateForkBytes(parent: WorkspaceState, count: number): Promise<number>;
     close(): Promise<void>;
 }
 /** Every `DSH_LAYERFS_*` name a `dsh` session may publish. */

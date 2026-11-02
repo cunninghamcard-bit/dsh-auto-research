@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, readlink, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   ResearchStoppedError,
@@ -194,6 +194,20 @@ describe('Runner batches', () => {
       assert.equal(JSON.parse(await readFile(join(output, 'SELECTIONS.json'), 'utf8')).length, 1)
       assert.equal((await stat(join(output, 'DASHBOARD.json'))).isFile(), true)
       assert.equal(JSON.parse(await readFile(join(root, '.auto-research-methods', 'LATEST.json'), 'utf8')).leader_workspace, result.leader.workspace)
+      await runner.releaseAll()
+    })
+  })
+
+  it('completes a batch on a workspace with node_modules/.bin symlinks', async () => {
+    await withTemp(async root => {
+      const { runner, workspace } = await setup(root, { options: { forkAndFlush: true } })
+      await mkdir(join(workspace, 'pkg'), { recursive: true })
+      await writeFile(join(workspace, 'pkg', 'cli.js'), 'run\n')
+      await mkdir(join(workspace, 'node_modules', '.bin'), { recursive: true })
+      await symlink('../../pkg/cli.js', join(workspace, 'node_modules', '.bin', 'cli'))
+      const result = await runner.run()
+      assert.equal(result.status, 'COMPLETED')
+      assert.equal(await readlink(join(result.leader.workspace, 'node_modules', '.bin', 'cli')), '../../pkg/cli.js')
       await runner.releaseAll()
     })
   })

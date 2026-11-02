@@ -153,7 +153,7 @@ export declare class Runner {
     private disposeWithin;
     metricDiagnostics(): MetricDiagnostic[];
     dashboard(): Record<string, unknown>;
-    checkDisk(workspace: string, count: number): Promise<void>;
+    checkDisk(parent: WorkspaceState, count: number): Promise<void>;
     views(count: number): MetricView[];
     /** Run all branches; one unexpected rejection aborts its siblings. */
     private runBranches;

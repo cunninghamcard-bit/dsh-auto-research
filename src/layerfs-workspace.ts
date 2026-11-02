@@ -31,6 +31,7 @@ import type {
   LayerFSSettings,
   Logger,
   PluginContext,
+  Reconciliation,
   TrajectoryRow,
   WorkspaceBackend,
   WorkspaceBackendCreateOptions,
@@ -119,10 +120,19 @@ function omitFile(name: string): boolean {
   return OMIT.has(name) || ENV_FILE.test(name)
 }
 
+/** Manifest value prefix for a symlink: `symlink:<link text>`. */
+export const SYMLINK = 'symlink:'
+
+/** @returns whether a manifest value records a symlink rather than a content hash. */
+export function isLinkEntry(value: string | undefined): boolean {
+  return value !== undefined && value.startsWith(SYMLINK)
+}
+
 /**
  * Snapshot inventory: relative POSIX path -> SHA-256 for every regular,
- * non-omitted file. Symlinks and non-regular entries are rejected instead of
- * being followed, so a snapshot never captures bytes outside the workspace.
+ * non-omitted file, and `symlink:<link text>` for every symlink. Links are
+ * recorded, never followed, so a snapshot never captures bytes outside the
+ * workspace. Other non-regular entries are rejected.
  */
 export async function inventory(root: string): Promise<Record<string, string>> {
   const result: Record<string, string> = {}
@@ -132,7 +142,9 @@ export async function inventory(root: string): Promise<Record<string, string>> {
     for (const entry of entries) {
       const full = join(directory, entry.name)
       if (entry.isSymbolicLink()) {
-        throw new Error('Snapshot requires materializing symlinks first: ' + full)
+        if (omitFile(entry.name) || omitDirectory(directory.split(sep).at(-1), entry.name)) continue
+        result[relativePosix(root, full)] = SYMLINK + await fsp.readlink(full)
+        continue
       }
       if (entry.isDirectory()) {
         if (omitDirectory(directory.split(sep).at(-1), entry.name)) continue
@@ -159,6 +171,17 @@ export async function inventoryBytes(root: string, files: Record<string, string>
     total += stat.size
   }
   return total
+}
+
+/** @returns the sorted paths whose manifest value differs between `before` and `after`. */
+export function changedPaths(before: Record<string, string>, after: Record<string, string>): string[] {
+  const names = new Set([...Object.keys(before), ...Object.keys(after)])
+  return [...names].filter(name => before[name] !== after[name]).sort()
+}
+
+/** @returns the bytes of `count` full host copies of the tree at `path`. */
+export async function hostCopyBytes(path: string, count: number): Promise<number> {
+  return (await inventoryBytes(path, await inventory(path))) * count
 }
 
 /** @returns available bytes of the filesystem holding `path` (or its nearest parent). */
@@ -200,7 +223,8 @@ async function copyTree(sourceRoot: string, destinationRoot: string): Promise<vo
       if (!shouldCopy(sourceRoot, from)) continue
       const to = join(destination, entry.name)
       if (entry.isSymbolicLink()) {
-        throw new Error('Snapshot requires materializing symlinks first: ' + from)
+        await fsp.symlink(await fsp.readlink(from), to)
+        continue
       }
       if (entry.isDirectory()) {
         await walk(from, to)
@@ -309,6 +333,14 @@ export async function retainCompletedState(output: string, row: TrajectoryRow): 
   const objects = join(output, 'checkpoint-objects')
   await fsp.mkdir(objects, { recursive: true })
   const modes: Record<string, number> = {}
+  // Links are recorded by their text and recreated on restore; only regular
+  // files go into `checkpoint-objects`.
+  const links: Record<string, string> = {}
+  for (const [name, value] of Object.entries(files)) {
+    if (!isLinkEntry(value)) continue
+    links[name] = value.slice(SYMLINK.length)
+    delete files[name]
+  }
   for (const name of Object.keys(files).sort()) {
     const expected = files[name]
     if (expected === undefined) continue
@@ -337,7 +369,7 @@ export async function retainCompletedState(output: string, row: TrajectoryRow): 
     if (await digestFile(object) !== expected) throw new Error('Checkpoint object changed')
   }
   const checkpoint = join(output, `${row.id}-completed-state.json`)
-  const saved: CompletedState = { row: publicRow(row), files, modes }
+  const saved: CompletedState = { row: publicRow(row), files, modes, links }
   await writeJsonAtomic(checkpoint, saved)
   return checkpoint
 }
@@ -376,6 +408,16 @@ export async function restoreCompletedState(
     await fsp.mkdir(dirname(target), { recursive: true })
     await fsp.copyFile(object, target)
     await fsp.chmod(target, saved.modes[name] ?? 0o644)
+  }
+  // Checkpoints written before links were recorded have no `links`.
+  for (const [name, link] of Object.entries(saved.links ?? {})) {
+    const parts = name.split('/')
+    if (isAbsolute(name) || parts.includes('..') || parts.length === 0) {
+      throw new Error('Invalid retained checkpoint path')
+    }
+    const target = join(workspace, name)
+    await fsp.mkdir(dirname(target), { recursive: true })
+    await fsp.symlink(link, target)
   }
   const actual = await inventory(workspace)
   if (jsonDigest(actual) !== row.evaluation?.workspace_manifest_sha256) {
@@ -422,6 +464,10 @@ export class SnapshotBackend implements WorkspaceBackend {
   async commit(): Promise<void> {}
 
   async release(): Promise<void> {}
+
+  async estimateForkBytes(parent: WorkspaceState, count: number): Promise<number> {
+    return hostCopyBytes(parent.path, count)
+  }
 
   async retainCompletedState(row: TrajectoryRow): Promise<string> {
     return retainCompletedState(this.output, row)
@@ -795,6 +841,15 @@ export class LayerFSBackend implements WorkspaceBackend {
     const directories = new Set<string>()
     for (const name of Object.keys(after).sort()) {
       if (after[name] === before[name]) continue
+      if (isLinkEntry(after[name])) {
+        // The SDK has no call that writes a symlink: keep it on the host copy
+        // and never treat its absence on the branch as a deletion.
+        if (!(state.skippedFiles ?? []).includes(name)) {
+          state.skippedFiles = [...(state.skippedFiles ?? []), name]
+          this.logger?.warn?.(`[auto-research] symlink ${name} stays in the host staging copy; LayerFS fs.apply cannot write links`)
+        }
+        continue
+      }
       const parts = name.split('/')
       for (let depth = 1; depth < parts.length; depth += 1) {
         directories.add(parts.slice(0, depth).join('/'))
@@ -817,6 +872,8 @@ export class LayerFSBackend implements WorkspaceBackend {
       // A binary adopted file without a host copy must never be removed from
       // its branch just because the staging directory cannot represent it.
       if ((state.skippedFiles ?? []).includes(name)) continue
+      // A link was never published, so there is nothing to remove.
+      if (isLinkEntry(before[name])) continue
       writes.push({ op: 'rm', path: '/' + name })
     }
     const fs = this.client.fs
@@ -1217,29 +1274,74 @@ export class LayerFSBackend implements WorkspaceBackend {
   }
 
   /**
-   * Fold changes made inside a live Sandbox mount back into the host staging
-   * copy before it is evaluated.
+   * Settle a staged branch's two writable views before evaluation.
    *
-   * A worker calls `bash` inside `/workspaces/<n>`; those edits stay in the
-   * Sandbox overlay until they are committed. Host edits take precedence: if
-   * the staging directory changed, `commit()` is the writer and this returns.
+   * The host staging copy is the authoritative writer; the Sandbox mount at
+   * `/workspaces/<n>` is for execution. A worker that edits the Sandbox anyway
+   * leaves changes in its overlay. This commits that overlay into the branch
+   * history first, whatever the host did, so it is never dropped, then compares
+   * both sides with the inventory the staging copy started from:
+   *
+   * - neither changed: `unchanged`
+   * - Sandbox only: fold the branch into the host copy, `folded`
+   * - host only: `host`; `commit()` publishes it
+   * - both: `conflict`; the host diff is still published by `commit()`, so
+   *   both sides stay in the branch history, and the row is invalid because
+   *   the evaluated host copy is not the branch state.
    */
-  async reconcile(state: WorkspaceState): Promise<void> {
-    if (!state?.staging || !state.handle || !state.branch) return
-    const hostAfter = await inventory(state.path)
+  async reconcile(state: WorkspaceState): Promise<Reconciliation> {
+    const unchanged: Reconciliation = { outcome: 'unchanged', conflicts: [] }
+    if (!state?.staging || !state.handle || !state.branch) return unchanged
     const hostBaseline = state.prelaunchInventory ?? state.stagingInventory ?? {}
-    const hostChanged = !jsonEqual(hostAfter, hostBaseline)
-    if (hostChanged) return
+    const hostChanged = changedPaths(hostBaseline, await inventory(state.path))
+    const sandbox = await this.sandboxChanges(state)
+    if (sandbox === null || sandbox.changed.length === 0) {
+      return hostChanged.length > 0 ? { outcome: 'host', conflicts: [] } : unchanged
+    }
+    if (hostChanged.length > 0) {
+      const sandboxChanged = new Set(sandbox.changed)
+      return { outcome: 'conflict', conflicts: hostChanged.filter(name => sandboxChanged.has(name)) }
+    }
+    const baseline = state.stagingInventory ?? {}
+    for (const name of Object.keys(baseline)) {
+      if (Object.hasOwn(sandbox.files, name)) continue
+      if ((state.skippedFiles ?? []).includes(name)) continue
+      // Links are never published, so a branch without one has not deleted it.
+      if (isLinkEntry(baseline[name])) continue
+      await fsp.rm(join(state.path, name), { force: true })
+    }
+    for (const name of Object.keys(sandbox.files).sort()) {
+      const target = join(state.path, name)
+      await fsp.mkdir(dirname(target), { recursive: true })
+      await fsp.copyFile(join(sandbox.directory, name), target)
+    }
+    await fsp.rm(sandbox.directory, { recursive: true, force: true })
+    state.stagingInventory = sandbox.files
+    state.prelaunchInventory = await inventory(state.path)
+    return { outcome: 'folded', conflicts: [] }
+  }
+
+  /**
+   * Commit a dirty Sandbox overlay and report what the branch now holds that
+   * the staging copy did not start from.
+   *
+   * @returns null when the overlay is clean and the branch head has not moved;
+   *   otherwise the changed paths and a materialized copy of the branch (the
+   *   caller removes `directory`).
+   */
+  private async sandboxChanges(state: WorkspaceState): Promise<{
+    changed: string[]
+    files: Record<string, string>
+    directory: string
+  } | null> {
+    const handle = state.handle as LayerFSMount
     const status = this.client.workspace?.status
     if (typeof status === 'function') {
-      let current: unknown
+      let current: unknown = null
       try {
-        current = await this.retry(() => status.call(this.client.workspace, state.handle as LayerFSMount))
+        current = await this.retry(() => status.call(this.client.workspace, handle))
       } catch (error) {
-        this.logger?.warn?.(
-          `[auto-research] workspace.status unavailable for ${state.id}: ${(error as Error).message}`,
-        )
-        current = null
+        this.logger?.warn?.(`[auto-research] workspace.status unavailable for ${state.id}: ${(error as Error).message}`)
       }
       if (current !== null && typeof current === 'object') {
         const record = current as {
@@ -1253,56 +1355,56 @@ export class LayerFSBackend implements WorkspaceBackend {
         const dirtyInodes = Number(record.overlay?.inodes ?? record.dirty?.inodes ?? 0)
         const pendingMerge = record.overlay?.pendingMerge === true || record.dirty?.pendingMerge === true
         const dirtyOverlay = dirtyEntries > 0 || dirtyInodes > 0 || pendingMerge
-        if (dirtyOverlay && typeof this.client.workspace?.commit === 'function') {
-          try {
-            await this.retry(() => this.client.workspace!.commit!(
-              state.handle as LayerFSMount,
-              `auto-research: sandbox ${state.id}`,
-            ))
-          } catch (error) {
-            if (!isStaleMountRefusal(error)) throw error
-          }
-        }
-        const initialBase = (state.handle as { base?: unknown } | null)?.base
+        const initialBase = (handle as { base?: unknown } | null)?.base
         const headKnownUnchanged = !dirtyOverlay
           && !record.headMovedSinceMount
           && typeof initialBase === 'string'
           && typeof record.branchHead === 'string'
           && record.branchHead === initialBase
           && (record.base === undefined || record.base === initialBase)
-        if (headKnownUnchanged) return
+        if (headKnownUnchanged) return null
+        if (dirtyOverlay && typeof this.client.workspace?.commit === 'function') {
+          // A refused commit throws: the overlay is not in the branch history
+          // yet, and the remount below would discard it.
+          await this.retry(() => this.client.workspace!.commit!(handle, `auto-research: sandbox ${state.id}`))
+          // The branch head moved; the later `commit()` needs a current mount.
+          await this.remountStaging(state)
+        }
       }
     }
-    const temporary = join(this.output, `${state.id}-reconcile-${randomUUID()}`)
+    const directory = join(this.output, `${state.id}-reconcile-${randomUUID()}`)
     try {
-      await fsp.mkdir(temporary, { recursive: true })
+      await fsp.mkdir(directory, { recursive: true })
       const skipped = await this.materializeBranch(
-        state.branch,
-        temporary,
+        state.branch as string,
+        directory,
         state.handle as LayerFSMount,
         state.sandboxPath ?? null,
       )
       if (skipped.length > 0) {
         state.skippedFiles = [...new Set([...(state.skippedFiles ?? []), ...skipped])]
       }
-      const branchInv = await inventory(temporary)
-      const branchBaseline = state.stagingInventory ?? {}
-      if (jsonEqual(branchInv, branchBaseline)) return
-      for (const name of Object.keys(branchBaseline)) {
-        if (Object.hasOwn(branchInv, name)) continue
-        if ((state.skippedFiles ?? []).includes(name)) continue
-        await fsp.rm(join(state.path, name), { force: true })
-      }
-      for (const name of Object.keys(branchInv).sort()) {
-        const target = join(state.path, name)
-        await fsp.mkdir(dirname(target), { recursive: true })
-        await fsp.copyFile(join(temporary, name), target)
-      }
-      state.stagingInventory = branchInv
-      state.prelaunchInventory = await inventory(state.path)
-    } finally {
-      await fsp.rm(temporary, { recursive: true, force: true }).catch(() => {})
+      const files = await inventory(directory)
+      const baseline = state.stagingInventory ?? {}
+      // Paths the branch cannot hold (links, unreadable binaries) are not
+      // Sandbox changes.
+      const changed = changedPaths(baseline, files)
+        .filter(name => !isLinkEntry(baseline[name]) && !(state.skippedFiles ?? []).includes(name))
+      if (changed.length === 0) await fsp.rm(directory, { recursive: true, force: true })
+      return { changed, files, directory }
+    } catch (error) {
+      await fsp.rm(directory, { recursive: true, force: true }).catch(() => {})
+      throw error
     }
+  }
+
+  /**
+   * A host-accessible LayerFS mount is copy-on-write and adds nothing up
+   * front; a staged mount (or a non-LayerFS parent) is copied to the host.
+   */
+  async estimateForkBytes(parent: WorkspaceState, count: number): Promise<number> {
+    if (parent.branch && !parent.staging) return 0
+    return hostCopyBytes(parent.path, count)
   }
 
   async commit(state: WorkspaceState, { message = 'auto-research: verified state' }: { message?: string } = {}): Promise<void> {
@@ -1469,9 +1571,13 @@ export class WorkspaceManager implements WorkspaceManagerLike {
     return this.backend.restoreCompletedState(checkpoint, failedRow)
   }
 
-  async reconcile(state: WorkspaceState): Promise<void> {
-    if (typeof this.backend.reconcile !== 'function') return
-    await this.backend.reconcile(state)
+  async reconcile(state: WorkspaceState): Promise<Reconciliation> {
+    if (typeof this.backend.reconcile !== 'function') return { outcome: 'unchanged', conflicts: [] }
+    return this.backend.reconcile(state)
+  }
+
+  async estimateForkBytes(parent: WorkspaceState, count: number): Promise<number> {
+    return this.backend.estimateForkBytes(parent, count)
   }
 
   async close(): Promise<void> {

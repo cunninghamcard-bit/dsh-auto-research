@@ -202,6 +202,8 @@ export interface CompletedState {
     row: TrajectoryRow;
     files: Record<string, string>;
     modes: Record<string, number>;
+    /** Symlinks by path -> link text; absent in checkpoints from older versions. */
+    links?: Record<string, string>;
 }
 /** Result of one complete batch. */
 export interface BatchResult {
@@ -569,9 +571,22 @@ export interface WorkspaceManagerLike {
     }) => Promise<void>;
     retainCompletedState: (row: TrajectoryRow) => Promise<string>;
     restoreCompletedState: (checkpoint: string, failedRow: TrajectoryRow) => Promise<TrajectoryRow>;
-    /** Fold changes made inside a live Sandbox mount back into the host copy. */
-    reconcile?: (state: WorkspaceState) => Promise<void>;
+    /** Settle a live Sandbox mount against its host copy before evaluation. */
+    reconcile: (state: WorkspaceState) => Promise<Reconciliation>;
+    /** Bytes `count` forks of `parent` will add to the run's filesystem. */
+    estimateForkBytes: (parent: WorkspaceState, count: number) => Promise<number>;
     close?: () => Promise<void>;
+}
+/**
+ * How a branch's two writable views compared after its worker returned:
+ * `unchanged`, `folded` (Sandbox only, folded into the host copy), `host`
+ * (host copy only), or `conflict` (both; `conflicts` lists the paths both
+ * changed).
+ */
+export type ReconcileOutcome = 'unchanged' | 'host' | 'folded' | 'conflict';
+export interface Reconciliation {
+    outcome: ReconcileOutcome;
+    conflicts: string[];
 }
 /** Structural contract for `dsh`'s `ctx.subprocess` (`@deepseek-ai/dsh-subprocess`). */
 export interface SubprocessServiceLike {
@@ -624,7 +639,7 @@ export interface WorkspaceBackend {
         sync?: boolean;
     }) => Promise<WorkspaceState>;
     fork: (parent: WorkspaceState, id: string) => Promise<WorkspaceState>;
-    reconcile?: (state: WorkspaceState) => Promise<void>;
+    reconcile?: (state: WorkspaceState) => Promise<Reconciliation>;
     commit: (state: WorkspaceState, options?: {
         message?: string;
     }) => Promise<void>;
@@ -634,6 +649,8 @@ export interface WorkspaceBackend {
     }) => Promise<void>;
     retainCompletedState: (row: TrajectoryRow) => Promise<string>;
     restoreCompletedState: (checkpoint: string, failedRow: TrajectoryRow) => Promise<TrajectoryRow>;
+    /** Bytes `count` forks of `parent` will add to the run's filesystem. */
+    estimateForkBytes: (parent: WorkspaceState, count: number) => Promise<number>;
     close?: () => Promise<void>;
 }
 /** Options passed to a {@link WorkspaceBackendFactory} when creating a backend for a batch. */

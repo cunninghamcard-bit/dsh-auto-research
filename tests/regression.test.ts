@@ -31,6 +31,7 @@ import {
 import {
   LAYERFS_ENV_KEYS,
   LayerFSBackend,
+  SnapshotBackend,
   applyEnvironmentPatch,
   applyLayerfsEnvironment,
   inventory,
@@ -1461,20 +1462,27 @@ describe('R15: canonical distinct metric values', () => {
   })
 })
 
-describe('R16: the disk check runs for both backends', () => {
-  it('rejects an impossible cohort on a layerfs manager too', async () => {
+describe('R16: the disk check uses the backend estimate', () => {
+  it('counts host copies for staged LayerFS mounts and nothing for direct ones', async () => {
     await withTemp(async root => {
       const workspace = join(root, 'workspace')
       await writeWorkspace(workspace)
-      const manager = {
-        kind: 'layerfs',
-        baseline: async () => ({ id: 'initial', backend: 'layerfs', path: workspace, branch: null }),
-        fork: async () => ({ id: 'x', backend: 'layerfs', path: workspace, branch: null }),
-        commit: async () => {},
-        release: async () => {},
-        retainCompletedState: async () => { throw new Error('unused') },
-        restoreCompletedState: async () => { throw new Error('unused') },
-      }
+      const backend = new LayerFSBackend({
+        client: { branch: { fork: async () => ({}) }, workspace: { mount: async () => ({}) } } as any,
+        output: join(root, 'out'),
+      })
+      const direct = { id: 'p', backend: 'layerfs', path: workspace, branch: 'ar-p', staging: false }
+      const staged = { ...direct, staging: true }
+      assert.equal(await backend.estimateForkBytes(direct, 4), 0)
+      const bytes = await backend.estimateForkBytes(staged, 1)
+      assert.ok(bytes > 0)
+      assert.equal(await backend.estimateForkBytes(staged, 4), bytes * 4)
+      assert.equal(await new SnapshotBackend({ output: join(root, 'out') }).estimateForkBytes(direct, 2), bytes * 2)
+
+      const estimate = { bytes: 0 }
+      const manager = Object.assign(Object.create(snapshotManager({ output: join(root, 'out') })), {
+        estimateForkBytes: async () => estimate.bytes,
+      })
       const runner = new Runner({
         config: {},
         plan: planFor(root),
@@ -1488,8 +1496,9 @@ describe('R16: the disk check runs for both backends', () => {
           logger: {},
         },
       })
-      await runner.checkDisk(workspace, 1)
-      await assert.rejects(runner.checkDisk(workspace, Number.MAX_SAFE_INTEGER), /Insufficient space/)
+      await runner.checkDisk(direct, Number.MAX_SAFE_INTEGER)
+      estimate.bytes = Number.MAX_SAFE_INTEGER
+      await assert.rejects(runner.checkDisk(direct, 1), /Insufficient space/)
     })
   })
 })
@@ -1981,53 +1990,117 @@ describe('R24: staged Sandbox mounts stay bidirectional', () => {
     })
   })
 
-  it('folds a committed Sandbox overlay back and lets host edits win', async () => {
+  it('settles a staged branch: unchanged, folded, host, then conflict with both sides in history', async () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const branchFiles: Record<string, string> = {
-        '/state.json': JSON.stringify({ score: 1, metrics: { score: 1 } }, null, 2) + '\n',
-        '/notes.md': '# notes\n',
-      }
-      let statusCalls = 0
+      // The branch as LayerFS holds it; fs.apply writes into it.
+      const branchFiles: Record<string, string> = {}
+      const actions: any[] = []
+      let dirty = false
       const client: any = {
         branch: { async fork() {} },
         workspace: {
           async mount() { return { sandbox: 'r24', path: '/workspaces/r24-reconcile' } },
-          async commit() {},
-          async unmount() {},
-          async status() {
-            statusCalls += 1
-            return { overlay: { entries: 1 }, headMovedSinceMount: true }
+          async commit(_handle: any, message: string) {
+            actions.push(['commit', message])
+            dirty = false
           },
+          async unmount() {},
+          async status() { return { overlay: { entries: dirty ? 1 : 0 }, headMovedSinceMount: dirty } },
         },
         fs: {
           async list(_branch: string, path = '/') {
             if (path !== '/') return []
-            return Object.keys(branchFiles).map(name => ({ name: name.replace(/^\/+/, '') }))
+            return Object.keys(branchFiles).map(name => ({ name: name.slice(1) }))
           },
           async read(_branch: string, name: string) {
             return { text: branchFiles[name] ?? '' }
           },
-          async apply() {},
+          async apply(_branch: string, changes: any[], message: string) {
+            actions.push(['apply', changes.filter(change => change.op !== 'mkdir').map(change => `${change.op} ${change.path}`), message])
+            for (const change of changes) {
+              if (change.op === 'write') branchFiles[change.path] = String(change.content)
+              if (change.op === 'rm') delete branchFiles[change.path]
+            }
+          },
         },
         async close() {},
       }
       const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'r24b' })
       const state = await backend.baseline(source, 'initial')
-      // A worker edits inside /workspaces/<n>; the host copy has not changed.
-      branchFiles['/state.json'] = JSON.stringify({ score: 9, metrics: { score: 9 } }, null, 2) + '\n'
+      const launch = async () => { state.prelaunchInventory = await inventory(state.path) }
+      const score = (value: number) => JSON.stringify({ score: value, metrics: { score: value } }, null, 2) + '\n'
+
+      await launch()
+      assert.deepEqual(await backend.reconcile(state), { outcome: 'unchanged', conflicts: [] })
+
+      // A worker edits inside /workspaces/<n> only.
+      await launch()
+      branchFiles['/state.json'] = score(9)
       delete branchFiles['/notes.md']
-      await backend.reconcile(state)
-      assert.match(await readFile(join(state.path, 'state.json'), 'utf8'), /"score": 9/)
+      dirty = true
+      assert.deepEqual(await backend.reconcile(state), { outcome: 'folded', conflicts: [] })
+      assert.equal(await readFile(join(state.path, 'state.json'), 'utf8'), score(9))
       await assert.rejects(stat(join(state.path, 'notes.md')), { code: 'ENOENT' })
 
-      // Host edits take precedence: reconcile must not touch them.
-      await writeFile(join(state.path, 'state.json'), JSON.stringify({ score: 3, metrics: { score: 3 } }, null, 2) + '\n')
-      const callsBefore = statusCalls
-      await backend.reconcile(state)
-      assert.equal(statusCalls, callsBefore)
-      assert.match(await readFile(join(state.path, 'state.json'), 'utf8'), /"score": 3/)
+      // A worker edits the host copy only; commit() publishes it.
+      await launch()
+      await writeFile(join(state.path, 'state.json'), score(3))
+      // fs.apply cannot write a symlink: it stays on the host copy only.
+      await symlink('state.json', join(state.path, 'current.json'))
+      assert.deepEqual(await backend.reconcile(state), { outcome: 'host', conflicts: [] })
+      await backend.commit(state)
+      assert.equal(branchFiles['/state.json'], score(3))
+      assert.equal(branchFiles['/current.json'], undefined)
+      assert.deepEqual(state.skippedFiles, ['current.json'])
+
+      // Both views change; state.json changes on both sides.
+      await launch()
+      actions.length = 0
+      await writeFile(join(state.path, 'state.json'), score(4))
+      await writeFile(join(state.path, 'host.md'), 'host\n')
+      branchFiles['/state.json'] = score(5)
+      branchFiles['/sandbox.md'] = 'sandbox\n'
+      dirty = true
+      assert.deepEqual(await backend.reconcile(state), { outcome: 'conflict', conflicts: ['state.json'] })
+      // The host copy is left as the worker wrote it.
+      assert.equal(await readFile(join(state.path, 'state.json'), 'utf8'), score(4))
+      await backend.commit(state, { message: 'auto-research: rejected initial' })
+      // The Sandbox overlay was committed first, then the host diff published.
+      assert.deepEqual(actions[0], ['commit', 'auto-research: sandbox initial'])
+      const apply = actions.find(action => action[0] === 'apply')
+      assert.deepEqual(apply[1], ['write /host.md', 'write /state.json'])
+      assert.equal(branchFiles['/state.json'], score(4))
+      assert.equal(branchFiles['/sandbox.md'], 'sandbox\n')
+    })
+  })
+
+  it('fails loud and keeps the mount when the Sandbox overlay cannot be committed', async () => {
+    await withTemp(async root => {
+      const source = join(root, 'source')
+      await writeWorkspace(source)
+      const unmounts: boolean[] = []
+      let refuse = false
+      const client: any = {
+        branch: { async fork() {} },
+        workspace: {
+          async mount() { return { sandbox: 'r24c', path: '/workspaces/r24c' } },
+          async commit() {
+            if (refuse) throw Object.assign(new Error('head moved since mount'), { code: 'headMovedSinceMount' })
+          },
+          async unmount(_handle: any, discard: boolean) { unmounts.push(discard) },
+          async status() { return { overlay: { entries: 1 }, headMovedSinceMount: true } },
+        },
+        fs: { async list() { return [] }, async read() { return { text: '' } }, async apply() {} },
+        async close() {},
+      }
+      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'r24c', retryBaseDelayMs: 1 })
+      const state = await backend.baseline(source, 'initial')
+      unmounts.length = 0
+      refuse = true
+      await assert.rejects(backend.reconcile(state), /head moved since mount/)
+      assert.deepEqual(unmounts, [], 'the uncommitted overlay is not discarded')
     })
   })
 
@@ -2046,8 +2119,9 @@ describe('R24: staged Sandbox mounts stay bidirectional', () => {
         restoreCompletedState: (...args: any[]) => base.restoreCompletedState(args[0], args[1]),
         async reconcile(state: any) {
           reconciles.push(state.path)
-          await base.reconcile(state)
+          return base.reconcile(state)
         },
+        estimateForkBytes: (...args: any[]) => base.estimateForkBytes(args[0], args[1]),
         close: () => base.close(),
       }
       const worker = async (spec: any) => {

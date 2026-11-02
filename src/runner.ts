@@ -16,7 +16,6 @@ import {
   digestFile,
   freeBytes,
   inventory,
-  inventoryBytes,
   jsonDigest,
   publicRow,
   writeJsonAtomic,
@@ -698,12 +697,9 @@ export class Runner {
     }
   }
 
-  async checkDisk(workspace: string, count: number): Promise<void> {
-    // Both backends materialize a host copy per branch (the snapshot backend
-    // duplicates the tree, the LayerFS backend stages Sandbox mounts), so the
-    // free-space check applies to both.
-    const files = await inventory(workspace)
-    const required = (await inventoryBytes(workspace, files)) * count
+  async checkDisk(parent: WorkspaceState, count: number): Promise<void> {
+    const required = await this.manager.estimateForkBytes(parent, count)
+    if (required === 0) return
     const free = await freeBytes(this.output)
     if (required >= free) {
       throw new Error('Insufficient space for this cohort; existing research preserved')
@@ -878,7 +874,7 @@ export class Runner {
         const phaseStart = this.now()
         await writeJsonAtomic(join(this.output, 'DASHBOARD.json'), this.dashboard())
         const count = phase === 'explore' ? options.branches : 1
-        await this.checkDisk(leader.workspace, count)
+        await this.checkDisk(leader._state as WorkspaceState, count)
         const views = this.views(count)
         let candidates: TrajectoryRow[]
         if (options.shareContext) {
@@ -1349,8 +1345,9 @@ export class Runner {
         await removeWorkerFiles(checkout, workerFiles)
       }
       // A Sandbox-internal worker edits `/workspaces/<n>`, not the host
-      // staging copy: fold its committed overlay back before evaluating.
-      if (typeof this.manager.reconcile === 'function') await this.manager.reconcile(state)
+      // staging copy: fold its overlay back, or refuse a branch whose two
+      // views both changed.
+      const reconciliation = await this.manager.reconcile(state)
       this.checkCancelled()
       const assistantText = outputText(result?.output)
       providerEvents.push({
@@ -1391,7 +1388,13 @@ export class Runner {
         time: Date.now(),
         last_output: assistantText,
         ...(handoff ? { handoff_path: join(folder, 'HANDOFF.md') } : {}),
-        evaluation: completed
+        evaluation: reconciliation.outcome === 'conflict'
+          ? {
+            valid: false,
+            reason: 'workspace conflict: host and sandbox both modified'
+              + (reconciliation.conflicts.length > 0 ? ': ' + reconciliation.conflicts.join(', ') : ''),
+          }
+          : completed
           ? await this.evaluator.evaluate(checkout, folder, {
             ...(cooperation ? { deadline: cooperation.deadline } : {}),
             signal: this.signalForWork(),

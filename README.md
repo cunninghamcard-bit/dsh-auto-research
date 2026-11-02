@@ -175,6 +175,12 @@ The provider resolves `DSH_LAYERFS_PROJECT`, `DSH_LAYERFS_SDK`, `DSH_LAYERFS_OPE
 
 Real LayerFS mounts return a Sandbox-internal path such as `/workspaces/1`. When that path is not host-accessible, the backend stages a host copy at `<run>/<branch>/workspace`, evaluates and runs workers there, and on commit publishes added/modified/deleted files with `client.fs.apply` (or `fs.write`/`fs.rm`) before `workspace.commit`. Workers also receive `DSH_AUTO_RESEARCH_BRANCH` and `DSH_AUTO_RESEARCH_SANDBOX_PATH`.
 
+The host staging copy is the only writer; the Sandbox mount is for execution. After a worker returns, `reconcile` commits any dirty Sandbox overlay into the branch history, then compares both views with the inventory the staging copy started from: Sandbox-only changes are folded into the host copy, host-only changes are published by the commit, and a branch whose two views both changed is invalid (`workspace conflict: host and sandbox both modified: <paths>`). It is not evaluated and is committed as `rejected`, so both sides stay in the branch history.
+
+Before a cohort, the backend estimates the bytes its forks add: full host copies for the snapshot backend and staged LayerFS mounts, nothing for host-accessible LayerFS mounts (copy-on-write). The cohort is refused only when that estimate does not fit.
+
+Symlinks are recorded in manifests as `symlink:<link text>` and never followed. Snapshot copies recreate them, completed-state checkpoints store them under `links`, and a staged LayerFS branch keeps them on the host copy only (the SDK cannot write links), listed in `skippedFiles`.
+
 ## Safety
 
 - The user's original checkout is never evaluated or mutated; branches are copies or CoW mounts.
