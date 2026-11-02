@@ -1147,7 +1147,7 @@ describe('R10: transient LayerFS startup failures and stale mounts', () => {
         workspace: {
           async commit(handle: any, message: any) {
             actions.push(['commit', message])
-            throw Object.assign(new Error('branch head moved since mount'), { code: 'headMovedSinceMount' })
+            throw Object.assign(new Error('the head moved and 1 file(s) conflict with this Workspace; markers are written and nothing was committed'), { code: 'Conflict' })
           },
         },
       })
@@ -1171,7 +1171,7 @@ describe('R10: transient LayerFS startup failures and stale mounts', () => {
         workspace: {
           async unmount(handle: any, discard: any) {
             actions.push(['unmount', discard])
-            if (!discard) throw Object.assign(new Error('head moved since mount'), { code: 'headMovedSinceMount' })
+            if (!discard) throw Object.assign(new Error('1 uncommitted change(s); unmount with discard to drop them'), { code: 'Dirty' })
           },
         },
       })
@@ -2033,7 +2033,7 @@ describe('R24: staged Sandbox mounts stay bidirectional', () => {
         workspace: {
           async mount() { return { sandbox: 'r24c', path: '/workspaces/r24c' } },
           async commit() {
-            if (refuse) throw Object.assign(new Error('head moved since mount'), { code: 'headMovedSinceMount' })
+            if (refuse) throw Object.assign(new Error('1 file(s) still contain conflict markers; nothing committed'), { code: 'Conflict' })
           },
           async unmount(_handle: any, discard: boolean) { unmounts.push(discard) },
           async status() { return { overlay: { entries: 1 }, headMovedSinceMount: true } },
@@ -2045,7 +2045,7 @@ describe('R24: staged Sandbox mounts stay bidirectional', () => {
       const state = await backend.baseline(source, 'initial')
       unmounts.length = 0
       refuse = true
-      await assert.rejects(backend.reconcile(state), /head moved since mount/)
+      await assert.rejects(backend.reconcile(state), /conflict markers/)
       assert.deepEqual(unmounts, [], 'the uncommitted overlay is not discarded')
     })
   })

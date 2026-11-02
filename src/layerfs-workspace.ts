@@ -484,19 +484,14 @@ function codedError(message: string, code: string): Error {
 }
 
 /**
- * Whether `fs.read` refused a file because it is not UTF-8 text.
+ * Whether `fs.read` refused a file because it is not UTF-8 text (`Binary`).
  *
  * A binary adopted file has no text representation to stage, but it is not a
  * lost file: `workspace.exec` can copy the exact bytes, or the file is reported
  * as skipped and never removed from the branch.
  */
 export function isSkippableAdoptedFile(error: unknown): boolean {
-  const code = refusalCode(error)
-  if (code === 'Binary' || code === 'BinaryFile' || code === 'NotText') return true
-  const message = error === null || typeof error !== 'object'
-    ? typeof error === 'string' ? error : ''
-    : String((error as { message?: unknown }).message ?? '')
-  return /\bbinary\b|not (?:utf-?8|text)/i.test(message)
+  return refusalCode(error) === 'Binary'
 }
 
 /** Quote a path for a POSIX shell command. */
@@ -505,50 +500,29 @@ function shellQuote(value: string): string {
 }
 
 /**
- * Whether a commit/unmount refusal only means the mount is behind its branch.
+ * Whether a commit/unmount refusal of a staged mount only means its overlay
+ * differs from the branch it was published to.
  *
- * `fs.apply` creates a commit on the branch, so right after publishing the
- * mount handle is one commit behind (`headMovedSinceMount`) or its overlay
- * necessarily differs (`Dirty`); the bytes are already safe on the branch.
+ * `fs.apply` writes the branch directly, so the mount's own overlay then
+ * disagrees with the moved head: `workspace.commit` refuses with `Conflict`
+ * and `workspace.unmount` with `Dirty`. The bytes are already on the branch.
  */
 export function isStaleMountRefusal(error: unknown): boolean {
   const code = refusalCode(error)
-  if (['headMovedSinceMount', 'HeadMovedSinceMount', 'UpToDate', 'AlreadyUpToDate', 'Dirty', 'StaleMount'].includes(code)) {
-    return true
-  }
-  const message = error === null || typeof error !== 'object'
-    ? typeof error === 'string' ? error : ''
-    : String((error as { message?: unknown }).message ?? '')
-  return /head moved since mount|already up[- ]to[- ]date|up[- ]to[- ]date|dirty|stale mount/i.test(message)
+  return code === 'Conflict' || code === 'Dirty'
 }
 
 /**
- * Whether a refusal means the LayerFS project does not exist yet or its `main`
- * branch carries no usable state, so `project.init(source)` can recover.
- *
- * The live and simulated bindings use the same codes (`NoSuchProject`,
- * `NoSuchBranch`, `NoSuchCommit`); message hints cover SDK versions that wrap
- * the refusal. Codes that mean "the project is there but unusable" are never
- * treated as missing.
+ * Whether a refusal means the LayerFS project or its `main` branch does not
+ * exist yet, so `project.init(source)` can recover.
  */
 export function isMissingProjectOrMain(error: unknown): boolean {
-  const code = refusalCode(error)
-  if (['NoSuchProject', 'NoSuchBranch', 'NoSuchCommit', 'NoSuchLayer'].includes(code)) return true
-  if (['Exists', 'ReadOnly', 'Conflict', 'Busy', 'InvalidInput', 'NoSuchPath', 'Unsupported'].includes(code)) return false
-  const message = error === null || typeof error !== 'object'
-    ? ''
-    : String((error as { message?: unknown }).message ?? '')
-  return /project .{0,200}does not exist|\bno (simulated )?(layerfs )?project\b|main (branch )?(does not exist|has no|is empty)|NoSuchProject|NoSuchBranch/i.test(message)
+  return ['NoSuchProject', 'NoSuchBranch', 'NoSuchCommit'].includes(refusalCode(error))
 }
 
 /** Whether `project.init` refused because the project already exists. */
 function isExistingProject(error: unknown): boolean {
-  const code = refusalCode(error)
-  if (code === 'Exists') return true
-  const message = error === null || typeof error !== 'object'
-    ? ''
-    : String((error as { message?: unknown }).message ?? '')
-  return /\bexists\b|already initialized/i.test(message)
+  return refusalCode(error) === 'Exists'
 }
 
 /**
@@ -592,7 +566,6 @@ export function isTransientLayerfsError(error: unknown): boolean {
     || candidate.code === 'EPIPE') return true
   const message = String(candidate.message ?? '')
   if (TRANSIENT_MESSAGE.test(message)) return true
-  if (/busy/i.test(message)) return true
   // A wrapped cause (undici/`node:net` errors) carries the real reason.
   const cause = candidate.cause
   if (cause && cause !== error) return isTransientLayerfsError(cause)
@@ -896,7 +869,7 @@ export class LayerFSBackend implements WorkspaceBackend {
         // by construction). That refusal is not a lost write.
         if (!published || !isStaleMountRefusal(error)) throw error
         this.logger?.info?.(
-          `[auto-research] branch ${branch} already holds the published bytes; skipping the stale mount commit (${refusalCode(error) || 'headMovedSinceMount'})`,
+          `[auto-research] branch ${branch} already holds the published bytes; skipping the stale mount commit (${refusalCode(error)})`,
         )
       }
     }
@@ -1328,24 +1301,22 @@ export class LayerFSBackend implements WorkspaceBackend {
         this.logger?.warn?.(`[auto-research] workspace.status unavailable for ${state.id}: ${(error as Error).message}`)
       }
       if (current !== null && typeof current === 'object') {
+        // `sandbox.status`: `overlay` is null when the mount has no local state.
         const record = current as {
-          overlay?: { entries?: unknown; inodes?: unknown; pendingMerge?: unknown }
-          dirty?: { entries?: unknown; inodes?: unknown; pendingMerge?: unknown }
-          headMovedSinceMount?: unknown
-          branchHead?: unknown
-          base?: unknown
+          overlay: { entries: number; inodes: number; pendingMerge: boolean } | null
+          headMovedSinceMount: boolean | null
+          branchHead: string | null
+          base: string | null
         }
-        const dirtyEntries = Number(record.overlay?.entries ?? record.dirty?.entries ?? 0)
-        const dirtyInodes = Number(record.overlay?.inodes ?? record.dirty?.inodes ?? 0)
-        const pendingMerge = record.overlay?.pendingMerge === true || record.dirty?.pendingMerge === true
-        const dirtyOverlay = dirtyEntries > 0 || dirtyInodes > 0 || pendingMerge
+        const overlay = record.overlay
+        const dirtyOverlay = overlay !== null && (overlay.entries > 0 || overlay.inodes > 0 || overlay.pendingMerge)
         const initialBase = (handle as { base?: unknown } | null)?.base
         const headKnownUnchanged = !dirtyOverlay
           && !record.headMovedSinceMount
           && typeof initialBase === 'string'
           && typeof record.branchHead === 'string'
           && record.branchHead === initialBase
-          && (record.base === undefined || record.base === initialBase)
+          && record.base === initialBase
         if (headKnownUnchanged) return null
         if (dirtyOverlay && typeof this.client.workspace?.commit === 'function') {
           // A refused commit throws: the overlay is not in the branch history

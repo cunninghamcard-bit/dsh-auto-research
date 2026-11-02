@@ -98,7 +98,7 @@ export declare class SnapshotBackend implements WorkspaceBackend {
 /** Sanitize a value into a Docker/LayerFS-safe name fragment. */
 export declare function branchSafe(value: unknown, max?: number): string;
 /**
- * Whether `fs.read` refused a file because it is not UTF-8 text.
+ * Whether `fs.read` refused a file because it is not UTF-8 text (`Binary`).
  *
  * A binary adopted file has no text representation to stage, but it is not a
  * lost file: `workspace.exec` can copy the exact bytes, or the file is reported
@@ -106,21 +106,17 @@ export declare function branchSafe(value: unknown, max?: number): string;
  */
 export declare function isSkippableAdoptedFile(error: unknown): boolean;
 /**
- * Whether a commit/unmount refusal only means the mount is behind its branch.
+ * Whether a commit/unmount refusal of a staged mount only means its overlay
+ * differs from the branch it was published to.
  *
- * `fs.apply` creates a commit on the branch, so right after publishing the
- * mount handle is one commit behind (`headMovedSinceMount`) or its overlay
- * necessarily differs (`Dirty`); the bytes are already safe on the branch.
+ * `fs.apply` writes the branch directly, so the mount's own overlay then
+ * disagrees with the moved head: `workspace.commit` refuses with `Conflict`
+ * and `workspace.unmount` with `Dirty`. The bytes are already on the branch.
  */
 export declare function isStaleMountRefusal(error: unknown): boolean;
 /**
- * Whether a refusal means the LayerFS project does not exist yet or its `main`
- * branch carries no usable state, so `project.init(source)` can recover.
- *
- * The live and simulated bindings use the same codes (`NoSuchProject`,
- * `NoSuchBranch`, `NoSuchCommit`); message hints cover SDK versions that wrap
- * the refusal. Codes that mean "the project is there but unusable" are never
- * treated as missing.
+ * Whether a refusal means the LayerFS project or its `main` branch does not
+ * exist yet, so `project.init(source)` can recover.
  */
 export declare function isMissingProjectOrMain(error: unknown): boolean;
 /**
