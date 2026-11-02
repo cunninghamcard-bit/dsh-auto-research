@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmod, lstat, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   LayerFSBackend,
@@ -358,13 +358,17 @@ describe('selectPlanWorkspace', () => {
     })
   })
 
-  it('rejects absolute paths, traversal, runtime directories and symlinks', async () => {
+  it('rejects absolute paths, traversal, runtime directories and links that leave the checkout', async () => {
     await withTemp(async root => {
-      await mkdir(join(root, 'real'), { recursive: true })
-      await symlink(join(root, 'real'), join(root, 'link'))
-      for (const workspace of ['/absolute', '../up', '.auto-research-methods', 'a/../b', 'link', '.']) {
-        await assert.rejects(selectPlanWorkspace(root, { workspace }), /Plan workspace|symlink/)
+      const checkout = join(root, 'checkout')
+      await mkdir(join(checkout, 'real'), { recursive: true })
+      await mkdir(join(root, 'outside'), { recursive: true })
+      await symlink(join(checkout, 'real'), join(checkout, 'link'))
+      await symlink(join(root, 'outside'), join(checkout, 'away'))
+      for (const workspace of ['/absolute', '../up', '.auto-research-methods', 'a/../b', 'away', '.']) {
+        await assert.rejects(selectPlanWorkspace(checkout, { workspace }), /Plan workspace/)
       }
+      assert.equal(await selectPlanWorkspace(checkout, { workspace: 'link' }), await realpath(join(checkout, 'real')))
     })
   })
 })

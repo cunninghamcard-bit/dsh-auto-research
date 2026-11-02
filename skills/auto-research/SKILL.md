@@ -49,7 +49,7 @@ The values are schema examples, not defaults. Choose each from task evidence.
 - `meaningful_gain`: the smallest primary-score gain that counts as progress. It drives the RSI-top stall clock; it does not gate leader selection.
 - With `rsiTop`: `stall_seconds`, `metric_subset` (1..number of metrics), `portfolio_size` (≥ 2) and a positive `meaningful_gain` are required.
 - `options` overrides the installed configuration for this batch: `rounds`, `branches` (≥ 2), `explorationMinutes`, `exploitationMinutes`, `rsiTop`, `forkAndFlush`, `shareContext`, `sharingIntervalMinutes`, `workerProvider`, `workerModel`.
-- `workspace`: for a large checkout, a relative subdirectory holding a compact, self-contained seed (source closure, data, evaluator inputs). It must not be a symlink, contain `..`, or sit inside `.auto-research-methods`.
+- `workspace`: for a large checkout, a relative subdirectory holding a compact, self-contained seed (source closure, data, evaluator inputs). It must resolve to a directory inside the checkout, must not contain `..`, and must not sit inside `.auto-research-methods`.
 
 The plan is frozen for the batch. Revise metrics or the evaluator between batches, explicitly, never mid-batch.
 

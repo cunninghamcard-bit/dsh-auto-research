@@ -92,13 +92,13 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
 | `executor` | `auto` | 运行冻结评估器的已注册执行后端（`local`、`colab` 或第三方）；`auto` 按优先级取第一个可用的。计划可在 `options.executor` 覆盖 |
 | `workspaceBackend` | `auto` | 已注册的后端名称（`layerfs`、`snapshot` 或第三方后端）；`auto` 按优先级取第一个可用的。计划可在 `options.workspaceBackend` 覆盖 |
 | `layerfs` | 自动 | 显式 LayerFS 设置；`false` 使 `layerfs` 后端拒绝本批次 |
-| `workerEnv` | `{}` | 展示给 worker 的非机密环境事实 |
+| `workerEnv` | `{}` | 按配置原样传给 worker 的环境变量（`DSH_*` 名同时经 `ctx.shellEnv` 提供）；`CONFIG.json` 省略疑似机密的键 |
 
 计划可以包含 `options` 对象，按批次覆盖上述值。科学取值由模型决定；插件只拒绝不可能的组合（例如指标子集大于已声明指标集）。
 
 ## 计划
 
-协调者把计划写在候选源码之外。provider 也接受委派提示词中的 fenced JSON 块或 `PLAN_JSON:` 行。
+协调者把计划写在候选源码之外的 `planPath`（默认 `.auto-research-methods/plan.json`），或由 profile 在配置中设置 `plan`。只有这两个来源。单批覆盖写在 `plan.options` 下，字段名与配置相同（`workerProvider`、`workerModel`、`branches` 等）。
 
 ```json
 {
@@ -124,7 +124,7 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
 - `selection_metrics` 必须同时声明在 `metrics` 中且为有限值；只在主分数并列时用于排序。
 - 可选指标可以缺失；缺失的观测不会被当成 0。
 - 启用 `rsiTop` 时必须给出 `stall_seconds`、`metric_subset` 和 `portfolio_size`。
-- `workspace` 可以指定 checkout 内的紧凑种子子目录；必须是相对路径、无符号链接，且不在 `.auto-research-methods` 内。
+- `workspace` 可以指定 checkout 内的紧凑种子子目录；必须是相对路径，解析后严格位于 checkout 内，且不在 `.auto-research-methods` 内。
 
 ## 评估器契约
 
@@ -207,7 +207,7 @@ provider 从 `config.layerfs`、`process.env` 与会话的 `ctx.shellEnv` contri
 - 用户原始 checkout 永远不会被评估或修改；分支是拷贝或 CoW 挂载。
 - 共享检查点拒绝符号链接、路径穿越、点文件（`.method-evaluation` 除外）、私有凭据文件名以及疑似凭据内容。
 - worker skill 禁止递归派生与发布/合并；provider 也会拒绝来自 worker checkout 或存活 worker 子会话的 `subagent_auto_research` 调用。
-- 序列化前会清理配置；疑似机密的环境变量键不会写入。
+- `CONFIG.json` 省略 `workerEnv` 与 `layerfs` 中疑似机密的键；worker 仍按配置收到完整的 `workerEnv`。
 - 不会自动合并、重置、覆盖、删除或发布。
 - 批次边界不能证明用户目标已完成，也不能证明存在基准提升。
 

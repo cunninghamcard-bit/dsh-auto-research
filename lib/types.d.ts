@@ -88,20 +88,8 @@ export interface ResearchPlanInput {
     meaningful_gain?: unknown;
     workspace?: unknown;
     evaluator_interpreter?: unknown;
-    options?: unknown;
-    branches?: unknown;
-    parallelism?: unknown;
-    rounds?: unknown;
-    workerProvider?: unknown;
-    worker_provider?: unknown;
-    workerLlmProvider?: unknown;
-    worker_llm_provider?: unknown;
-    workerModel?: unknown;
-    worker_model?: unknown;
-    workerReasoningEffort?: unknown;
-    worker_reasoning_effort?: unknown;
-    workerAgentOptions?: unknown;
-    worker_agent_options?: unknown;
+    /** Per-batch overrides of the plugin configuration. */
+    options?: PlanOptions;
     [key: string]: unknown;
 }
 /** Validated, normalized plan used by the runner. */

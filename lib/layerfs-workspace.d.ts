@@ -413,7 +413,7 @@ export declare class LayerFSWorkspaceFactory implements WorkspaceBackendFactory 
 }
 /**
  * Resolve the optional compact research seed named by `plan.workspace`.
- * It must be a regular, symlink-free subdirectory inside `root`.
+ * It must resolve to a directory strictly inside `root`.
  */
 export declare function selectPlanWorkspace(root: string, plan: {
     workspace?: unknown;

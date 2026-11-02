@@ -110,15 +110,9 @@ export function normalizeOptions(
   const overrides: PlanOptions = plan.options && typeof plan.options === 'object'
     ? plan.options as PlanOptions
     : {}
-  const topRounds = typeof plan.rounds === 'number' ? plan.rounds : undefined
-  const topBranches = typeof plan.branches === 'number'
-    ? plan.branches
-    : typeof plan.parallelism === 'number'
-      ? plan.parallelism
-      : undefined
   return {
-    rounds: overrides.rounds ?? topRounds ?? config.rounds ?? 1,
-    branches: overrides.branches ?? overrides.parallelism ?? topBranches ?? config.branches ?? config.parallelism ?? 4,
+    rounds: overrides.rounds ?? config.rounds ?? 1,
+    branches: overrides.branches ?? overrides.parallelism ?? config.branches ?? config.parallelism ?? 4,
     explorationMinutes: overrides.explorationMinutes ?? config.explorationMinutes ?? 30,
     exploitationMinutes: overrides.exploitationMinutes ?? config.exploitationMinutes ?? 30,
     rsiTop: overrides.rsiTop ?? config.rsiTop ?? false,
@@ -134,59 +128,35 @@ function nonEmptyTrimmed(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
 }
 
-/** Merge config-level, plan-level, and request-level child LLM selection options. */
+/**
+ * Merge the child LLM selection: the request's `agentOptions`, then
+ * `plan.options`, then the plugin configuration. Within a layer,
+ * `workerAgentOptions` wins over the single `worker*` fields.
+ */
 export function resolveWorkerAgentOptions(
   config: Config = {},
   plan: ResearchPlanInput = {},
   override?: WorkerAgentOptions | null,
 ): WorkerAgentOptions | null {
-  const planOptions = plan.options && typeof plan.options === 'object'
-    ? plan.options as Record<string, unknown>
-    : {}
-  const cfgOpts = config.workerAgentOptions && typeof config.workerAgentOptions === 'object'
-    ? config.workerAgentOptions
-    : {}
-  const planOpts = (plan.worker_agent_options && typeof plan.worker_agent_options === 'object'
-    ? plan.worker_agent_options
-    : plan.workerAgentOptions && typeof plan.workerAgentOptions === 'object'
-      ? plan.workerAgentOptions
-      : planOptions.workerAgentOptions && typeof planOptions.workerAgentOptions === 'object'
-        ? planOptions.workerAgentOptions
-        : {}) as Record<string, unknown>
-  const reqOpts = override && typeof override === 'object' ? override : {}
-
-  const provider = nonEmptyTrimmed(reqOpts.provider)
-    ?? nonEmptyTrimmed(planOpts.provider)
-    ?? nonEmptyTrimmed(plan.worker_llm_provider)
-    ?? nonEmptyTrimmed(plan.workerLlmProvider)
-    ?? nonEmptyTrimmed(planOptions.workerLlmProvider)
-    ?? nonEmptyTrimmed(cfgOpts.provider)
-    ?? nonEmptyTrimmed(config.workerLlmProvider)
-
-  const model = nonEmptyTrimmed(reqOpts.model)
-    ?? nonEmptyTrimmed(planOpts.model)
-    ?? nonEmptyTrimmed(plan.worker_model)
-    ?? nonEmptyTrimmed(plan.workerModel)
-    ?? nonEmptyTrimmed(planOptions.workerModel)
-    ?? nonEmptyTrimmed(cfgOpts.model)
-    ?? nonEmptyTrimmed(config.workerModel)
-
-  const reasoningEffort = nonEmptyTrimmed(reqOpts.reasoningEffort)
-    ?? nonEmptyTrimmed(planOpts.reasoningEffort)
-    ?? nonEmptyTrimmed(plan.worker_reasoning_effort)
-    ?? nonEmptyTrimmed(plan.workerReasoningEffort)
-    ?? nonEmptyTrimmed(planOptions.workerReasoningEffort)
-    ?? nonEmptyTrimmed(cfgOpts.reasoningEffort)
-    ?? nonEmptyTrimmed(config.workerReasoningEffort)
-
-  const maxTokens = typeof reqOpts.maxTokens === 'number' && Number.isFinite(reqOpts.maxTokens) && reqOpts.maxTokens > 0
-    ? reqOpts.maxTokens
-    : typeof planOpts.maxTokens === 'number' && Number.isFinite(planOpts.maxTokens) && planOpts.maxTokens > 0
-      ? planOpts.maxTokens
-      : typeof cfgOpts.maxTokens === 'number' && Number.isFinite(cfgOpts.maxTokens) && cfgOpts.maxTokens > 0
-        ? cfgOpts.maxTokens
-        : undefined
-
+  const options = (plan.options ?? {}) as PlanOptions
+  const fields = (source: Config | PlanOptions): Record<string, unknown> => ({
+    provider: source.workerLlmProvider,
+    model: source.workerModel,
+    reasoningEffort: source.workerReasoningEffort,
+  })
+  const layers: Array<Record<string, unknown>> = [
+    override ?? {},
+    options.workerAgentOptions ?? {},
+    fields(options),
+    config.workerAgentOptions ?? {},
+    fields(config),
+  ]
+  const pick = (key: 'provider' | 'model' | 'reasoningEffort'): string | undefined =>
+    layers.map(layer => nonEmptyTrimmed(layer[key])).find(value => value !== undefined)
+  const provider = pick('provider')
+  const model = pick('model')
+  const reasoningEffort = pick('reasoningEffort')
+  const maxTokens = layers.map(layer => layer.maxTokens).find(finitePositive)
   const merged: WorkerAgentOptions = {
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
@@ -328,10 +298,8 @@ function mergeEnv(
   layerfsEnv: Record<string, unknown> = {},
 ): Record<string, string> {
   const result: Record<string, string> = {}
-  const secret = /(token|key|secret|password|credential)/i
   for (const [key, value] of Object.entries({ ...layerfsEnv, ...configured })) {
     if (value === undefined || value === null) continue
-    if (secret.test(key)) continue
     result[key] = String(value)
   }
   return result

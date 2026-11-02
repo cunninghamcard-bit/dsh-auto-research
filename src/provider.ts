@@ -37,6 +37,7 @@ import type {
   ContentBlock,
   LayerFSBinding,
   LayerFSSettings,
+  PlanOptions,
   PluginContext,
   ProviderContext,
   ResearchPlanInput,
@@ -147,59 +148,10 @@ function requireNonEmptyString(value: unknown, name: string): void {
   }
 }
 
-/** Extract the standalone user text from a `ContentBlock[]` or string. */
-export function extractPromptText(prompt: unknown): string {
-  if (typeof prompt === 'string') return prompt
-  if (!Array.isArray(prompt)) return ''
-  return (prompt as unknown[])
-    .map(block => {
-      if (typeof block === 'string') return block
-      if (!block || typeof block !== 'object') return ''
-      const record = block as Record<string, unknown>
-      if (record.type === 'text' && typeof record.text === 'string') return record.text
-      if (typeof record.text === 'string') return record.text
-      return ''
-    })
-    .filter(Boolean)
-    .join('\n')
-}
-
 function looksLikePlan(value: unknown): value is ResearchPlanInput {
   return Boolean(value) && typeof value === 'object'
     && typeof (value as ResearchPlanInput).objective === 'string'
     && typeof (value as ResearchPlanInput).evaluator === 'string'
-}
-
-/**
- * Find a plan object embedded in a delegation prompt: a fenced JSON block, a
- * `PLAN_JSON:` line, or a prompt that is itself the JSON object.
- */
-export function parsePlanFromPrompt(text: string): ResearchPlanInput | null {
-  if (typeof text !== 'string' || text.trim() === '') return null
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/gi
-  for (const match of text.matchAll(fenced)) {
-    try {
-      const value = JSON.parse(match[1] as string)
-      if (looksLikePlan(value)) return value
-    } catch {
-      // Try the next block.
-    }
-  }
-  const marker = /PLAN_JSON:\s*(\{[\s\S]*\})\s*$/m.exec(text)
-  if (marker) {
-    try {
-      const value = JSON.parse(marker[1] as string)
-      if (looksLikePlan(value)) return value
-    } catch {
-      // Fall through to the whole-prompt attempt.
-    }
-  }
-  try {
-    const value = JSON.parse(text.trim())
-    return looksLikePlan(value) ? value : null
-  } catch {
-    return null
-  }
 }
 
 async function readJson(path: string): Promise<unknown> {
@@ -215,40 +167,25 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-/**
- * Resolve the plan from config, the plan file, or the delegation prompt.
- */
+/** The plan from `config.plan`, else the file at `config.planPath`. */
 export async function resolvePlan({
   cwd,
   config,
-  promptText,
 }: {
   cwd: string
   config: ResolvedConfig
-  promptText: string
 }): Promise<{ plan: ResearchPlanInput; source: string }> {
-  if (config.plan && typeof config.plan === 'object') {
-    return { plan: { ...config.plan }, source: 'config' }
+  if (config.plan) return { plan: { ...config.plan }, source: 'config' }
+  const planPath = resolve(cwd, config.planPath)
+  let value: unknown
+  try {
+    value = await readJson(planPath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`No research plan: write ${planPath}`)
+    throw error
   }
-  const planPath = isAbsolute(config.planPath) ? config.planPath : resolve(cwd, config.planPath)
-  if (await pathExists(planPath)) {
-    const value = await readJson(planPath)
-    if (!looksLikePlan(value)) throw new Error(`Research plan is incomplete: ${planPath}`)
-    return { plan: value, source: planPath }
-  }
-  if (config.planPath === '.auto-research-methods/plan.json') {
-    const fallbackPath = resolve(cwd, 'auto-research.json')
-    if (await pathExists(fallbackPath)) {
-      const value = await readJson(fallbackPath)
-      if (!looksLikePlan(value)) throw new Error(`Research plan is incomplete: ${fallbackPath}`)
-      return { plan: value, source: fallbackPath }
-    }
-  }
-  const embedded = parsePlanFromPrompt(promptText)
-  if (embedded) return { plan: embedded, source: 'prompt' }
-  throw new Error(
-    `No research plan: write ${config.planPath} (or include a PLAN_JSON object in the delegation prompt)`,
-  )
+  if (!looksLikePlan(value)) throw new Error(`Research plan is incomplete: ${planPath}`)
+  return { plan: value, source: planPath }
 }
 
 function truncateDiagnostic(text: unknown): string {
@@ -325,7 +262,6 @@ export interface RunnerLock {
 }
 
 function processAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false
   try {
     process.kill(pid, 0)
     return true
@@ -335,154 +271,43 @@ function processAlive(pid: number): boolean {
 }
 
 /**
- * Refuse a runtime root that is a symlink escaping the workspace.
- *
- * `.auto-research-methods` holds every branch artifact and the runner lock, so
- * a planted symlink would redirect those writes outside the assigned
- * checkout. A missing runtime root is fine (it is created later).
- */
-export async function assertRuntimeRootContained(
-  workspaceRoot: string,
-  runtimeRoot: string,
-): Promise<void> {
-  let stats: Awaited<ReturnType<typeof fsp.lstat>>
-  try {
-    stats = await fsp.lstat(runtimeRoot)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
-    throw error
-  }
-  if (!stats.isSymbolicLink()) {
-    if (!stats.isDirectory()) {
-      throw new Error(`Auto-research runtime root is not a directory: ${runtimeRoot}`)
-    }
-    return
-  }
-  let realRoot: string
-  let realRuntime: string
-  try {
-    [realRoot, realRuntime] = await Promise.all([fsp.realpath(workspaceRoot), fsp.realpath(runtimeRoot)])
-  } catch (error) {
-    throw new Error(
-      `Auto-research runtime root is an unresolvable symlink: ${runtimeRoot} (${(error as Error).message})`,
-    )
-  }
-  if (!isContained(realRoot, realRuntime)) {
-    throw new Error(
-      `Auto-research runtime root is a symlink escaping the workspace: ${runtimeRoot} -> ${realRuntime}`,
-    )
-  }
-}
-
-/** A lock file that stayed unparsable this recently is still being written. */
-const LOCK_WRITE_GRACE_MS = 2000
-
-/**
- * Acquire `<runtimeRoot>/runner.lock` so two `subagent_auto_research`
- * invocations on one checkout fail loud instead of racing on `LATEST.json`.
- *
- * The payload is written to a unique sibling first and then hard-linked into
- * place, so a lock file is never observable empty or half-written. A stale
- * lock is reclaimed only when its owning PID is gone; an unparsable lock that
- * is younger than {@link LOCK_WRITE_GRACE_MS} is treated as live rather than
- * unlinked, which closes the remaining creation window.
+ * Acquire `<runtimeRoot>/runner.lock` so two batches on one checkout fail
+ * loud instead of racing on `LATEST.json`. The lock is created with `wx`; an
+ * existing lock whose pid is gone is removed and the create retried once.
  */
 export async function acquireRunnerLock(
   runtimeRoot: string,
   runId: string,
-  {
-    cwd = runtimeRoot,
-    pid = process.pid,
-    alive = processAlive,
-    now = Date.now,
-    writeGraceMs = LOCK_WRITE_GRACE_MS,
-  }: {
+  { cwd = runtimeRoot, pid = process.pid, alive = processAlive }: {
     cwd?: string
     pid?: number
     alive?: (pid: number) => boolean
-    now?: () => number
-    writeGraceMs?: number
   } = {},
 ): Promise<RunnerLock> {
   await fsp.mkdir(runtimeRoot, { recursive: true })
   const path = join(runtimeRoot, 'runner.lock')
-  const info = { pid, runId, cwd, started_at: new Date(now()).toISOString() }
-  const payload = JSON.stringify(info, null, 2) + '\n'
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const temporary = join(runtimeRoot, `.runner.lock.${pid}.${randomUUID()}`)
+  const info = { pid, runId, cwd, started_at: new Date().toISOString() }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      await fsp.writeFile(temporary, payload, { mode: 0o600 })
-      // link() is atomic and refuses an existing target, so the visible lock is
-      // always the complete payload.
-      await fsp.link(temporary, path)
-      let released = false
-      return {
-        path,
-        info,
-        release: async () => {
-          if (released) return
-          released = true
-          try {
-            const saved = JSON.parse(await fsp.readFile(path, 'utf8')) as { pid?: unknown; runId?: unknown }
-            if (saved.pid === pid && saved.runId === runId) await fsp.unlink(path)
-          } catch {
-            // Already unlocked or replaced by a newer owner.
-          }
-        },
-      }
+      await fsp.writeFile(path, JSON.stringify(info, null, 2) + '\n', { flag: 'wx', mode: 0o600 })
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-      let saved: { pid?: unknown; runId?: unknown; started_at?: unknown } | null = null
-      let readable = true
-      try {
-        saved = JSON.parse(await fsp.readFile(path, 'utf8')) as { pid?: unknown; runId?: unknown }
-      } catch {
-        saved = null
-        readable = false
+      const owner = Number.parseInt(/"pid":\s*(\d+)/.exec(await fsp.readFile(path, 'utf8'))?.[1] ?? '', 10)
+      if (Number.isNaN(owner) || alive(owner)) {
+        throw new Error(`Another auto-research batch is already running for this checkout: ${path} (pid ${Number.isNaN(owner) ? 'unknown' : owner}; delete the file if no batch is running)`)
       }
-      const owner = typeof saved?.pid === 'number' ? saved.pid : null
-      if (owner !== null && alive(owner)) {
-        throw new Error(
-          `Another auto-research batch is already running for this checkout: ${path} (pid ${owner}, run ${String(saved?.runId ?? 'unknown')})`,
-        )
-      }
-      if (owner === null) {
-        // Either a writer that has not finished or a corrupt lock. Only a lock
-        // old enough to be certainly abandoned may be removed.
-        const stats = await fsp.stat(path).catch(() => null)
-        if (stats && now() - stats.mtimeMs < writeGraceMs) {
-          throw new Error(
-            `Another auto-research batch is starting for this checkout: ${path}${readable ? '' : ' (lock still being written)'}`,
-          )
-        }
-      }
-      // Stale lock: reclaim atomically by moving to a unique stale path and
-      // verifying its owner is still dead before deleting.
-      const stalePath = join(runtimeRoot, `.runner.lock.stale.${pid}.${randomUUID()}`)
-      try {
-        await fsp.rename(path, stalePath)
-        let movedSaved: { pid?: unknown } | null = null
-        try {
-          movedSaved = JSON.parse(await fsp.readFile(stalePath, 'utf8')) as { pid?: unknown }
-        } catch {
-          movedSaved = null
-        }
-        const movedOwner = typeof movedSaved?.pid === 'number' ? movedSaved.pid : null
-        if (movedOwner !== null && movedOwner !== owner && alive(movedOwner)) {
-          await fsp.link(stalePath, path).catch(() => {})
-          await fsp.unlink(stalePath).catch(() => {})
-          throw new Error(
-            `Another auto-research batch is already running for this checkout: ${path} (pid ${movedOwner})`,
-          )
-        }
-        await fsp.unlink(stalePath).catch(() => {})
-      } catch (reclaimErr) {
-        if (reclaimErr instanceof Error && reclaimErr.message.startsWith('Another auto-research batch')) {
-          throw reclaimErr
-        }
-      }
-    } finally {
-      await fsp.unlink(temporary).catch(() => {})
+      await fsp.rm(path, { force: true })
+      continue
+    }
+    let released = false
+    return {
+      path,
+      info,
+      release: async () => {
+        if (released) return
+        released = true
+        await fsp.rm(path, { force: true })
+      },
     }
   }
   throw new Error(`Could not acquire the auto-research runner lock: ${path}`)
@@ -722,9 +547,6 @@ export const DSH_RESERVED_ENV_KEYS = new Set([
   'DSH_PROFILE_DIR',
 ])
 
-/** Secret-looking names are filtered from prompts, receipts and registries. */
-const SECRET_ENV_KEY = /(token|key|secret|password|credential)/i
-
 /**
  * The `DSH_*` keys the `auto-research` contributor declares.
  *
@@ -747,7 +569,6 @@ export function declaredWorkerEnvKeys(
     if (!REGISTRY_KEY.test(name)
       || name.startsWith('DSH_LAYERFS_')
       || DSH_RESERVED_ENV_KEYS.has(name)
-      || SECRET_ENV_KEY.test(name)
       || Object.hasOwn(keys, name)) continue
     keys[name] = { description: 'Configured auto-research worker environment value' }
   }
@@ -941,8 +762,7 @@ export class AutoResearchProvider implements SubagentProvider {
     if (!stat?.isDirectory()) throw new Error('auto-research child cwd is not an accessible directory: ' + cwd)
     if (!request.parent) throw new Error('auto-research requires the exact live parent agent')
 
-    const promptText = extractPromptText(request.prompt)
-    const { plan, source } = await resolvePlan({ cwd, config: this.config, promptText })
+    const { plan, source } = await resolvePlan({ cwd, config: this.config })
     if (typeof plan.evaluator !== 'string') throw new Error('Plan requires an evaluator script')
     if (!isAbsolute(plan.evaluator)) plan.evaluator = resolve(cwd, plan.evaluator)
     const evaluatorPath = plan.evaluator
@@ -953,9 +773,6 @@ export class AutoResearchProvider implements SubagentProvider {
     const options = normalizeOptions(this.config, plan)
     validatePlan(plan, options)
 
-    const planOptionsRecord = plan.options && typeof plan.options === 'object'
-      ? plan.options as Record<string, unknown>
-      : {}
     const workerAgentOptions: WorkerAgentOptions | null = await this.resolveLiveWorkerAgentOptions(
       resolveWorkerAgentOptions(
         this.config,
@@ -964,16 +781,10 @@ export class AutoResearchProvider implements SubagentProvider {
       ),
       request.parent,
     )
-    const planWorkerProvider = plan.workerProvider ?? plan.worker_provider ?? planOptionsRecord.workerProvider
-    const workerProvider = this.workerProviderName(planWorkerProvider, Boolean(workerAgentOptions))
+    const workerProvider = this.workerProviderName((plan.options as PlanOptions | undefined)?.workerProvider, Boolean(workerAgentOptions))
     const workspaceRoot = await selectPlanWorkspace(cwd, plan as { workspace?: unknown })
     const runtimeRoot = join(workspaceRoot, '.auto-research-methods')
-    await assertRuntimeRootContained(workspaceRoot, runtimeRoot)
-    await assertRuntimeRootContained(workspaceRoot, join(runtimeRoot, 'runs'))
     const seed = resolve(workspaceRoot) !== resolve(cwd)
-    if (seed) {
-      await assertRuntimeRootContained(cwd, join(cwd, '.auto-research-methods'))
-    }
     const runId = randomUUID()
     const output = join(runtimeRoot, 'runs', runId)
     // Take the checkout lock before creating anything: a concurrent batch on

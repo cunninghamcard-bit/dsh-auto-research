@@ -91,13 +91,13 @@ Add the bundle to a DSH profile (the plugin manager reads `dsh.bundle.patch`), o
 | `executor` | `auto` | Registered executor for the frozen evaluator (`local`, `colab`, or a third-party one); `auto` takes the first available by priority. A plan may override it in `options.executor` |
 | `workspaceBackend` | `auto` | Registered backend name (`layerfs`, `snapshot`, or a third-party one); `auto` takes the first available by priority. A plan may override it in `options.workspaceBackend` |
 | `layerfs` | auto | Explicit LayerFS settings; `false` makes the `layerfs` backend decline the batch |
-| `workerEnv` | `{}` | Non-secret environment facts shown to workers |
+| `workerEnv` | `{}` | Environment passed to workers as configured (`DSH_*` names also through `ctx.shellEnv`); `CONFIG.json` omits secret-looking keys |
 
 Every plan may include an `options` object that overrides these per-batch values. The model chooses scientific values; the plugin only rejects impossible combinations (for example a metric subset larger than the declared metric set).
 
 ## Plan
 
-The coordinator writes the plan outside the candidate source. The provider also accepts a plan embedded in the delegation prompt as a fenced JSON block or a `PLAN_JSON:` line.
+The coordinator writes the plan outside the candidate source, at `planPath` (default `.auto-research-methods/plan.json`), or the profile sets `plan` in the configuration. These are the only two sources. Per-batch overrides go in `plan.options`, under the configuration's own field names (`workerProvider`, `workerModel`, `branches`, …).
 
 ```json
 {
@@ -123,7 +123,7 @@ The coordinator writes the plan outside the candidate source. The provider also 
 - `selection_metrics` must also be declared in `metrics` and be finite; they only rank candidates whose primary score ties.
 - Optional metrics may be absent; a missing observation is never coerced to zero.
 - `stall_seconds`, `metric_subset`, and `portfolio_size` are required when `rsiTop` is enabled.
-- `workspace` may name a compact seed subdirectory inside the checkout. It must be relative, symlink-free, and outside `.auto-research-methods`.
+- `workspace` may name a compact seed subdirectory inside the checkout. It must be relative, resolve to a directory strictly inside the checkout, and stay outside `.auto-research-methods`.
 
 ## Evaluator contract
 
@@ -171,7 +171,7 @@ Everything lives under `<checkout>/.auto-research-methods/runs/<run-id>/`:
 | `LEADER.json` | Selected candidate |
 | `RESULT.json` | Batch boundary result |
 
-`<checkout>/.auto-research-methods/LATEST.json` records the selected workspace, its LayerFS branch, the original manifest, and the stall `frontier` (`evaluator_sha256`, `anchor_score`, `stalled_work_seconds`). The next batch starts from that leader only when the original workspace still matches; otherwise it stops and asks the coordinator to reconcile the starting point. With LayerFS, the saved branch is remounted when its previous mount path is no longer available. If `LATEST.json` names a leader workspace or branch and neither can be adopted, the new batch fails loud instead of silently restarting from the seed. `runner.lock` makes one checkout single-instance. For a compact `plan.workspace` seed, runtime artifacts live inside the seed (`.auto-research-methods/`) and `<checkout>/.auto-research-methods/SEED.json` points at them.
+`<checkout>/.auto-research-methods/LATEST.json` records the selected workspace, its LayerFS branch, the original manifest, and the stall `frontier` (`evaluator_sha256`, `anchor_score`, `stalled_work_seconds`). The next batch starts from that leader only when the original workspace still matches; otherwise it stops and asks the coordinator to reconcile the starting point. With LayerFS, the saved branch is remounted when its previous mount path is no longer available. If `LATEST.json` names a leader workspace or branch and neither can be adopted, the new batch fails loud instead of silently restarting from the seed. `runner.lock` (created exclusively, holding the owner pid) makes one checkout single-instance; a lock whose pid is gone is replaced, an unreadable one must be deleted by hand. For a compact `plan.workspace` seed, runtime artifacts live inside the seed (`.auto-research-methods/`) and `<checkout>/.auto-research-methods/SEED.json` points at them.
 
 ## LayerFS integration
 
@@ -206,7 +206,7 @@ Symlinks are recorded in manifests as `symlink:<link text>` and never followed. 
 - The user's original checkout is never evaluated or mutated; branches are copies or CoW mounts.
 - Symlinks, path traversal, dotfiles (except `.method-evaluation`), private credential names, and credential-looking evidence are rejected from shared checkpoints.
 - The worker skill forbids recursive spawning and publishing/merging; the provider also rejects `subagent_auto_research` calls from a worker checkout or a live worker child session.
-- Config is sanitized before serialization; secret-looking environment keys are not written.
+- `CONFIG.json` omits secret-looking keys of `workerEnv` and `layerfs`; workers still receive `workerEnv` as configured.
 - No automatic merge, reset, overwrite, deletion, or publication occurs.
 - A batch boundary is not proof that the user's objective is complete or that a benchmark gain exists.
 

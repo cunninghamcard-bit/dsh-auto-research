@@ -30,7 +30,11 @@ export interface Frontier {
 }
 /** Merge plan-level option overrides over plugin configuration. */
 export declare function normalizeOptions(config?: Config, plan?: ResearchPlanInput): ResearchOptions;
-/** Merge config-level, plan-level, and request-level child LLM selection options. */
+/**
+ * Merge the child LLM selection: the request's `agentOptions`, then
+ * `plan.options`, then the plugin configuration. Within a layer,
+ * `workerAgentOptions` wins over the single `worker*` fields.
+ */
 export declare function resolveWorkerAgentOptions(config?: Config, plan?: ResearchPlanInput, override?: WorkerAgentOptions | null): WorkerAgentOptions | null;
 /**
  * Validate the model-written plan against the execution contract and return

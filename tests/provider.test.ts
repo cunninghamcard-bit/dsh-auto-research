@@ -5,8 +5,6 @@ import { join } from 'node:path'
 import {
   AutoResearchProvider,
   NO_START_CAPABILITIES,
-  extractPromptText,
-  parsePlanFromPrompt,
   resolveConfig,
   resolvePlan,
 } from '../lib/provider.js'
@@ -93,44 +91,22 @@ function fakeLayerfs(root: string, actions: any[]) {
   }
 }
 
-describe('provider parsing helpers', () => {
-  it('extracts text blocks from prompt content', () => {
-    assert.equal(extractPromptText('plain'), 'plain')
-    assert.equal(extractPromptText([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }]), 'a\nb')
-    assert.equal(extractPromptText([{ type: 'image' }]), '')
-    assert.equal(extractPromptText(null), '')
-  })
-
-  it('finds a plan in a fenced block, a PLAN_JSON line, or a bare object', () => {
-    const plan = { objective: 'o', evaluator: 'e' }
-    assert.deepEqual(parsePlanFromPrompt('```json\n' + JSON.stringify(plan) + '\n```'), plan)
-    assert.deepEqual(parsePlanFromPrompt('hello\nPLAN_JSON: ' + JSON.stringify(plan)), plan)
-    assert.deepEqual(parsePlanFromPrompt(JSON.stringify(plan)), plan)
-    assert.equal(parsePlanFromPrompt('no plan here'), null)
-    assert.equal(parsePlanFromPrompt('```json\n{"objective":"o"}\n```'), null)
-  })
-
-  it('prefers config, then the plan file, then the prompt', async () => {
+describe('plan source', () => {
+  it('reads config.plan, else the plan file, else fails', async () => {
     await withTemp(async root => {
       const config = { plan: { objective: 'o', evaluator: 'e' }, planPath: '.auto-research-methods/plan.json' } as any
-      assert.equal((await resolvePlan({ cwd: root, config, promptText: '' })).source, 'config')
+      assert.equal((await resolvePlan({ cwd: root, config })).source, 'config')
     })
     await withTemp(async root => {
       await mkdir(join(root, '.auto-research-methods'), { recursive: true })
       await writeFile(join(root, '.auto-research-methods', 'plan.json'), JSON.stringify({ objective: 'o', evaluator: 'e' }))
-      const result = await resolvePlan({ cwd: root, config: { planPath: '.auto-research-methods/plan.json' } as any, promptText: '' })
+      const result = await resolvePlan({ cwd: root, config: { planPath: '.auto-research-methods/plan.json' } as any })
       assert.equal(result.source.endsWith('plan.json'), true)
     })
     await withTemp(async root => {
-      const result = await resolvePlan({
-        cwd: root,
-        config: { planPath: '.auto-research-methods/plan.json' } as any,
-        promptText: '```json\n{"objective":"o","evaluator":"e"}\n```',
-      })
-      assert.equal(result.source, 'prompt')
-    })
-    await withTemp(async root => {
-      await assert.rejects(resolvePlan({ cwd: root, config: { planPath: 'none.json' } as any, promptText: '' }), /No research plan/)
+      await writeFile(join(root, 'plan.json'), JSON.stringify({ objective: 'o' }))
+      await assert.rejects(resolvePlan({ cwd: root, config: { planPath: 'plan.json' } as any }), /incomplete/)
+      await assert.rejects(resolvePlan({ cwd: root, config: { planPath: 'none.json' } as any }), /No research plan/)
     })
   })
 })
@@ -227,30 +203,6 @@ describe('AutoResearchProvider', () => {
       assert.equal(JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'runs', runs[0]!, 'RESULT.json'), 'utf8')).status, 'COMPLETED')
       assert.equal(JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'LATEST.json'), 'utf8')).leader_workspace.includes('runs'), true)
       await handle.dispose()
-      await handle.dispose()
-    })
-  })
-
-  it('accepts a plan embedded in the delegation prompt', async () => {
-    await withTemp(async root => {
-      const cwd = join(root, 'repo')
-      await writeWorkspace(cwd, { score: 1, metrics: { score: 1 } })
-      await writeStateEvaluator(join(cwd, 'evaluator.mjs'))
-      const plan = { ...planObject(cwd), evaluator: 'evaluator.mjs' }
-      const subagents = fakeSubagents(async spec => {
-        await setState(spec.request.cwd, { score: 5, metrics: { score: 5 } })
-        return { output: [], stopReason: 'completed' }
-      }, ['worker'])
-      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(), ctx: { subagents, logger: {} }, config: { workerProvider: 'worker' } })
-      const handle = await provider.start({
-        cwd,
-        prompt: [{ type: 'text', text: 'Plan:\n```json\n' + JSON.stringify(plan) + '\n```' }],
-        parent: { id: 'parent' },
-        signal: new AbortController().signal,
-      })
-      const result = await handle.result
-      assert.equal(result.stopReason, 'completed')
-      assert.match((result.output as any)[0].text, /score: 5/)
       await handle.dispose()
     })
   })
@@ -361,7 +313,7 @@ describe('AutoResearchProvider', () => {
     })
     await withTemp(async root => {
       const { cwd } = await fixture(root)
-      await writeFile(join(cwd, '.auto-research-methods', 'plan.json'), JSON.stringify({ ...planObject(cwd), workerProvider: 'missing' }))
+      await writeFile(join(cwd, '.auto-research-methods', 'plan.json'), JSON.stringify({ ...planObject(cwd), options: { workerProvider: 'missing' } }))
       const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents: { list: () => ['worker'], startActivation() {} } } as any,
         config: {},

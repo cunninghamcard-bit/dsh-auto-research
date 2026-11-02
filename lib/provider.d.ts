@@ -11,20 +11,10 @@ import type { Config, ProviderContext, ResearchPlanInput, ResolvedConfig, Subage
 export declare const NO_START_CAPABILITIES: Record<string, unknown>;
 /** Normalize plugin config (also used by the Cordis standard schema). */
 export declare function resolveConfig(input?: unknown): ResolvedConfig;
-/** Extract the standalone user text from a `ContentBlock[]` or string. */
-export declare function extractPromptText(prompt: unknown): string;
-/**
- * Find a plan object embedded in a delegation prompt: a fenced JSON block, a
- * `PLAN_JSON:` line, or a prompt that is itself the JSON object.
- */
-export declare function parsePlanFromPrompt(text: string): ResearchPlanInput | null;
-/**
- * Resolve the plan from config, the plan file, or the delegation prompt.
- */
-export declare function resolvePlan({ cwd, config, promptText, }: {
+/** The plan from `config.plan`, else the file at `config.planPath`. */
+export declare function resolvePlan({ cwd, config, }: {
     cwd: string;
     config: ResolvedConfig;
-    promptText: string;
 }): Promise<{
     plan: ResearchPlanInput;
     source: string;
@@ -41,29 +31,14 @@ export interface RunnerLock {
     release: () => Promise<void>;
 }
 /**
- * Refuse a runtime root that is a symlink escaping the workspace.
- *
- * `.auto-research-methods` holds every branch artifact and the runner lock, so
- * a planted symlink would redirect those writes outside the assigned
- * checkout. A missing runtime root is fine (it is created later).
+ * Acquire `<runtimeRoot>/runner.lock` so two batches on one checkout fail
+ * loud instead of racing on `LATEST.json`. The lock is created with `wx`; an
+ * existing lock whose pid is gone is removed and the create retried once.
  */
-export declare function assertRuntimeRootContained(workspaceRoot: string, runtimeRoot: string): Promise<void>;
-/**
- * Acquire `<runtimeRoot>/runner.lock` so two `subagent_auto_research`
- * invocations on one checkout fail loud instead of racing on `LATEST.json`.
- *
- * The payload is written to a unique sibling first and then hard-linked into
- * place, so a lock file is never observable empty or half-written. A stale
- * lock is reclaimed only when its owning PID is gone; an unparsable lock that
- * is younger than {@link LOCK_WRITE_GRACE_MS} is treated as live rather than
- * unlinked, which closes the remaining creation window.
- */
-export declare function acquireRunnerLock(runtimeRoot: string, runId: string, { cwd, pid, alive, now, writeGraceMs, }?: {
+export declare function acquireRunnerLock(runtimeRoot: string, runId: string, { cwd, pid, alive }?: {
     cwd?: string;
     pid?: number;
     alive?: (pid: number) => boolean;
-    now?: () => number;
-    writeGraceMs?: number;
 }): Promise<RunnerLock>;
 /** The worker environment keys this plugin owns in a `dsh` shell registry. */
 export declare const AUTO_RESEARCH_ENV_KEYS: readonly ['DSH_AUTO_RESEARCH_WORKER', 'DSH_AUTO_RESEARCH_BRANCH', 'DSH_AUTO_RESEARCH_CHECKOUT', 'DSH_AUTO_RESEARCH_SANDBOX_PATH'];

@@ -298,21 +298,6 @@ export function publicRow(row: TrajectoryRow): TrajectoryRow {
   return copy
 }
 
-async function ensureNoSymlink(root: string, parts: string[]): Promise<void> {
-  let cursor = root
-  for (const part of parts) {
-    cursor = join(cursor, part)
-    let stat
-    try {
-      stat = await fsp.lstat(cursor)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
-      throw error
-    }
-    if (stat.isSymbolicLink()) throw new Error('Completed checkpoint path may not traverse symlinks')
-  }
-}
-
 /**
  * Store every distinct completed file once in `checkpoint-objects` and record a
  * checkpoint manifest for later restoration.
@@ -348,7 +333,6 @@ export async function retainCompletedState(output: string, row: TrajectoryRow): 
     if (isAbsolute(name) || parts.includes('..') || parts.length === 0) {
       throw new Error('Invalid retained checkpoint path')
     }
-    await ensureNoSymlink(workspace, parts)
     const path = join(workspace, name)
     if (!isContained(workspace, path)) throw new Error('Retained checkpoint escapes the workspace')
     const stat = await fsp.lstat(path)
@@ -2088,7 +2072,7 @@ export class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
 
 /**
  * Resolve the optional compact research seed named by `plan.workspace`.
- * It must be a regular, symlink-free subdirectory inside `root`.
+ * It must resolve to a directory strictly inside `root`.
  */
 export async function selectPlanWorkspace(root: string, plan: { workspace?: unknown }): Promise<string> {
   const requested = plan?.workspace
@@ -2103,7 +2087,6 @@ export async function selectPlanWorkspace(root: string, plan: { workspace?: unkn
   if (parts.length === 0 || parts.includes('..') || parts.includes('.auto-research-methods')) {
     throw new Error('Plan workspace must be a regular compact subdirectory, not prior runtime')
   }
-  await ensureNoSymlink(root, parts)
   const chosen = await fsp.realpath(join(root, ...parts))
   const realRoot = await fsp.realpath(root)
   if (chosen === realRoot || !isContained(realRoot, chosen)) {
