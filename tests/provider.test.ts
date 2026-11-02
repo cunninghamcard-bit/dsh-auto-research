@@ -10,7 +10,7 @@ import {
   resolveConfig,
   resolvePlan,
 } from '../lib/provider.js'
-import { Config, apply, coordinatorPolicy, name as pluginName, inject } from '../lib/index.js'
+import { Config, apply, name as pluginName, inject } from '../lib/index.js'
 import { ResearchStoppedError } from '../lib/runner.js'
 import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
 
@@ -142,41 +142,31 @@ describe('plugin entry', () => {
     assert.equal(resolveConfig({}).rounds, 1)
   })
 
-  it('registers the provider and the coordinator prompt section', () => {
+  it('registers the provider and the packaged skills, without a system prompt section', async () => {
     const registered: any[] = []
-    const sections: any[] = []
+    const skillFactories: any[] = []
     const ctx: any = {
       subagents: {
         registerProvider(provider: any) { registered.push(provider) },
       },
-      systemPrompt: {
-        getSectionOrder(name: any) { return name === 'PLAN_POLICY' ? 500 : 999 },
-        section(section: any) { sections.push(section) },
-      },
+      skills: { registerProvider(factory: any) { skillFactories.push(factory) } },
     }
     apply(ctx, { branches: 2, rsiTop: false })
     assert.equal(pluginName, 'dsh-auto-research')
-    assert.deepEqual(inject, ['subagents', 'systemPrompt'])
+    assert.deepEqual(inject, ['subagents', 'skills'])
     assert.equal(registered.length, 1)
     assert.equal(registered[0].name, 'auto-research')
     assert.equal(registered[0].inheritsParentContext, false)
     assert.equal(registered[0].capabilities, NO_START_CAPABILITIES)
-    assert.equal(sections.length, 1)
-    assert.equal(sections[0].name, 'auto-research:coordinator')
-    assert.equal(sections[0].order, 500)
-    assert.equal(sections[0].interpolate, false)
-    assert.match(sections[0].text, /You are the coordinator/)
-    assert.match(sections[0].text, /RESEARCH_STATUS: continue/)
-    assert.match(coordinatorPolicy(), /Collaborative evidence sharing/)
-  })
-
-  it('falls back to a numeric order when the host lacks getSectionOrder', () => {
-    const sections: any[] = []
-    apply({
-      subagents: { registerProvider() {} },
-      systemPrompt: { section(section: any) { sections.push(section) } },
-    } as any, {})
-    assert.equal(sections[0].order, 500)
+    assert.equal(skillFactories.length, 1)
+    let invalidated = 0
+    const skills = skillFactories[0]({ invalidate: () => { invalidated += 1 }, signal: new AbortController().signal })
+    assert.deepEqual((await skills.list({ cwd: '/repo' })).map((entry: any) => entry.name), ['auto-research'])
+    // A live worker checkout switches the catalog and invalidates it on start and stop.
+    const lease = registered[0].workerEnvs.register({ id: 'b', checkout: '/work/branch' })
+    assert.deepEqual((await skills.list({ cwd: '/work/branch/src' })).map((entry: any) => entry.name), ['auto-research-worker'])
+    lease.dispose()
+    assert.equal(invalidated, 2)
   })
 })
 
@@ -413,7 +403,7 @@ describe('AutoResearchProvider', () => {
   it('exposes ctx.autoResearch service interface for workspace backend plugins', async () => {
     const ctx: any = {
       subagents: { registerProvider() {} },
-      systemPrompt: { section() {} },
+      skills: { registerProvider() {} },
     }
     apply(ctx, {})
     assert.ok(ctx.autoResearch)

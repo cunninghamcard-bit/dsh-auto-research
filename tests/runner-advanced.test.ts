@@ -8,7 +8,7 @@ import {
   Runner,
 } from '../lib/runner.js'
 import { LayerFSBackend, WorkspaceManager, createWorkspaceManager, inventory } from '../lib/layerfs-workspace.js'
-import { SHARED_CONTEXT_POLICY } from '../lib/policies.js'
+import { SHARED_CONTEXT_PREAMBLE } from '../lib/protocols.js'
 import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
 
 const sha256 = (data: any) => createHash('sha256').update(data).digest('hex')
@@ -149,12 +149,14 @@ function hostLayerfs(root: string, actions: any[]): any {
 }
 
 describe('P0: full RSI view, provider archival, and continuation handoff', () => {
-  it('serializes the complete view in prompt/LAUNCH, archives provider.jsonl, and hands off output', async () => {
+  it('serializes the complete view in BRANCH/LAUNCH, archives provider.jsonl, and hands off output', async () => {
     await withTemp(async root => {
       const worker = async (spec: any, index: number) => {
-        const text = spec.request.prompt[0].text
         await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index, progress: 2 + index } })
-        if (text.includes('RSI-top dashboard view')) await writePortfolio(spec.request.cwd, 2)
+        if (spec.branch.rsi_top) await writePortfolio(spec.request.cwd, 2)
+        if (spec.branch.handoff) {
+          spec.handoffText = await readFile(join(spec.request.cwd, spec.branch.handoff.path), 'utf8')
+        }
         return { output: [{ type: 'text', text: `assistant output ${index}` }], stopReason: 'completed' }
       }
       const { runner, subagents } = await setup(root, {
@@ -170,27 +172,23 @@ describe('P0: full RSI view, provider archival, and continuation handoff', () =>
       assert.equal(launch.metric_view.definitions.length, 1)
       assert.ok(Array.isArray(launch.metric_view.diagnostics))
       assert.ok(Array.isArray(launch.metric_view.rows))
-      const exploreCall = subagents.calls.find((call: any) => call.label.includes('explore'))
+      const exploreCall = subagents.calls.find((call: any) => call.branch.branch_id === 'round-1-explore-1')
       assert.ok(exploreCall)
-      const line = exploreCall.request.prompt[0].text.split('\n').find((value: any) => value.startsWith('RSI-top dashboard view'))
-      assert.ok(line)
-      const promptView = JSON.parse(line.slice(line.indexOf(':') + 2))
-      assert.deepEqual(Object.keys(promptView).sort(), ['definitions', 'diagnostics', 'rows'])
-      assert.equal(promptView.definitions.length, 1)
-      assert.ok(Array.isArray(promptView.rows))
+      const branchView = exploreCall.branch.rsi_top.metric_view
+      assert.deepEqual(branchView, launch.metric_view)
+      assert.equal(exploreCall.branch.rsi_top.portfolio_size, 2)
 
       const continueCall = subagents.calls.find((call: any) => call.label.includes('continue'))
       assert.ok(continueCall)
-      const continuePrompt = continueCall.request.prompt[0].text
       const continueLaunch = JSON.parse(await readFile(join(runner.output, 'round-1-continue-1', 'LAUNCH.json'), 'utf8'))
       const parentId = continueLaunch.parent
       assert.equal(continueLaunch.continuation, 'handoff')
       assert.equal(typeof continueLaunch.provider_session, 'string')
       assert.equal(continueLaunch.handoff_from, parentId)
-      assert.match(continuePrompt, new RegExp(`Previous turn handoff \\(from parent ${parentId}\\):`))
-      assert.match(continuePrompt, new RegExp(`assistant output [01]`))
-      const handoff = await readFile(join(runner.output, 'round-1-continue-1', 'workspace', '.auto-research-methods', 'HANDOFF.md'), 'utf8')
-      assert.match(handoff, /assistant output [01]/)
+      assert.deepEqual(continueCall.branch.handoff, { from: parentId, path: '.auto-research-methods/HANDOFF.md' })
+      assert.match(continueCall.handoffText, /assistant output [01]/)
+      assert.equal(continueLaunch.handoff_path, join(runner.output, 'round-1-continue-1', 'HANDOFF.md'))
+      assert.match(await readFile(continueLaunch.handoff_path, 'utf8'), /assistant output [01]/)
 
       const transcript = (await readFile(join(runner.output, 'round-1-continue-1', 'provider.jsonl'), 'utf8'))
         .trim().split('\n').map(line => JSON.parse(line))
@@ -251,8 +249,7 @@ describe('P0/P1: rejected branch preservation and cooperative fidelity', () => {
     await withTemp(async root => {
       const prompts: any[] = []
       const worker = async (spec: any, index: number) => {
-        const text = spec.request.prompt[0].text
-        prompts.push({ index, text, cwd: spec.request.cwd })
+        prompts.push({ index, branch: spec.branch, cwd: spec.request.cwd })
         await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index, progress: 2 + index } })
         await writeCheckpoint(spec.request.cwd, index)
         return { output: [{ type: 'text', text: `coop ${index}` }], stopReason: 'completed' }
@@ -275,19 +272,19 @@ describe('P0/P1: rejected branch preservation and cooperative fidelity', () => {
       assert.ok(collaboration.epochs.length >= 2)
       const publication = join(runner.output, 'round-1-explore-epoch-1-shared', 'shared-context.md')
       const shared = await readFile(publication, 'utf8')
-      assert.ok(shared.startsWith(SHARED_CONTEXT_POLICY))
+      assert.ok(shared.startsWith(SHARED_CONTEXT_PREAMBLE))
       assert.match(shared, /Checkout: .*workspace/)
       assert.match(shared, /Saved transcript: .*provider\.jsonl/)
       assert.match(shared, /Saved notes: .*RESEARCH_HANDOFF\.md/)
       assert.match(shared, /RESEARCH_CONTEXT\/topic0__method__result__verified\.md/)
       assert.match(shared, /topic0 \/ method \/ result \/ verified/)
 
-      const later = prompts.find(entry => entry.text.includes('Read the published cooperative context at'))
+      const later = prompts.find(entry => entry.branch.cooperation?.shared_context)
       assert.ok(later)
       const expected = join(later.cwd, 'SHARED_CONTEXT', 'shared-context.md')
-      assert.ok(later.text.includes(expected))
+      assert.equal(later.branch.cooperation.shared_context, expected)
       const copied = await readFile(expected, 'utf8')
-      assert.ok(copied.startsWith(SHARED_CONTEXT_POLICY))
+      assert.ok(copied.startsWith(SHARED_CONTEXT_PREAMBLE))
       assert.match(copied, /Checkout: .*workspace/)
       const publications = (await readdir(runner.output)).filter(name => name.endsWith('-shared'))
       const publishedContexts = await Promise.all(publications.map(name => readFile(join(runner.output, name, 'shared-context.md'), 'utf8')))

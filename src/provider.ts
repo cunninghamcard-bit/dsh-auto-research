@@ -8,7 +8,7 @@
 
 import { randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
-import { isAbsolute, join, resolve, sep } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import {
   LayerFSWorkspaceFactory,
   SnapshotWorkspaceFactory,
@@ -23,6 +23,7 @@ import {
   withoutLayerfsTrace,
   writeJsonAtomic,
 } from './layerfs-workspace.js'
+import { insideWorkerCheckout } from './skills.js'
 import { FrozenEvaluator } from './evaluator.js'
 import {
   ResearchStoppedError,
@@ -535,6 +536,8 @@ export interface WorkerEnvRegistration {
 export class WorkerEnvRegistry {
   private readonly entries = new Map<number, WorkerEnvEntry>()
   private nextKey = 1
+  /** Called whenever a worker starts or stops (the skill catalog depends on it). */
+  onChange: (() => void) | null = null
   private readonly resolveCwd: ((session: unknown, agent: unknown) => string | null) | null
 
   constructor(options: {
@@ -551,6 +554,14 @@ export class WorkerEnvRegistry {
   /** @returns every checkout that currently has a live worker. */
   checkouts(): string[] {
     return [...this.entries.values()].map(entry => entry.checkout)
+  }
+
+  /** Whether `sessionId` is the child session of a live worker. */
+  hasChildSession(sessionId: string): boolean {
+    for (const entry of this.entries.values()) {
+      if (entry.childSessionId === sessionId) return true
+    }
+    return false
   }
 
   /** Whether `path` is one of the live worker checkouts (or inside it). */
@@ -586,6 +597,7 @@ export class WorkerEnvRegistry {
       env: { ...env },
     }
     this.entries.set(key, entry)
+    this.onChange?.()
     let disposed = false
     return {
       id,
@@ -598,6 +610,7 @@ export class WorkerEnvRegistry {
         if (disposed) return
         disposed = true
         this.entries.delete(key)
+        this.onChange?.()
       },
     }
   }
@@ -696,13 +709,6 @@ export class WorkerEnvRegistry {
 export function sessionIdOf(agent: unknown): string | null {
   const header = (agent as { session?: { header?: { id?: unknown } } } | null | undefined)?.session?.header
   return typeof header?.id === 'string' && header.id.length > 0 ? header.id : null
-}
-
-/** Whether `path` sits inside a `.auto-research-methods/runs/` runtime tree. */
-export function isInsideRuntimeRuns(path: string): boolean {
-  const parts = resolve(path).split(sep)
-  const index = parts.lastIndexOf('.auto-research-methods')
-  return index >= 0 && parts[index + 1] === 'runs'
 }
 
 /** One-line description for each environment key this plugin owns. */
@@ -996,24 +1002,14 @@ export class AutoResearchProvider implements SubagentProvider {
    * Refuse `subagent_auto_research` from a branch worker.
    *
    * A worker already owns one branch of a running batch: delegating another
-   * batch from inside it would recurse forever, race the runner lock of its own
-   * checkout, and corrupt `plan.json`. A delegation whose cwd is a live worker
-   * checkout or any `runs/` runtime tree is rejected the same way.
+   * batch from inside it would recurse and race the runner lock. Two signals,
+   * either sufficient: the cwd is inside a checkout carrying the runner's
+   * `.auto-research-methods/WORKER.json` marker, or the caller's session is a
+   * live worker's child session.
    */
   private assertNotRecursive(request: SubagentStartRequest, cwd: string): void {
-    const parent = request.parent as
-      | { session?: { header?: { origin?: unknown } } }
-      | null
-      | undefined
-    const origin = parent?.session?.header?.origin
-    // The real harness copies the coordinator's header (and cwd) onto a worker
-    // session and records the assigned checkout as a working-directory change,
-    // so the resolution below is what actually identifies a live worker.
-    const resolved = this.workerEnvs.resolve({ agent: request.parent, session: parent?.session, cwd })
-    if (resolved.DSH_AUTO_RESEARCH_WORKER === '1'
-      || origin === 'subagent'
-      || this.workerEnvs.ownsCheckout(cwd)
-      || isInsideRuntimeRuns(cwd)) {
+    const sessionId = sessionIdOf(request.parent)
+    if (insideWorkerCheckout(cwd) || (sessionId !== null && this.workerEnvs.hasChildSession(sessionId))) {
       throw new Error('subagent_auto_research cannot be called recursively by a worker subagent')
     }
   }

@@ -319,18 +319,19 @@ export interface ShellEnvService {
   [key: string]: unknown
 }
 
+/** `ctx.skills` (`@deepseek-ai/dsh-skill`) registration surface. */
+export interface SkillsService {
+  registerProvider: (factory: (control: { invalidate: () => void; signal: AbortSignal }) => {
+    name: string
+    list: (options: { cwd?: string; signal?: AbortSignal }) => Promise<unknown>
+    get: (candidate: never, options: { cwd?: string; signal?: AbortSignal }) => Promise<unknown>
+  }) => unknown
+}
+
 /** Cordis context subset consumed by the plugin. */
 export interface PluginContext {
   subagents: SubagentsService
-  systemPrompt?: {
-    getSectionOrder?: (name: string) => number | null | undefined
-    section: (section: {
-      name: string
-      order: number
-      interpolate: boolean
-      text: string
-    }) => unknown
-  }
+  skills?: SkillsService
   shellEnv?: ShellEnvService
   /** `dsh` `ctx.workingDirectory` service (per-session assigned checkout). */
   workingDirectory?: {

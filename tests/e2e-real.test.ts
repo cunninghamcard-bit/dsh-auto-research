@@ -69,7 +69,8 @@ async function dshModules() {
   const cordis = await import(pathToFileURL(`${DSH_ROOT}/vendor/cordis/lib/index.js`).href)
   const testkit = await import(pathToFileURL(`${DSH_ROOT}/packages/test-support/agent-loop-testkit/lib/index.js`).href)
   const subagent = await import(pathToFileURL(`${DSH_ROOT}/packages/subagent/subagent/lib/index.js`).href)
-  return { Context: cordis.Context, testkit, SubagentRuntime: subagent.default }
+  const skill = await import(pathToFileURL(`${DSH_ROOT}/packages/skill/skill/lib/index.js`).href)
+  return { Context: cordis.Context, testkit, SubagentRuntime: subagent.default, SkillRegistry: skill.default }
 }
 
 function digest(text: string | Buffer) {
@@ -170,6 +171,7 @@ async function mountDshContext(modules: any) {
   const harness = await modules.testkit.mountAgentLoopTestHarness(ctx)
   const agent = await harness.create('e2e-parent', { provider: 'e2e', model: 'e2e' }, { cwd: tmpdir() })
   await ctx.plugin(modules.SubagentRuntime)
+  await ctx.plugin(modules.SkillRegistry)
   return { ctx, agent }
 }
 
@@ -306,6 +308,7 @@ async function scenario(backend: string) {
       cwd,
       bySession: collectFor(ctx, { session: { header: { id: childId, cwd, origin: 'subagent' } } }),
       byCwd: collectFor(ctx, { session: { header: { id: `unknown-${childId}`, cwd, parentSession: 'e2e-parent' } } }),
+      skills: ctx.skills.list({ cwd }),
     })
   })
   const mounted = await mountDshContext(modules)
@@ -355,7 +358,10 @@ async function scenario(backend: string) {
       }
       // The session's LayerFS facts are still contributed to the same call.
       assert.ok(entry.bySession.DSH_LAYERFS_PROJECT, 'the LayerFS contributor still publishes the project')
+      // The real skill registry shows a running worker its own skill only.
+      assert.deepEqual((await entry.skills).map((skill: any) => skill.name).filter((name: string) => name.startsWith('auto-research')), ['auto-research-worker'])
     }
+    assert.deepEqual((await ctx.skills.list({ cwd: workspace })).map((skill: any) => skill.name).filter((name: string) => name.startsWith('auto-research')), ['auto-research'])
     const coordinatorEnv = collectFor(ctx, agent)
     assert.equal(coordinatorEnv.DSH_AUTO_RESEARCH_WORKER, undefined, 'the coordinator gets no worker flag')
     assert.ok(coordinatorEnv.DSH_LAYERFS_PROJECT, 'the coordinator still receives the LayerFS facts')

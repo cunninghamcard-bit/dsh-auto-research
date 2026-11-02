@@ -32,7 +32,7 @@ import {
   validatePortfolio,
   writeSharedContextAtomic,
 } from './protocols.js'
-import { buildWorkerPrompt, workerPolicy } from './policies.js'
+import { buildWorkerPrompt, materializeWorkerFiles, removeWorkerFiles } from './skills.js'
 import type {
   BatchResult,
   Clock,
@@ -1200,17 +1200,10 @@ export class Runner {
         sharedContextPath = targetFile
       }
 
-      let handoff: { from: string; text: string; path?: string } | null = null
+      let handoff: { from: string; text: string } | null = null
       if ((phase === 'continue' || resume) && typeof parent.last_output === 'string' && parent.last_output.trim() !== '') {
-        // `.auto-research-methods` is omitted from every inventory, so the note
-        // is never evaluated, shared or forked into children.
-        const handoffPath = join(checkout, '.auto-research-methods', 'HANDOFF.md')
-        await fsp.mkdir(join(checkout, '.auto-research-methods'), { recursive: true })
-        await fsp.writeFile(handoffPath, parent.last_output, { mode: 0o600 })
-        handoff = { from: parent.id, text: parent.last_output, path: handoffPath }
-      }
-      if (state.staging) {
-        state.prelaunchInventory = await inventory(checkout)
+        handoff = { from: parent.id, text: parent.last_output }
+        await fsp.writeFile(join(folder, 'HANDOFF.md'), parent.last_output, { mode: 0o600 })
       }
 
       const branchEnv: Record<string, string> = { ...this.workerEnv }
@@ -1223,24 +1216,7 @@ export class Runner {
       if (state.sandboxPath) branchEnv.DSH_AUTO_RESEARCH_SANDBOX_PATH = state.sandboxPath
       branchEnv.DSH_AUTO_RESEARCH_CHECKOUT = checkout
 
-      const prompt = buildWorkerPrompt({
-        plan: this.plan,
-        parent: publicRow(parent),
-        checkout,
-        phase,
-        view,
-        options: this.options,
-        cooperation: cooperation
-          ? { index, count: cooperation.count, target, seconds }
-          : null,
-        peer,
-        env: branchEnv,
-        provider: this.workerProvider,
-        policy: workerPolicy({ cooperation: Boolean(cooperation) }),
-        seconds,
-        handoff,
-        sharedContext: sharedContextPath,
-      })
+      const prompt = buildWorkerPrompt({ plan: this.plan, checkout })
       await writeJsonAtomic(join(folder, 'LAUNCH.json'), {
         phase,
         parent: parent.id,
@@ -1257,7 +1233,7 @@ export class Runner {
         worker_agent_options: this.workerAgentOptions,
         environment: Object.keys(branchEnv),
         handoff_from: handoff?.from ?? null,
-        handoff_path: handoff?.path ?? null,
+        handoff_path: handoff ? join(folder, 'HANDOFF.md') : null,
         shared_context: sharedContextPath,
         workspace_branch: state.branch,
         sandbox_path: state.sandboxPath,
@@ -1269,6 +1245,41 @@ export class Runner {
       })
       if (providerSeconds <= 0) {
         throw new Error('No provider window remains after reserving evaluation')
+      }
+
+      const unixNow = Date.now() / 1000
+      const rsiTop = this.options.rsiTop && phase === 'explore'
+      const workerFiles = await materializeWorkerFiles(checkout, {
+        branch: {
+          schema: 1,
+          run_id: this.runId,
+          branch_id: basename(folder),
+          phase,
+          parent: parent.id,
+          checkout,
+          layerfs_branch: state.branch ?? null,
+          sandbox_path: state.sandboxPath ?? null,
+          deadline_unix: Math.floor(unixNow + providerSeconds),
+          provider_seconds: providerSeconds,
+          evaluation_reserve_seconds: cooperation ? this.plan.evaluation_seconds : 0,
+          share_target_unix: cooperation ? Math.floor(unixNow + target) : null,
+          handoff: handoff ? { from: handoff.from, path: '.auto-research-methods/HANDOFF.md' } : null,
+          rsi_top: rsiTop ? { portfolio_size: this.plan.portfolio_size, metric_view: view } : null,
+          cooperation: cooperation
+            ? {
+              index,
+              count: cooperation.count,
+              peer_evidence: peer ? { path: peer.path, sha256: peer.digest, peer_ids: peer.ids } : null,
+              shared_context: sharedContextPath,
+            }
+            : null,
+          environment: Object.keys(branchEnv),
+        },
+        marker: { run_id: this.runId, branch_id: basename(folder), created_at: new Date().toISOString() },
+        handoff: handoff?.text ?? null,
+      })
+      if (state.staging) {
+        state.prelaunchInventory = await inventory(checkout)
       }
 
       const started = Date.now()
@@ -1333,6 +1344,8 @@ export class Runner {
       } finally {
         clearTimeout(timer)
         workerRegistration?.dispose()
+        // Runner-written files never reach evaluation or a LayerFS commit.
+        await removeWorkerFiles(checkout, workerFiles)
       }
       // A Sandbox-internal worker edits `/workspaces/<n>`, not the host
       // staging copy: fold its committed overlay back before evaluating.
@@ -1376,7 +1389,7 @@ export class Runner {
         provider_outcome: outcome,
         time: Date.now(),
         last_output: assistantText,
-        ...(handoff?.path ? { handoff_path: handoff.path } : {}),
+        ...(handoff ? { handoff_path: join(folder, 'HANDOFF.md') } : {}),
         evaluation: completed
           ? await this.evaluator.evaluate(checkout, folder, {
             ...(cooperation ? { deadline: cooperation.deadline } : {}),

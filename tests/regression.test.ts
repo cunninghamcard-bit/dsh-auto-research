@@ -19,7 +19,6 @@ import {
   WorkerEnvRegistry,
   acquireRunnerLock,
   declaredWorkerEnvKeys,
-  isInsideRuntimeRuns,
   resolveConfig,
   sessionIdOf,
 } from '../lib/provider.js'
@@ -245,7 +244,7 @@ export class LayerFS {
         const runs = await readdir(join(cwd, '.auto-research-methods', 'runs'))
         const config = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'runs', runs[0]!, 'CONFIG.json'), 'utf8'))
         assert.equal(config.layerfs, false)
-        assert.doesNotMatch(subagents.calls[0].request.prompt[0].text, /DSH_LAYERFS_PROJECT/)
+        assert.equal(subagents.calls[0].branch.environment.includes('DSH_LAYERFS_PROJECT'), false)
         const latest = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'LATEST.json'), 'utf8'))
         assert.equal(latest.leader_branch, null, 'the snapshot backend has no LayerFS branch')
         await handle.dispose()
@@ -1130,54 +1129,49 @@ describe('R8: the runner lock precedes every artifact write', () => {
 })
 
 describe('R9: recursive delegation is refused', () => {
-  it('rejects a call whose parent is already a subagent', async () => {
+  it('rejects a call from inside a checkout that carries the worker marker', async () => {
     await withTemp(async root => {
       const { cwd, provider } = await providerFixture(root)
+      const branch = join(root, 'branch')
+      await mkdir(join(branch, '.auto-research-methods'), { recursive: true })
+      await writeFile(join(branch, '.auto-research-methods', 'WORKER.json'), '{}\n')
+      await mkdir(join(branch, 'src'), { recursive: true })
+      await assert.rejects(
+        provider.start({ cwd: join(branch, 'src'), prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }),
+        /cannot be called recursively by a worker subagent/,
+      )
+      // The coordinator's own checkout carries no marker and is not refused for it.
+      const handle = await provider.start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal })
+      await handle.result
+      await handle.dispose()
+    })
+  })
+
+  it('rejects a call from a live worker child session', async () => {
+    await withTemp(async root => {
+      const { cwd, provider } = await providerFixture(root)
+      const registration = provider.workerEnvs.register({ id: 'w', checkout: join(root, 'elsewhere'), childSessionId: 'child-1' })
       await assert.rejects(
         provider.start({
           cwd,
           prompt: [],
-          parent: { id: 'p', session: { header: { id: 'child', origin: 'subagent' } } },
+          parent: { id: 'p', session: { header: { id: 'child-1' } } },
           signal: new AbortController().signal,
         }),
         /cannot be called recursively by a worker subagent/,
       )
-    })
-  })
-
-  it('rejects a call from inside a live worker checkout or a runs/ tree', async () => {
-    await withTemp(async root => {
-      const { cwd, provider } = await providerFixture(root)
-      const registration = provider.workerEnvs.register({ id: 'w', checkout: cwd, env: {} })
-      await assert.rejects(
-        provider.start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }),
-        /cannot be called recursively by a worker subagent/,
-      )
       registration.dispose()
-      const runtime = join(cwd, '.auto-research-methods', 'runs', 'abc', 'round-1', 'workspace')
-      await assert.rejects(
-        provider.start({ cwd: runtime, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }),
-        /cannot be called recursively by a worker subagent/,
-      )
-      assert.equal(isInsideRuntimeRuns(runtime), true)
-      assert.equal(isInsideRuntimeRuns(cwd), false)
     })
   })
 
-  it('tells branch workers not to delegate or edit the plan', async () => {
-    const { DSH_COORDINATOR_ADDENDUM, buildWorkerPrompt } = await import('../lib/policies.js')
-    assert.match(DSH_COORDINATOR_ADDENDUM, /DSH_AUTO_RESEARCH_WORKER=1/)
-    assert.match(DSH_COORDINATOR_ADDENDUM, /never call `subagent_auto_research`/)
-    assert.match(DSH_COORDINATOR_ADDENDUM, /\.auto-research-methods\/plan\.json/)
-    const prompt = buildWorkerPrompt({
-      plan: { worker_prompt: 'Do work.', objective: 'o' },
-      checkout: '/tmp/ar/branch-1',
-      phase: 'continue',
-    })
+  it('tells branch workers where their instructions are', async () => {
+    const { buildWorkerPrompt, skillFile } = await import('../lib/skills.js')
+    const prompt = buildWorkerPrompt({ plan: { worker_prompt: 'Do work.', objective: 'o' }, checkout: '/tmp/ar/branch-1' })
     assert.match(prompt, /Work only in this branch: \/tmp\/ar\/branch-1/)
-    assert.match(prompt, /You are a branch worker/)
-    assert.match(prompt, /Never call subagent_auto_research/)
-    assert.match(prompt, /never modify \.auto-research-methods\/plan\.json/)
+    assert.ok(prompt.includes(skillFile('auto-research-worker')))
+    const skill = await readFile(skillFile('auto-research-worker'), 'utf8')
+    assert.match(skill, /Never call `subagent_auto_research`/)
+    assert.match(skill, /never edit `\.auto-research-methods\/plan\.json`/)
   })
 })
 
@@ -1799,12 +1793,10 @@ export class LayerFS {
     assert.equal(good.value.rounds, 2)
   })
 
-  it('reports the coordinator session id and runtime-run containment helpers', () => {
+  it('reports the coordinator session id', () => {
     assert.equal(sessionIdOf({ session: { header: { id: 's-1' } } }), 's-1')
     assert.equal(sessionIdOf({ session: { header: {} } }), null)
     assert.equal(sessionIdOf(null), null)
-    assert.equal(isInsideRuntimeRuns(join('/tmp', 'repo', '.auto-research-methods', 'runs', 'id')), true)
-    assert.equal(isInsideRuntimeRuns(join('/tmp', 'repo', '.auto-research-methods', 'plan.json')), false)
   })
 })
 

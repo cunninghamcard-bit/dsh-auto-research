@@ -87,6 +87,8 @@ export interface WorkerEnvRegistration {
 export declare class WorkerEnvRegistry {
     private readonly entries;
     private nextKey;
+    /** Called whenever a worker starts or stops (the skill catalog depends on it). */
+    onChange: (() => void) | null;
     private readonly resolveCwd;
     constructor(options?: {
         /** Resolve the per-session assigned checkout (`ctx.workingDirectory.get`). */
@@ -95,6 +97,8 @@ export declare class WorkerEnvRegistry {
     get size(): number;
     /** @returns every checkout that currently has a live worker. */
     checkouts(): string[];
+    /** Whether `sessionId` is the child session of a live worker. */
+    hasChildSession(sessionId: string): boolean;
     /** Whether `path` is one of the live worker checkouts (or inside it). */
     ownsCheckout(path: string): boolean;
     register({ id, checkout, parentSessionId, childSessionId, env, }: {
@@ -111,8 +115,6 @@ export declare class WorkerEnvRegistry {
 }
 /** The runtime session id of a live agent, when the host exposes one. */
 export declare function sessionIdOf(agent: unknown): string | null;
-/** Whether `path` sits inside a `.auto-research-methods/runs/` runtime tree. */
-export declare function isInsideRuntimeRuns(path: string): boolean;
 /** `dsh`-owned names that a plugin contributor may never claim. */
 export declare const DSH_RESERVED_ENV_KEYS: Set<string>;
 /**
@@ -205,9 +207,10 @@ export declare class AutoResearchProvider implements SubagentProvider {
      * Refuse `subagent_auto_research` from a branch worker.
      *
      * A worker already owns one branch of a running batch: delegating another
-     * batch from inside it would recurse forever, race the runner lock of its own
-     * checkout, and corrupt `plan.json`. A delegation whose cwd is a live worker
-     * checkout or any `runs/` runtime tree is rejected the same way.
+     * batch from inside it would recurse and race the runner lock. Two signals,
+     * either sufficient: the cwd is inside a checkout carrying the runner's
+     * `.auto-research-methods/WORKER.json` marker, or the caller's session is a
+     * live worker's child session.
      */
     private assertNotRecursive;
     /**

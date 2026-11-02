@@ -10,14 +10,33 @@
 
 | Cordis 行 | 作用 |
 | --- | --- |
-| `subagent-auto-research` | 注册 `auto-research` provider 与协调者提示词段落 |
+| `subagent-auto-research` | 注册 `auto-research` provider 与 `auto-research` / `auto-research-worker` 两个 skill |
 | `tool-subagent-auto-research` | 通过 `@deepseek-ai/dsh-tool-subagent` 暴露 `subagent_auto_research`，深度由 provider 管理 |
 
-协调者会收到研究策略、方法策略与继续策略组成的系统提示词段落。它检查仓库、编写计划、委派一个批次，然后审阅 `RESULT.json`、`DASHBOARD.json`、`LEADER.json`、`SELECTIONS.json` 以及协作证据，再决定是否运行下一批。
+协调者加载 `auto-research` skill。它检查仓库、编写计划、委派一个批次，然后审阅 `RESULT.json`、`DASHBOARD.json`、`LEADER.json`、`SELECTIONS.json` 以及协作证据，再决定是否运行下一批。
+
+
+## Skills
+
+所有面向模型的指令都以 skill 形式放在 [`skills/`](skills)，插件不注入任何系统提示词。插件把两个 skill 注册到 `skills` 服务（`@deepseek-ai/dsh-skill`），profile 必须加载该服务：
+
+| Skill | 在哪些 cwd 列出 | 内容 |
+| --- | --- | --- |
+| `auto-research` | 分支 checkout 之外的所有 cwd | 协调者流程、plan 结构、evaluator 契约、审阅 |
+| `auto-research-worker` | 存活分支 checkout 内的 cwd（用户不可调用） | 分支规则、`BRANCH.json` 字段、RSI-top portfolio、协作 epoch |
+
+worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以及指向 worker skill 和 `.auto-research-methods/BRANCH.json` 的说明组成。启动前 runner 在 checkout 中写入：
+
+- `.auto-research-methods/BRANCH.json`：run 与分支 id、阶段、父分支、LayerFS 分支、截止时间、provider 秒数、`handoff`、`rsi_top`（portfolio 大小与完整指标视图）、`cooperation`（同伴证据、共享上下文）、环境变量名。
+- `.auto-research-methods/WORKER.json`：标识 worker checkout 的标记。
+- 分支续接父分支时的 `.auto-research-methods/HANDOFF.md`。
+- `.claude/skills/auto-research-worker/SKILL.md` 与 `.agents/skills/auto-research-worker/SKILL.md`，供外部 CLI worker（`claude-code`、`codex`）从 checkout 中发现 worker skill。
+
+这些文件在 activation 结束时、评估与提交之前全部删除；`.agents` 不计入 inventory。
 
 ## 安装
 
-把该 bundle 加入 DSH profile（插件管理器会读取 `dsh.bundle.patch`），或手动把 [`cordis.patch.yml`](cordis.patch.yml) 中的两行插入 profile patch。下面的代码块与该文件逐字一致；配置表列的是代码默认值，profile 中的配置会覆盖它们。provider 需要至少一个其他已注册的 `ctx.subagents` provider 来执行 worker（`claude-code`、`codex`、`acp`、`dsh-sdk`、`spawn` 等）。存在多个候选时请显式设置 `workerProvider`。
+把该 bundle 加入 DSH profile（插件管理器会读取 `dsh.bundle.patch`），或手动把 [`cordis.patch.yml`](cordis.patch.yml) 中的两行插入 profile patch。下面的代码块与该文件逐字一致；配置表列的是代码默认值，profile 中的配置会覆盖它们。插件注入 `skills` 服务，profile 必须加载 `@deepseek-ai/dsh-skill` 与 `@deepseek-ai/dsh-tool-skill`（DSH base bundle 已包含）。provider 需要至少一个其他已注册的 `ctx.subagents` provider 来执行 worker（`claude-code`、`codex`、`acp`、`dsh-sdk`、`spawn` 等）。存在多个候选时请显式设置 `workerProvider`。
 
 ```yaml
 - insert:
@@ -152,7 +171,7 @@ provider 从 `config.layerfs`、`process.env` 与会话的 `ctx.shellEnv` contri
 
 - 用户原始 checkout 永远不会被评估或修改；分支是拷贝或 CoW 挂载。
 - 共享检查点拒绝符号链接、路径穿越、点文件（`.method-evaluation` 除外）、私有凭据文件名以及疑似凭据内容。
-- Worker 提示词禁止递归派生与发布/合并。
+- worker skill 禁止递归派生与发布/合并；provider 也会拒绝来自 worker checkout 或存活 worker 子会话的 `subagent_auto_research` 调用。
 - 序列化前会清理配置；疑似机密的环境变量键不会写入。
 - 不会自动合并、重置、覆盖、删除或发布。
 - 批次边界不能证明用户目标已完成，也不能证明存在基准提升。
@@ -171,7 +190,7 @@ npm test
 
 ## 限制
 
-- worker 的 provider session 会被记录，但通用 `startActivation` 接口无法恢复会话；续跑依靠 handoff：上一轮的助手输出写进下一轮提示词和 `.auto-research-methods/HANDOFF.md`。`LAUNCH.json` 记录 `continuation: "handoff"`（全新分支为 `"none"`）。
+- worker 的 provider session 会被记录，但通用 `startActivation` 接口无法恢复会话；续跑依靠 handoff：上一轮的助手输出写入下一轮 checkout 的 `.auto-research-methods/HANDOFF.md`（由 `BRANCH.json` 的 `handoff` 指出），run 目录在 `<branch>/HANDOFF.md` 留一份副本。`LAUNCH.json` 记录 `continuation: "handoff"`（全新分支为 `"none"`）。
 - Sandbox 内部的 LayerFS 挂载通过宿主暂存目录桥接；超大工作区需要复制成本。二进制文件通过 `workspace.exec` 原样复制，无法复制时跳过并告警，且不会被删除。
 - 协作 epoch 复用分支工作区，要求 worker 在共享窗口内完成；硬性阶段截止时间仍然生效。
 - 评估器必须是本地可执行脚本；除已接受的工作区与清单检查外没有额外沙箱。

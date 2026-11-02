@@ -46,6 +46,7 @@ export const OMIT = new Set([
   '.method-evaluation',
   '.codex',
   '.claude',
+  '.agents',
   '.aws',
   '.ssh',
   '.azure',

@@ -10,14 +10,32 @@ Stack: strict TypeScript (ES2024, compiled to `lib/` with declarations and sourc
 
 | Cordis row | Contribution |
 | --- | --- |
-| `subagent-auto-research` | Registers the `auto-research` provider and the coordinator prompt section |
+| `subagent-auto-research` | Registers the `auto-research` provider and the `auto-research` / `auto-research-worker` skills |
 | `tool-subagent-auto-research` | Exposes `subagent_auto_research` through `@deepseek-ai/dsh-tool-subagent` with provider-managed depth |
 
-The coordinator receives the research policy, methods policy, and continuation policy as a system-prompt section. It inspects the repository, writes a plan, delegates one batch, then reviews `RESULT.json`, `DASHBOARD.json`, `LEADER.json`, `SELECTIONS.json`, and any cooperative evidence before deciding whether another batch is justified.
+The coordinator loads the `auto-research` skill. It inspects the repository, writes a plan, delegates one batch, then reviews `RESULT.json`, `DASHBOARD.json`, `LEADER.json`, `SELECTIONS.json`, and any cooperative evidence before deciding whether another batch is justified.
+
+## Skills
+
+Every model-facing instruction ships as a skill under [`skills/`](skills); the plugin injects no system-prompt text. The plugin registers both skills with the `skills` service (`@deepseek-ai/dsh-skill`), which the profile must load:
+
+| Skill | Listed for | Content |
+| --- | --- | --- |
+| `auto-research` | every cwd outside a branch checkout | coordinator workflow, plan schema, evaluator contract, review |
+| `auto-research-worker` | cwds inside a live branch checkout (not user-invocable) | branch rules, `BRANCH.json` fields, RSI-top portfolio, cooperative epochs |
+
+A worker's prompt is the plan's `worker_prompt`, the objective, the checkout, and a pointer to the worker skill and to `.auto-research-methods/BRANCH.json`. Before launch the runner writes into the checkout:
+
+- `.auto-research-methods/BRANCH.json`: run and branch ids, phase, parent, LayerFS branch, deadline, provider seconds, `handoff`, `rsi_top` (portfolio size and the full metric view), `cooperation` (peer evidence, shared context), environment keys.
+- `.auto-research-methods/WORKER.json`: the marker that identifies a worker checkout.
+- `.auto-research-methods/HANDOFF.md` when the branch continues a parent.
+- `.claude/skills/auto-research-worker/SKILL.md` and `.agents/skills/auto-research-worker/SKILL.md`, so external CLI workers (`claude-code`, `codex`) discover the worker skill from the checkout.
+
+All of these are removed when the activation ends, before evaluation and commit; `.agents` is excluded from inventories.
 
 ## Install
 
-Add the bundle to a DSH profile (the plugin manager reads `dsh.bundle.patch`), or insert the two rows from [`cordis.patch.yml`](cordis.patch.yml) into the profile patch manually. The block below is that file verbatim; the configuration table lists the code defaults, which a profile row overrides. The provider expects at least one other registered `ctx.subagents` provider to execute workers (`claude-code`, `codex`, `acp`, `dsh-sdk`, `spawn`, …). Set `workerProvider` when the profile has more than one candidate.
+Add the bundle to a DSH profile (the plugin manager reads `dsh.bundle.patch`), or insert the two rows from [`cordis.patch.yml`](cordis.patch.yml) into the profile patch manually. The block below is that file verbatim; the configuration table lists the code defaults, which a profile row overrides. The plugin injects the `skills` service, so the profile must load `@deepseek-ai/dsh-skill` and `@deepseek-ai/dsh-tool-skill` (the DSH base bundle does). The provider expects at least one other registered `ctx.subagents` provider to execute workers (`claude-code`, `codex`, `acp`, `dsh-sdk`, `spawn`, …). Set `workerProvider` when the profile has more than one candidate.
 
 ```yaml
 - insert:
@@ -152,7 +170,7 @@ Real LayerFS mounts return a Sandbox-internal path such as `/workspaces/1`. When
 
 - The user's original checkout is never evaluated or mutated; branches are copies or CoW mounts.
 - Symlinks, path traversal, dotfiles (except `.method-evaluation`), private credential names, and credential-looking evidence are rejected from shared checkpoints.
-- Worker prompts forbid recursive spawning and publishing/merging.
+- The worker skill forbids recursive spawning and publishing/merging; the provider also rejects `subagent_auto_research` calls from a worker checkout or a live worker child session.
 - Config is sanitized before serialization; secret-looking environment keys are not written.
 - No automatic merge, reset, overwrite, deletion, or publication occurs.
 - A batch boundary is not proof that the user's objective is complete or that a benchmark gain exists.
@@ -169,7 +187,7 @@ The `node:test` suite covers protocols (full RSI views, reservoir sampling, port
 
 ## Limitations
 
-- The generic `startActivation` seam cannot resume a provider's own CLI session. Continuation is the handoff: each turn is archived in `provider.jsonl`, and the previous assistant output is passed to the next worker in the prompt and in `.auto-research-methods/HANDOFF.md`. `LAUNCH.json` records `continuation: "handoff"` (or `"none"` for a fresh branch).
+- The generic `startActivation` seam cannot resume a provider's own CLI session. Continuation is the handoff: each turn is archived in `provider.jsonl`, and the previous assistant output is written to `.auto-research-methods/HANDOFF.md` in the next worker's checkout (named by `BRANCH.json` `handoff`); the run folder keeps a copy at `<branch>/HANDOFF.md`. `LAUNCH.json` records `continuation: "handoff"` (or `"none"` for a fresh branch).
 - Sandbox-internal LayerFS mounts are bridged through a host staging directory; very large workspaces pay a copy cost. Binary adopted files that `fs.read` refuses are copied through `workspace.exec` + `base64`; when that is unavailable they are skipped with a warning and never removed from the branch.
 - Cooperative epochs reuse a branch workspace and require the worker to finish within the share window; the hard phase deadline still applies.
 - The evaluator must be a local executable script; there is no built-in sandbox beyond the accepted workspace and inventory checks.

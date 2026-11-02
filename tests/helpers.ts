@@ -1,3 +1,4 @@
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -44,6 +45,12 @@ export function fakeClock(start = 1000): FakeClock {
  * The structural host surface is intentionally loose (`any`) here: tests build
  * partial Cordis contexts and assert on the recorded calls.
  */
+/** The worker's `.auto-research-methods/BRANCH.json`, or null outside a branch checkout. */
+export function readBranch(cwd: string | undefined): any {
+  const file = cwd ? join(cwd, '.auto-research-methods', 'BRANCH.json') : ''
+  return file && existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : null
+}
+
 export function fakeSubagents(
   handler: (spec: any, index: number) => any,
   names: string[] = ['worker'],
@@ -56,8 +63,11 @@ export function fakeSubagents(
   return {
     calls,
     list: () => [...names],
-    async startActivation(spec: any) {
+    async startActivation(input: any) {
       const index = calls.length
+      // The branch parameters are removed when the activation ends, so each
+      // call keeps the BRANCH.json its worker saw.
+      const spec = { ...input, branch: readBranch(input.request?.cwd) }
       calls.push(spec)
       let value: any
       try {

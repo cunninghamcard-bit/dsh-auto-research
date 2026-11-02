@@ -1,8 +1,8 @@
 /**
  * Cordis entry point for the `dsh-auto-research` bundle.
  *
- * The plugin registers the `auto-research` SubagentProvider and a stable
- * coordinator prompt section. Model-facing tools are installed by
+ * The plugin registers the `auto-research` SubagentProvider and the packaged
+ * skills on `ctx.skills`. Model-facing tools are installed by
  * `cordis.patch.yml` through `@deepseek-ai/dsh-tool-subagent`.
  */
 
@@ -13,13 +13,11 @@ import {
   layerfsWorkspacePlugin,
   snapshotWorkspacePlugin,
 } from './layerfs-workspace.js'
-import { coordinatorPolicy } from './policies.js'
+import { registerSkills } from './skills.js'
 import type { Config as PluginConfig, PluginContext, ResolvedConfig } from './types.js'
 
 export const name = 'dsh-auto-research'
-export const inject: string[] = ['subagents', 'systemPrompt']
-
-const PLACEMENT = 'PLAN_POLICY'
+export const inject: string[] = ['subagents', 'skills']
 
 /**
  * Standard-schema compatible config. Using the plain standard interface keeps
@@ -43,7 +41,7 @@ export const Config = Object.freeze({
 
 /**
  * Register the `autoResearch` service, concrete workspace backend plugins, the
- * `auto-research` SubagentProvider, and coordinator guidance.
+ * `auto-research` SubagentProvider, and the packaged skills.
  */
 export function apply(ctx: PluginContext, config?: PluginConfig): void {
   const resolved = resolveConfig(config)
@@ -58,24 +56,12 @@ export function apply(ctx: PluginContext, config?: PluginConfig): void {
   snapshotWorkspacePlugin.apply(ctx)
 
   const disposeProvider = ctx.subagents.registerProvider?.(provider)
-  const prompt = ctx.systemPrompt
-  let disposeSection: unknown = null
-  if (prompt) {
-    const order = typeof prompt.getSectionOrder === 'function'
-      ? prompt.getSectionOrder(PLACEMENT) ?? 500
-      : 500
-    disposeSection = prompt.section({
-      name: 'auto-research:coordinator',
-      order,
-      interpolate: false,
-      text: coordinatorPolicy(),
-    })
-  }
+  const skills = registerSkills(ctx.skills!, cwd => provider.workerEnvs.ownsCheckout(cwd))
+  provider.workerEnvs.onChange = skills.invalidate
   const effectFn = (ctx as { effect?: (cb: () => () => void) => void }).effect
   if (typeof effectFn === 'function') {
     try {
       effectFn(() => () => {
-        if (typeof disposeSection === 'function') (disposeSection as () => void)()
         if (typeof disposeProvider === 'function') (disposeProvider as () => void)()
         provider.dispose()
       })
@@ -93,7 +79,6 @@ export {
   layerfsWorkspacePlugin,
   snapshotWorkspacePlugin,
   resolveConfig,
-  coordinatorPolicy,
 }
 export type {
   AutoResearchService,
@@ -103,11 +88,9 @@ export type {
   WorkspaceBackendFactory,
 } from './types.js'
 export {
-  RESEARCH_POLICY,
-  RESEARCH_METHODS_POLICY,
-  CONTINUE_POLICY,
-  SHARED_CONTEXT_POLICY,
-  DSH_COORDINATOR_ADDENDUM,
+  COORDINATOR_SKILL,
+  SKILLS_ROOT,
+  WORKER_SKILL,
   buildWorkerPrompt,
-  workerPolicy,
-} from './policies.js'
+  skillFile,
+} from './skills.js'

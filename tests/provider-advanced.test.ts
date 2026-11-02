@@ -137,9 +137,9 @@ describe('P0: LayerFS environment from ctx.shellEnv', () => {
         const result = await handle.result
         assert.equal(result.stopReason, 'completed')
         assert.equal(subagents.calls.length, 1)
-        const prompt = subagents.calls[0].request.prompt[0].text
-        assert.match(prompt, /"DSH_LAYERFS_PROJECT":"shell-project"/)
-        assert.match(prompt, /"DSH_LAYERFS_IMAGE":"image:test"/)
+        const environment = subagents.calls[0].branch.environment
+        assert.ok(environment.includes('DSH_LAYERFS_PROJECT'))
+        assert.ok(environment.includes('DSH_LAYERFS_IMAGE'))
         const latest = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'LATEST.json'), 'utf8'))
         assert.match(latest.leader_branch, /^ar-/)
         const runs = await readdir(join(cwd, '.auto-research-methods', 'runs'))

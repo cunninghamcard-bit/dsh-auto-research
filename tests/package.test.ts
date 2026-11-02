@@ -94,7 +94,7 @@ describe('package metadata', () => {
       'layerfs-workspace.ts',
       'evaluator.ts',
       'protocols.ts',
-      'policies.ts',
+      'skills.ts',
       'types.ts',
     ]
     for (const name of sources) {
@@ -120,7 +120,7 @@ describe('package metadata', () => {
     assert.equal(tsconfig.compilerOptions.rootDir, 'src')
     assert.equal(tsconfig.compilerOptions.outDir, 'lib')
     assert.match(tsconfig.compilerOptions.target, /^es2024$/i)
-    for (const test of ['protocols', 'evaluator', 'workspace', 'runner', 'provider', 'policies', 'package']) {
+    for (const test of ['protocols', 'evaluator', 'workspace', 'runner', 'provider', 'skills', 'package']) {
       assert.equal((await stat(join(root, `tests/${test}.test.ts`))).isFile(), true, test)
     }
     const testFiles = await readdir(join(root, 'tests'))
@@ -213,24 +213,12 @@ describe('package metadata', () => {
   })
 })
 
-describe('source policies', () => {
-  it('contains the ported policies verbatim and the dsh addendum', async () => {
-    const {
-      RESEARCH_POLICY,
-      RESEARCH_METHODS_POLICY,
-      CONTINUE_POLICY,
-      SHARED_CONTEXT_POLICY,
-      DSH_COORDINATOR_ADDENDUM,
-    } = await import('../lib/policies.js')
-    assert.match(RESEARCH_POLICY, /^You are the research agent inside Auto Research/)
-    assert.match(RESEARCH_POLICY, /RESEARCH_STATUS: needs_input/)
-    assert.match(RESEARCH_METHODS_POLICY, /^# Optional research methods/)
-    assert.match(RESEARCH_METHODS_POLICY, /## Collaborative evidence sharing/)
-    assert.match(CONTINUE_POLICY, /^Continue the research from this session's evidence/)
-    assert.match(CONTINUE_POLICY, /phase_budget_reached/)
-    assert.match(SHARED_CONTEXT_POLICY, /compact checkpoints verbatim/)
-    assert.match(SHARED_CONTEXT_POLICY, /Do not invent a successful result/)
-    assert.match(DSH_COORDINATOR_ADDENDUM, /subagent_auto_research/)
-    assert.match(DSH_COORDINATOR_ADDENDUM, /\.auto-research-methods\/plan\.json/)
+describe('packaged skills', () => {
+  it('ships both SKILL.md files in the published package', async () => {
+    const pkg = await json('package.json')
+    assert.ok(pkg.files.includes('skills'))
+    for (const name of ['auto-research', 'auto-research-worker']) {
+      assert.equal((await stat(join(root, 'skills', name, 'SKILL.md'))).isFile(), true, name)
+    }
   })
 })
