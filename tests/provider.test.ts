@@ -181,6 +181,19 @@ describe('plugin entry', () => {
 })
 
 describe('AutoResearchProvider', () => {
+  it('rejects an invalid plan before taking the lock or creating a run', async () => {
+    await withTemp(async root => {
+      const { cwd, provider, subagents } = await fixture(root, { plan: { worker_prompt: '' } })
+      await assert.rejects(provider.start({
+        cwd,
+        prompt: [{ type: 'text', text: 'start the batch' }],
+        parent: { id: 'parent' },
+      }), /Plan requires a worker_prompt/)
+      assert.deepEqual((await readdir(join(cwd, '.auto-research-methods'))).sort(), ['plan.json'])
+      assert.equal(subagents.calls.length, 0)
+    })
+  })
+
   it('runs one batch from a plan file and settles through result', async () => {
     await withTemp(async root => {
       const { cwd, provider, subagents } = await fixture(root)

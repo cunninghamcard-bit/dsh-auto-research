@@ -16,6 +16,18 @@ export declare class ResearchStoppedError extends Error {
     constructor(message?: string);
 }
 declare const DEFAULT_CLOCK: Clock;
+/**
+ * Stall state carried across batches in `LATEST.json`.
+ *
+ * The coordinator delegates one batch at a time, so a per-batch clock would
+ * never reach `stall_seconds` with `rounds: 1`. Only phase work time counts;
+ * the time between batches does not.
+ */
+export interface Frontier {
+    evaluator_sha256: string | null;
+    anchor_score: string | null;
+    stalled_work_seconds: number;
+}
 /** Merge plan-level option overrides over plugin configuration. */
 export declare function normalizeOptions(config?: Config, plan?: ResearchPlanInput): ResearchOptions;
 /** Merge config-level, plan-level, and request-level child LLM selection options. */
@@ -72,7 +84,9 @@ export declare class Runner {
     readonly selections: Array<Record<string, unknown>>;
     peerBundle: string | null;
     readonly peerSlots: Record<string, PeerSlot>;
-    bestTime: number;
+    /** Phase work seconds since the last meaningful gain, across batches. */
+    stalledWorkSeconds: number;
+    readonly savedFrontier: Frontier | null;
     anchor: number | null;
     cancelled: boolean;
     readonly abort: AbortController;
@@ -92,13 +106,14 @@ export declare class Runner {
     readonly releasedStates: Set<WorkspaceState>;
     readonly workerGraceMs: number;
     private managerClosed;
-    constructor({ config, plan, workspace, output, originalManifest, selectionFile, deps, }: {
+    constructor({ config, plan, workspace, output, originalManifest, selectionFile, frontier, deps, }: {
         config?: Config;
         plan: unknown;
         workspace: string;
         output: string;
         originalManifest?: Record<string, string> | null;
         selectionFile?: string | null;
+        frontier?: Frontier | null;
         deps: RunnerDeps;
     });
     now(): number;

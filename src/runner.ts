@@ -87,6 +87,19 @@ const DEFAULT_CLOCK: Clock = {
   }),
 }
 
+/**
+ * Stall state carried across batches in `LATEST.json`.
+ *
+ * The coordinator delegates one batch at a time, so a per-batch clock would
+ * never reach `stall_seconds` with `rounds: 1`. Only phase work time counts;
+ * the time between batches does not.
+ */
+export interface Frontier {
+  evaluator_sha256: string | null
+  anchor_score: string | null
+  stalled_work_seconds: number
+}
+
 /** How long a worker activation may take to settle after its signal aborts. */
 const DEFAULT_WORKER_GRACE_MS = 2000
 
@@ -409,7 +422,9 @@ export class Runner {
   readonly selections: Array<Record<string, unknown>> = []
   peerBundle: string | null = null
   readonly peerSlots: Record<string, PeerSlot> = {}
-  bestTime: number
+  /** Phase work seconds since the last meaningful gain, across batches. */
+  stalledWorkSeconds = 0
+  readonly savedFrontier: Frontier | null
   anchor: number | null = null
   cancelled = false
   readonly abort = new AbortController()
@@ -429,6 +444,7 @@ export class Runner {
     output,
     originalManifest = null,
     selectionFile = null,
+    frontier = null,
     deps,
   }: {
     config?: Config
@@ -437,6 +453,7 @@ export class Runner {
     output: string
     originalManifest?: Record<string, string> | null
     selectionFile?: string | null
+    frontier?: Frontier | null
     deps: RunnerDeps
   }) {
     this.config = config
@@ -469,7 +486,7 @@ export class Runner {
     this.evaluator = (deps.evaluator ?? new FrozenEvaluator({ plan: this.plan, output, logger: this.logger ?? null })) as RunnerDeps['evaluator'] & { hash: string | null }
     this.originalManifest = originalManifest
     this.selectionFile = selectionFile
-    this.bestTime = this.clock.now()
+    this.savedFrontier = frontier
     this.runId = deps.runId ?? basename(output)
     const grace = Number(deps.workerGraceMs)
     this.workerGraceMs = Number.isFinite(grace) && grace > 0 ? grace : DEFAULT_WORKER_GRACE_MS
@@ -840,18 +857,24 @@ export class Runner {
       throw new Error('Initial candidate failed frozen evaluation; no research workers started: ' + reason)
     }
     this.anchor = scoreValue(initial.evaluation.score)
-    this.bestTime = this.now()
+    // A frontier frozen against a different evaluator is not comparable.
+    const saved = this.savedFrontier
+    if (saved && saved.evaluator_sha256 === this.evaluator.hash && typeof saved.anchor_score === 'string') {
+      this.anchor = scoreValue(saved.anchor_score, 'frontier anchor_score')
+      this.stalledWorkSeconds = Number(saved.stalled_work_seconds) || 0
+    }
 
     let leader: TrajectoryRow = initial
     for (let roundNumber = 1; roundNumber <= options.rounds; roundNumber += 1) {
       this.checkCancelled()
-      const stalled = Boolean(options.rsiTop
-        && (this.plan.stall_seconds ?? Number.POSITIVE_INFINITY) > 0
-        && (this.now() - this.bestTime) / 1000 >= (this.plan.stall_seconds ?? Number.POSITIVE_INFINITY))
-      const explore = Boolean(options.forkAndFlush || (options.rsiTop && stalled))
+      const stalled = options.rsiTop
+        && this.plan.stall_seconds !== null
+        && this.stalledWorkSeconds >= this.plan.stall_seconds
+      const explore = options.forkAndFlush || stalled
       const phases: Phase[] = explore ? ['explore', 'continue'] : ['continue']
       for (const phase of phases) {
         this.checkCancelled()
+        const phaseStart = this.now()
         await writeJsonAtomic(join(this.output, 'DASHBOARD.json'), this.dashboard())
         const count = phase === 'explore' ? options.branches : 1
         await this.checkDisk(leader.workspace, count)
@@ -876,6 +899,7 @@ export class Runner {
         if (!candidates.some(candidate => candidate.completed)) {
           const budget = (candidates.length === 0 || candidates.every(candidate => candidate.timed_out))
           if (leader.evaluation?.valid === true && budget) {
+            this.stalledWorkSeconds += (this.now() - phaseStart) / 1000
             this.timedOutRows = candidates
             return this.finish(leader, 'phase_budget_reached', candidates)
           }
@@ -899,7 +923,9 @@ export class Runner {
         if (gain !== null && this.plan.direction === 'minimize') gain = -gain
         if (this.anchor === null || (gain !== null && gain > this.plan.meaningful_gain)) {
           this.anchor = current
-          this.bestTime = this.now()
+          this.stalledWorkSeconds = 0
+        } else {
+          this.stalledWorkSeconds += (this.now() - phaseStart) / 1000
         }
         await writeJsonAtomic(join(this.output, 'LEADER.json'), publicRow(leader))
         await this.writeSelection(leader)
@@ -917,6 +943,11 @@ export class Runner {
       original_manifest: this.originalManifest,
       run: this.output,
       updated_at: new Date().toISOString(),
+      frontier: {
+        evaluator_sha256: this.evaluator.hash,
+        anchor_score: this.anchor === null ? null : String(this.anchor),
+        stalled_work_seconds: this.stalledWorkSeconds,
+      } satisfies Frontier,
     })
   }
 
@@ -1031,8 +1062,7 @@ export class Runner {
       })
       const incomplete = candidates.some(row => !row.completed
         || row.evaluation?.valid !== true
-        || row.collaboration_failed
-        || !row.provider_session)
+        || row.collaboration_failed)
       if (incomplete) {
         const restored: TrajectoryRow[] = []
         for (let index = 0; index < candidates.length; index += 1) {
@@ -1172,7 +1202,10 @@ export class Runner {
 
       let handoff: { from: string; text: string; path?: string } | null = null
       if ((phase === 'continue' || resume) && typeof parent.last_output === 'string' && parent.last_output.trim() !== '') {
-        const handoffPath = join(checkout, '.auto-research-methods-handoff.md')
+        // `.auto-research-methods` is omitted from every inventory, so the note
+        // is never evaluated, shared or forked into children.
+        const handoffPath = join(checkout, '.auto-research-methods', 'HANDOFF.md')
+        await fsp.mkdir(join(checkout, '.auto-research-methods'), { recursive: true })
         await fsp.writeFile(handoffPath, parent.last_output, { mode: 0o600 })
         handoff = { from: parent.id, text: parent.last_output, path: handoffPath }
       }
@@ -1211,7 +1244,9 @@ export class Runner {
       await writeJsonAtomic(join(folder, 'LAUNCH.json'), {
         phase,
         parent: parent.id,
-        fresh_context: !session,
+        // The subagent seam cannot resume a provider session; continuity is
+        // the handoff note plus the worker's own RESEARCH_HANDOFF.md.
+        continuation: handoff ? 'handoff' : 'none',
         provider_session: session,
         seconds,
         metric_view: view,

@@ -23,6 +23,18 @@ async function walkFiles(directory: string): Promise<string[]> {
   return files
 }
 
+describe('README install examples', () => {
+  it('reproduce cordis.patch.yml verbatim in both languages', async () => {
+    const patch = (await readFile(join(root, 'cordis.patch.yml'), 'utf8'))
+      .split('\n').filter(line => !line.startsWith('#')).join('\n').trim()
+    for (const [file, heading] of [['README.md', '## Install'], ['README.zh.md', '## 安装']] as const) {
+      const text = await readFile(join(root, file), 'utf8')
+      const start = text.indexOf('```yaml\n', text.indexOf(heading)) + '```yaml\n'.length
+      assert.equal(text.slice(start, text.indexOf('```', start)).trim(), patch, file)
+    }
+  })
+})
+
 describe('package metadata', () => {
   it('declares the compiled ESM bundle, icon, locale exports, and build scripts', async () => {
     const pkg = await json('package.json')

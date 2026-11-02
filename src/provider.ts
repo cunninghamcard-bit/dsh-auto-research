@@ -24,7 +24,14 @@ import {
   writeJsonAtomic,
 } from './layerfs-workspace.js'
 import { FrozenEvaluator } from './evaluator.js'
-import { ResearchStoppedError, Runner, resolveWorkerAgentOptions } from './runner.js'
+import {
+  ResearchStoppedError,
+  Runner,
+  normalizeOptions,
+  resolveWorkerAgentOptions,
+  validatePlan,
+} from './runner.js'
+import type { Frontier } from './runner.js'
 import type {
   AutoResearchService,
   Config,
@@ -1211,6 +1218,8 @@ export class AutoResearchProvider implements SubagentProvider {
     if (typeof evaluatorPath !== 'string') throw new Error('Plan requires an evaluator script')
     const evaluatorStat = await fsp.stat(evaluatorPath).catch(() => null)
     if (!evaluatorStat?.isFile()) throw new Error('Research plan evaluator does not exist: ' + evaluatorPath)
+    // Validate the complete plan before any lock, run directory or mount exists.
+    validatePlan(plan, normalizeOptions(this.config, plan))
 
     const planOptionsRecord = plan.options && typeof plan.options === 'object'
       ? plan.options as Record<string, unknown>
@@ -1287,6 +1296,7 @@ export class AutoResearchProvider implements SubagentProvider {
       })
 
       let sourceWorkspace = workspaceRoot
+      let frontier: Frontier | null = null
       if (await pathExists(selectionFile)) {
         let latest = null
         try {
@@ -1294,6 +1304,7 @@ export class AutoResearchProvider implements SubagentProvider {
         } catch {
           throw new Error(`Previous run selection is not valid JSON: ${selectionFile}`)
         }
+        frontier = (latest?.frontier as Frontier | undefined) ?? null
         if (latest?.original_manifest && !jsonEqual(latest.original_manifest, originalManifest)) {
           throw new Error('Original workspace changed since the last method run. Select/reconcile the intended starting workspace before continuing; all branches preserved.')
         }
@@ -1363,6 +1374,7 @@ export class AutoResearchProvider implements SubagentProvider {
         output,
         originalManifest,
         selectionFile,
+        frontier,
         deps: {
           subagents: this.ctx.subagents,
           workspaceManager: manager,

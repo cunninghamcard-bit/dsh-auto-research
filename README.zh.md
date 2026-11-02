@@ -17,22 +17,23 @@
 
 ## 安装
 
-把该 bundle 加入 DSH profile（插件管理器会读取 `dsh.bundle.patch`），或手动把 [`cordis.patch.yml`](cordis.patch.yml) 中的两行插入 profile patch。provider 需要至少一个其他已注册的 `ctx.subagents` provider 来执行 worker（`claude-code`、`codex`、`acp`、`dsh-sdk`、`spawn` 等）。存在多个候选时请显式设置 `workerProvider`。
+把该 bundle 加入 DSH profile（插件管理器会读取 `dsh.bundle.patch`），或手动把 [`cordis.patch.yml`](cordis.patch.yml) 中的两行插入 profile patch。下面的代码块与该文件逐字一致；配置表列的是代码默认值，profile 中的配置会覆盖它们。provider 需要至少一个其他已注册的 `ctx.subagents` provider 来执行 worker（`claude-code`、`codex`、`acp`、`dsh-sdk`、`spawn` 等）。存在多个候选时请显式设置 `workerProvider`。
 
 ```yaml
 - insert:
     - id: subagent-auto-research
       name: 'dsh-auto-research'
       config:
-        workerProvider: claude-code
+        providerName: auto-research
         rounds: 1
         branches: 4
         explorationMinutes: 30
         exploitationMinutes: 30
         rsiTop: true
-        forkAndFlush: false
+        forkAndFlush: true
         shareContext: false
         sharingIntervalMinutes: 10
+
     - id: tool-subagent-auto-research
       name: '@deepseek-ai/dsh-tool-subagent'
       config:
@@ -110,7 +111,7 @@
 
 1. 冻结评估器并写入 `PLAN.json` / `CONFIG.json`。
 2. 快照（或建立 LayerFS 基线）起始工作区并评估。基线无效时，在任何 worker 启动前停止。
-3. 每轮判断 `stalled`（`now - bestTime >= stall_seconds`）与 `explore = forkAndFlush || (rsiTop && stalled)`。
+3. 每轮判断 `stalled`（`stalled_work_seconds >= stall_seconds`）与 `explore = forkAndFlush || (rsiTop && stalled)`。`stalled_work_seconds` 只累计上次超过 `meaningful_gain` 的提升之后的阶段工作时间，通过 `LATEST.json` 的 `frontier` 跨批次保存，因此单开 RSI-top 在 `rounds: 1` 时也会探索。评估器哈希不同的 frontier 会被丢弃。
 4. 探索阶段运行 `branches` 个并行 worker；继续阶段运行一个。每个分支获得隔离 fork/mount、Worker Prompt、预算预留；RSI-top 下还会获得不同的随机指标视图与 portfolio 协议。
 5. 用冻结评估器评估完成的分支，校验 `PORTFOLIO.json`，选择 leader。
 6. 运行继续阶段，或写出 `RESULT.json` 结束。
@@ -137,7 +138,7 @@
 | `LEADER.json` | 选中的候选 |
 | `RESULT.json` | 批次边界结果 |
 
-`<checkout>/.auto-research-methods/LATEST.json` 记录选中的工作区、其 LayerFS 分支与原始清单。下一批只在原始工作区仍匹配时从该 leader 开始；否则停止并要求协调者先对齐起点。使用 LayerFS 时，若之前的挂载路径已不可用，会重新挂载保存的分支。
+`<checkout>/.auto-research-methods/LATEST.json` 记录选中的工作区、其 LayerFS 分支、原始清单，以及停滞状态 `frontier`（`evaluator_sha256`、`anchor_score`、`stalled_work_seconds`）。下一批只在原始工作区仍匹配时从该 leader 开始；否则停止并要求协调者先对齐起点。使用 LayerFS 时，若之前的挂载路径已不可用，会重新挂载保存的分支。
 
 ## LayerFS 集成
 
@@ -170,7 +171,7 @@ npm test
 
 ## 限制
 
-- worker 的 provider session 会被记录，但通用 `startActivation` 接口无法恢复会话；每个 worker 轮次都收到全新提示词。
+- worker 的 provider session 会被记录，但通用 `startActivation` 接口无法恢复会话；续跑依靠 handoff：上一轮的助手输出写进下一轮提示词和 `.auto-research-methods/HANDOFF.md`。`LAUNCH.json` 记录 `continuation: "handoff"`（全新分支为 `"none"`）。
 - Sandbox 内部的 LayerFS 挂载通过宿主暂存目录桥接；超大工作区需要复制成本。二进制文件通过 `workspace.exec` 原样复制，无法复制时跳过并告警，且不会被删除。
 - 协作 epoch 复用分支工作区，要求 worker 在共享窗口内完成；硬性阶段截止时间仍然生效。
 - 评估器必须是本地可执行脚本；除已接受的工作区与清单检查外没有额外沙箱。

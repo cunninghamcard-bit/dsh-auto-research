@@ -319,7 +319,7 @@ describe('P1-2: atomic runner lock and runtime containment', () => {
     })
   })
 
-  it('releases an adopted initial state when Runner construction fails', async () => {
+  it('rejects an invalid plan before adopting the saved LayerFS leader', async () => {
     await withTemp(async root => {
       const actions: any[] = []
       const client = hostClient(root, actions)
@@ -341,11 +341,8 @@ describe('P1-2: atomic runner lock and runtime containment', () => {
         broken.provider.start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }),
         /Plan requires a worker_prompt/,
       )
-      const adopted = actions.slice(before)
-      assert.ok(
-        adopted.some(action => action[0] === 'unmount' && action[2] === false),
-        'the adopted branch was unmounted before the manager closed',
-      )
+      // Validation runs before the lock and before any mount.
+      assert.deepEqual(actions.slice(before), [])
       assert.equal(existsSync(join(cwd, '.auto-research-methods', 'runner.lock')), false)
     })
   })
@@ -2529,13 +2526,14 @@ describe('R33: post-re-audit edge cases (NEW-01..NEW-03)', () => {
       const backend = new LayerFSBackend({ client, project: 'proj', output: join(root, 'out'), runId: 'r33' })
       const base = await backend.baseline(source, 'initial')
       const child = await backend.fork(base, 'round-1-continue-1')
-      // Simulate Runner.branch() writing .auto-research-methods-handoff.md before launch
-      await writeFile(join(child.path, '.auto-research-methods-handoff.md'), 'handoff notes\n')
+      // Simulate Runner.branch() writing .auto-research-methods/HANDOFF.md before launch
+      await mkdir(join(child.path, '.auto-research-methods'), { recursive: true })
+      await writeFile(join(child.path, '.auto-research-methods', 'HANDOFF.md'), 'handoff notes\n')
       child.prelaunchInventory = await inventory(child.path)
       await backend.reconcile(child)
       const after = JSON.parse(await readFile(join(child.path, 'state.json'), 'utf8'))
       assert.equal(after.score, 9)
-      assert.equal(await readFile(join(child.path, '.auto-research-methods-handoff.md'), 'utf8'), 'handoff notes\n')
+      assert.equal(await readFile(join(child.path, '.auto-research-methods', 'HANDOFF.md'), 'utf8'), 'handoff notes\n')
     })
   })
 

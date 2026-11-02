@@ -211,32 +211,93 @@ describe('Runner batches', () => {
     })
   })
 
-  it('triggers an RSI-top explore cohort on a stall and enforces portfolios', async () => {
+  it('triggers an RSI-top explore cohort once phase work without gain reaches the stall', async () => {
     await withTemp(async root => {
       let tick = 1000
       const clock = { now: () => { tick += 25; return tick }, sleep: async (ms: number) => { tick += ms } }
       const worker = async (spec: any, index: number) => {
         const text = spec.request.prompt[0].text
-        await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index, progress: 2 + index } })
-        if (text.includes('RSI-top dashboard view')) await writePortfolio(spec.request.cwd, 2)
+        // The first continuation makes no gain, so its phase time accrues.
+        const score = index === 0 ? 1 : 2 + index
+        await setState(spec.request.cwd, { score, metrics: { score, progress: score } })
+        if (text.includes('RSI-top dashboard view')) await writePortfolio(spec.request.cwd, 2, 'round-1-continue-1')
         return { output: [], stopReason: 'completed' }
       }
       const { runner, subagents } = await setup(root, {
         clock,
         worker,
         state: { score: 1, metrics: { score: 1, progress: 0 } },
-        options: { rsiTop: true, forkAndFlush: false },
+        options: { rsiTop: true, forkAndFlush: false, rounds: 2 },
         extraPlan: { stall_seconds: 0.001, metrics: [{ name: 'score' }, { name: 'progress', definition: 'p' }], metric_subset: 1 },
       })
       const result = await runner.run()
-      assert.equal(subagents.calls.length, 3)
-      assert.match(subagents.calls[0].request.prompt[0].text, /RSI-top dashboard view/)
+      assert.equal(subagents.calls.length, 4)
+      assert.doesNotMatch(subagents.calls[0].request.prompt[0].text, /RSI-top dashboard view/)
+      assert.match(subagents.calls[1].request.prompt[0].text, /RSI-top dashboard view/)
       const dashboard = JSON.parse(await readFile(join(runner.output, 'DASHBOARD.json'), 'utf8'))
       const exploreRows = dashboard.trajectories.filter((row: any) => row.phase === 'explore')
       assert.equal(exploreRows.length, 2)
       for (const row of exploreRows) assert.match(row.portfolio_sha256, /^[0-9a-f]{64}$/)
-      assert.equal(result.leader.id, 'round-1-continue-1')
+      assert.equal(result.leader.id, 'round-2-continue-1')
       await runner.releaseAll()
+    })
+  })
+
+  it('carries the stall frontier across batches through LATEST.json', async () => {
+    await withTemp(async root => {
+      let tick = 1000
+      const clock = { now: () => { tick += 25; return tick }, sleep: async (ms: number) => { tick += ms } }
+      const flat = async (spec: any) => {
+        await setState(spec.request.cwd, { score: 1, metrics: { score: 1 } })
+        if (spec.request.prompt[0].text.includes('RSI-top dashboard view')) {
+          await writePortfolio(spec.request.cwd, 2)
+        }
+        return { output: [], stopReason: 'completed' }
+      }
+      const first = await setup(root, {
+        clock,
+        worker: flat,
+        options: { rsiTop: true, forkAndFlush: false, rounds: 1 },
+        extraPlan: { stall_seconds: 0.001 },
+      })
+      await first.runner.run()
+      await first.runner.releaseAll()
+      // One batch with one round can never explore on its own.
+      assert.equal(first.subagents.calls.length, 1)
+      const latest = JSON.parse(await readFile(join(root, '.auto-research-methods', 'LATEST.json'), 'utf8'))
+      assert.equal(latest.frontier.evaluator_sha256, first.runner.evaluator.hash)
+      assert.equal(latest.frontier.anchor_score, '1')
+      assert.ok(latest.frontier.stalled_work_seconds >= 0.001)
+
+      const runBatch = async (frontier: any, output: string) => {
+        const manager = await createWorkspaceManager({ output, runId: 'run2', env: {} })
+        const subagents = fakeSubagents(flat)
+        const runner = new Runner({
+          plan: first.plan,
+          workspace: first.workspace,
+          output,
+          frontier,
+          deps: {
+            subagents,
+            workspaceManager: manager,
+            parent: { id: 'parent' },
+            workerProvider: 'worker',
+            clock,
+            runId: 'run2',
+            logger: { info() {}, warn() {} },
+          },
+        })
+        await runner.run()
+        await runner.releaseAll()
+        return subagents
+      }
+      const resumed = await runBatch(latest.frontier, join(root, 'out2'))
+      assert.equal(resumed.calls.length, 3)
+      assert.match(resumed.calls[0].request.prompt[0].text, /RSI-top dashboard view/)
+
+      // A frontier frozen against another evaluator is discarded.
+      const foreign = await runBatch({ ...latest.frontier, evaluator_sha256: 'other' }, join(root, 'out3'))
+      assert.equal(foreign.calls.length, 1)
     })
   })
 
@@ -370,6 +431,33 @@ describe('cooperative cohorts', () => {
       const reviewed = collaboration.epochs.slice(1).flatMap((epoch: any) => epoch.rows)
       assert.ok(reviewed.some((row: any) => row.peer_review_sha256))
       assert.ok(collaboration.epochs[0].rows.every((row: any) => !row.peer_review_sha256))
+      await runner.releaseAll()
+    })
+  })
+
+  it('runs several epochs when the worker provider reports no child session', async () => {
+    await withTemp(async root => {
+      const worker = async (spec: any, index: number) => {
+        await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index } })
+        await writeCheckpoint(spec.request.cwd, index)
+        return { output: [], stopReason: 'completed' }
+      }
+      const { runner, subagents } = await setup(root, {
+        worker,
+        options: {
+          shareContext: true,
+          forkAndFlush: true,
+          exploitationMinutes: 0.1,
+          sharingIntervalMinutes: 0.02,
+        },
+        extraPlan: { evaluation_seconds: 0.5 },
+      })
+      const start = subagents.startActivation
+      subagents.startActivation = async (spec: any) => ({ ...(await start(spec)), childId: null })
+      await runner.run()
+      const collaboration = JSON.parse(await readFile(join(runner.output, 'round-1-explore-COLLABORATION.json'), 'utf8'))
+      assert.ok(collaboration.epochs.length >= 2)
+      assert.ok(collaboration.epochs[0].rows.every((row: any) => row.provider_session === null))
       await runner.releaseAll()
     })
   })

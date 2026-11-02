@@ -17,22 +17,23 @@ The coordinator receives the research policy, methods policy, and continuation p
 
 ## Install
 
-Add the bundle to a DSH profile (the plugin manager reads `dsh.bundle.patch`), or insert the two rows from [`cordis.patch.yml`](cordis.patch.yml) into the profile patch manually. The provider expects at least one other registered `ctx.subagents` provider to execute workers (`claude-code`, `codex`, `acp`, `dsh-sdk`, `spawn`, …). Set `workerProvider` when the profile has more than one candidate.
+Add the bundle to a DSH profile (the plugin manager reads `dsh.bundle.patch`), or insert the two rows from [`cordis.patch.yml`](cordis.patch.yml) into the profile patch manually. The block below is that file verbatim; the configuration table lists the code defaults, which a profile row overrides. The provider expects at least one other registered `ctx.subagents` provider to execute workers (`claude-code`, `codex`, `acp`, `dsh-sdk`, `spawn`, …). Set `workerProvider` when the profile has more than one candidate.
 
 ```yaml
 - insert:
     - id: subagent-auto-research
       name: 'dsh-auto-research'
       config:
-        workerProvider: claude-code
+        providerName: auto-research
         rounds: 1
         branches: 4
         explorationMinutes: 30
         exploitationMinutes: 30
         rsiTop: true
-        forkAndFlush: false
+        forkAndFlush: true
         shareContext: false
         sharingIntervalMinutes: 10
+
     - id: tool-subagent-auto-research
       name: '@deepseek-ai/dsh-tool-subagent'
       config:
@@ -110,7 +111,7 @@ The evaluator is copied out of the candidate workspace, hashed, and executed wit
 
 1. Freeze the evaluator and write `PLAN.json` / `CONFIG.json`.
 2. Snapshot (or LayerFS-baseline) the starting workspace and evaluate it. An invalid baseline stops the batch before any worker starts.
-3. For each round, decide `stalled` (`now - bestTime >= stall_seconds`) and `explore = forkAndFlush || (rsiTop && stalled)`.
+3. For each round, decide `stalled` (`stalled_work_seconds >= stall_seconds`) and `explore = forkAndFlush || (rsiTop && stalled)`. `stalled_work_seconds` counts phase work time since the last gain above `meaningful_gain` and is carried across batches in `LATEST.json` (`frontier`), so RSI-top alone also explores with `rounds: 1`. A frontier frozen against a different evaluator is discarded.
 4. Explore runs `branches` parallel workers; continue runs one worker. Each branch gets an isolated fork/mount, a Worker Prompt, a budget reservation, and (under RSI-top) a distinct randomized metric view plus portfolio protocol.
 5. Evaluate completed branches with the frozen evaluator, validate `PORTFOLIO.json`, and select a leader.
 6. Either run the continue phase or finish with `RESULT.json`.
@@ -137,7 +138,7 @@ Everything lives under `<checkout>/.auto-research-methods/runs/<run-id>/`:
 | `LEADER.json` | Selected candidate |
 | `RESULT.json` | Batch boundary result |
 
-`<checkout>/.auto-research-methods/LATEST.json` records the selected workspace, its LayerFS branch, and the original manifest. The next batch starts from that leader only when the original workspace still matches; otherwise it stops and asks the coordinator to reconcile the starting point. With LayerFS, the saved branch is remounted when its previous mount path is no longer available. If `LATEST.json` names a leader workspace or branch and neither can be adopted, the new batch fails loud instead of silently restarting from the seed. `runner.lock` makes one checkout single-instance. For a compact `plan.workspace` seed, runtime artifacts live inside the seed (`.auto-research-methods/`) and `<checkout>/.auto-research-methods/SEED.json` points at them.
+`<checkout>/.auto-research-methods/LATEST.json` records the selected workspace, its LayerFS branch, the original manifest, and the stall `frontier` (`evaluator_sha256`, `anchor_score`, `stalled_work_seconds`). The next batch starts from that leader only when the original workspace still matches; otherwise it stops and asks the coordinator to reconcile the starting point. With LayerFS, the saved branch is remounted when its previous mount path is no longer available. If `LATEST.json` names a leader workspace or branch and neither can be adopted, the new batch fails loud instead of silently restarting from the seed. `runner.lock` makes one checkout single-instance. For a compact `plan.workspace` seed, runtime artifacts live inside the seed (`.auto-research-methods/`) and `<checkout>/.auto-research-methods/SEED.json` points at them.
 
 ## LayerFS integration
 
@@ -168,7 +169,7 @@ The `node:test` suite covers protocols (full RSI views, reservoir sampling, port
 
 ## Limitations
 
-- The generic `startActivation` seam cannot resume a provider's own CLI session. Continuation fidelity is preserved by archiving each turn in `provider.jsonl` and handing the previous assistant output plus `.auto-research-methods-handoff.md` to the next worker.
+- The generic `startActivation` seam cannot resume a provider's own CLI session. Continuation is the handoff: each turn is archived in `provider.jsonl`, and the previous assistant output is passed to the next worker in the prompt and in `.auto-research-methods/HANDOFF.md`. `LAUNCH.json` records `continuation: "handoff"` (or `"none"` for a fresh branch).
 - Sandbox-internal LayerFS mounts are bridged through a host staging directory; very large workspaces pay a copy cost. Binary adopted files that `fs.read` refuses are copied through `workspace.exec` + `base64`; when that is unavailable they are skipped with a warning and never removed from the branch.
 - Cooperative epochs reuse a branch workspace and require the worker to finish within the share window; the hard phase deadline still applies.
 - The evaluator must be a local executable script; there is no built-in sandbox beyond the accepted workspace and inventory checks.

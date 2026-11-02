@@ -165,6 +165,7 @@ describe('P0: full RSI view, provider archival, and continuation handoff', () =>
       assert.equal(subagents.calls.length, 3)
 
       const launch = JSON.parse(await readFile(join(runner.output, 'round-1-explore-1', 'LAUNCH.json'), 'utf8'))
+      assert.equal(launch.continuation, 'none')
       assert.deepEqual(Object.keys(launch.metric_view).sort(), ['definitions', 'diagnostics', 'rows'])
       assert.equal(launch.metric_view.definitions.length, 1)
       assert.ok(Array.isArray(launch.metric_view.diagnostics))
@@ -183,12 +184,12 @@ describe('P0: full RSI view, provider archival, and continuation handoff', () =>
       const continuePrompt = continueCall.request.prompt[0].text
       const continueLaunch = JSON.parse(await readFile(join(runner.output, 'round-1-continue-1', 'LAUNCH.json'), 'utf8'))
       const parentId = continueLaunch.parent
-      assert.equal(continueLaunch.fresh_context, false)
+      assert.equal(continueLaunch.continuation, 'handoff')
       assert.equal(typeof continueLaunch.provider_session, 'string')
       assert.equal(continueLaunch.handoff_from, parentId)
       assert.match(continuePrompt, new RegExp(`Previous turn handoff \\(from parent ${parentId}\\):`))
       assert.match(continuePrompt, new RegExp(`assistant output [01]`))
-      const handoff = await readFile(join(runner.output, 'round-1-continue-1', 'workspace', '.auto-research-methods-handoff.md'), 'utf8')
+      const handoff = await readFile(join(runner.output, 'round-1-continue-1', 'workspace', '.auto-research-methods', 'HANDOFF.md'), 'utf8')
       assert.match(handoff, /assistant output [01]/)
 
       const transcript = (await readFile(join(runner.output, 'round-1-continue-1', 'provider.jsonl'), 'utf8'))
