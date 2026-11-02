@@ -396,4 +396,32 @@ describe('AutoResearchProvider', () => {
       }), /Original workspace changed/)
     })
   })
+
+  it('exposes ctx.autoResearch service interface for workspace backend plugins', async () => {
+    const ctx: any = {
+      subagents: { registerProvider() {} },
+      systemPrompt: { section() {} },
+    }
+    apply(ctx, {})
+    assert.ok(ctx.autoResearch)
+    assert.deepEqual(
+      ctx.autoResearch.listWorkspaceBackends().map((b: any) => b.name),
+      ['layerfs', 'snapshot'],
+    )
+    const customBackend = {
+      name: 'custom-backend',
+      async create() { return null },
+    }
+    const disposeBackend = ctx.autoResearch.registerWorkspaceBackend(customBackend)
+    assert.deepEqual(
+      ctx.autoResearch.listWorkspaceBackends().map((b: any) => b.name),
+      ['layerfs', 'custom-backend', 'snapshot'],
+    )
+    assert.equal(ctx.autoResearch.getWorkspaceBackend('custom-backend')?.name, 'custom-backend')
+    disposeBackend()
+    assert.deepEqual(
+      ctx.autoResearch.listWorkspaceBackends().map((b: any) => b.name),
+      ['layerfs', 'snapshot'],
+    )
+  })
 })

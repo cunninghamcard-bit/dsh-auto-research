@@ -8,7 +8,7 @@
  * run, rejects the observation instead of ranking it.
  */
 import { spawn } from 'node:child_process';
-import type { EvaluationResult, Logger, MetricDefinition, SelectionMetric } from './types.js';
+import type { EvaluationResult, Logger, MetricDefinition, SelectionMetric, SubprocessServiceLike } from './types.js';
 /** Plan fields the evaluator needs; a full {@link ResearchPlan} satisfies it. */
 export interface EvaluatorPlan {
     evaluator: string;
@@ -18,15 +18,6 @@ export interface EvaluatorPlan {
     evaluator_interpreter?: string | string[];
     [key: string]: unknown;
 }
-/**
- * Parse a finite numeric score. Booleans are not scores; neither is an empty
- * string, a non-finite number, or a value that only coerces to one.
- *
- * String input must be a decimal literal: `"0x10"`, `"0b11"`, `"0o7"` and
- * `"Infinity"` are rejected instead of being silently coerced by `Number`.
- */
-export declare function scoreValue(value: unknown, label?: string): number;
-/** Result of one evaluator process. */
 export interface EvaluatorProcessResult {
     code: number | null;
     timedOut: boolean;
@@ -35,7 +26,6 @@ export interface EvaluatorProcessResult {
     stderr: string;
     error?: Error;
 }
-/** One evaluator process invocation. */
 export interface EvaluatorProcessParts {
     argv: string[];
     cwd: string;
@@ -45,11 +35,20 @@ export interface EvaluatorProcessParts {
     stdoutPath: string;
     stderrPath: string;
     spawn?: typeof spawn;
+    subprocess?: SubprocessServiceLike | null;
 }
 /**
- * Run one evaluator process, capturing stdout/stderr and enforcing a timeout.
- * `settle()` never rejects: a log write failure cannot leave the promise
- * pending, and the hard SIGKILL timer is cleared as soon as the child closes.
+ * Parse a finite numeric score. Booleans are not scores; neither is an empty
+ * string, a non-finite number, or a value that only coerces to one.
+ *
+ * String input must be a decimal literal: `"0x10"`, `"0b11"`, `"0o7"` and
+ * `"Infinity"` are rejected instead of being silently coerced by `Number`.
+ */
+export declare function scoreValue(value: unknown, label?: string): number;
+/**
+ * Run one evaluator process via `dsh`'s `ctx.subprocess` service when injected
+ * (or fallback to `node:child_process.spawn` in standalone unit tests),
+ * capturing stdout/stderr and enforcing a timeout.
  */
 export declare function runEvaluatorProcess(parts: EvaluatorProcessParts): Promise<EvaluatorProcessResult>;
 /** A frozen evaluator bound to one run directory. */
@@ -60,12 +59,14 @@ export declare class FrozenEvaluator {
     hash: string | null;
     script: string | null;
     private readonly spawnImpl;
+    private readonly subprocess;
     private readonly extraEnv;
-    constructor({ plan, output, logger, spawn: spawnImpl, env: extraEnv, }: {
+    constructor({ plan, output, logger, spawn: spawnImpl, subprocess, env: extraEnv, }: {
         plan: EvaluatorPlan;
         output: string;
         logger?: Logger | null;
         spawn?: typeof spawn;
+        subprocess?: SubprocessServiceLike | null;
         env?: Record<string, string>;
     });
     /**

@@ -17,7 +17,7 @@
  * is allowed to inspect) and the retained / restored completed-state objects
  * used by cooperative cohorts.
  */
-import type { Config, LayerFSBinding, LayerFSClient, LayerFSSettings, Logger, PluginContext, TrajectoryRow, WorkspaceManagerLike, WorkspaceState } from './types.js';
+import type { LayerFSBinding, LayerFSClient, LayerFSSettings, Logger, PluginContext, TrajectoryRow, WorkspaceBackend, WorkspaceBackendCreateOptions, WorkspaceBackendFactory, WorkspaceManagerLike, WorkspaceState } from './types.js';
 /** Harness and provider state that never enters an inventory or a branch. */
 export declare const OMIT: Set<string>;
 /** @returns the lowercase hexadecimal SHA-256 of `data`. */
@@ -70,7 +70,7 @@ export declare function retainCompletedState(output: string, row: TrajectoryRow)
  */
 export declare function restoreCompletedState(output: string, checkpoint: string, failedRow: TrajectoryRow): Promise<TrajectoryRow>;
 /** Full-copy branch backend used when no LayerFS project is bound. */
-export declare class SnapshotBackend {
+export declare class SnapshotBackend implements WorkspaceBackend {
     readonly name = "snapshot";
     readonly output: string;
     readonly runId: string;
@@ -151,7 +151,7 @@ export declare function withBusyRetry<T>(fn: () => Promise<T>, options?: {
  * `ownsClient` is false whenever the client was injected by the host (for
  * example `ctx.layerfs.client`), so `close()` never tears down a shared client.
  */
-export declare class LayerFSBackend {
+export declare class LayerFSBackend implements WorkspaceBackend {
     readonly name = "layerfs";
     readonly client: LayerFSClient;
     readonly operator: unknown;
@@ -257,24 +257,9 @@ export declare class LayerFSBackend {
 }
 /** Common facade used by the runner. */
 export declare class WorkspaceManager implements WorkspaceManagerLike {
-    readonly backend: {
-        name: string;
-        baseline: (source: string, id: string) => Promise<WorkspaceState>;
-        fork: (parent: WorkspaceState, id: string) => Promise<WorkspaceState>;
-        adopt?: (branch: string, id: string) => Promise<WorkspaceState>;
-        commit: (state: WorkspaceState, options?: {
-            message?: string;
-        }) => Promise<void>;
-        release: (state: WorkspaceState, options?: {
-            discard?: boolean;
-        }) => Promise<void>;
-        retainCompletedState: (row: TrajectoryRow) => Promise<string>;
-        restoreCompletedState: (checkpoint: string, failedRow: TrajectoryRow) => Promise<TrajectoryRow>;
-        reconcile?: (state: WorkspaceState) => Promise<void>;
-        close?: () => Promise<void>;
-    };
+    readonly backend: WorkspaceBackend;
     readonly output: string | undefined;
-    constructor(backend: WorkspaceManager['backend'], { output }?: {
+    constructor(backend: WorkspaceBackend, { output }?: {
         output?: string;
     });
     get kind(): string;
@@ -382,14 +367,46 @@ export declare function loadLayerfs(settings: LayerFSSettings): Promise<{
     activate: () => void;
 }>;
 /**
- * Build the workspace manager, preferring LayerFS when bound.
+ * Concrete `WorkspaceBackendFactory` for full-copy snapshot branches.
  */
-export declare function createWorkspaceManager({ output, runId, config, env, layerfs, }: {
-    output: string;
-    runId: string;
-    config?: Config;
-    env?: NodeJS.ProcessEnv | Record<string, unknown>;
-    layerfs?: LayerFSBinding;
+export declare class SnapshotWorkspaceFactory implements WorkspaceBackendFactory {
+    readonly name = "snapshot";
+    create({ output, runId }: WorkspaceBackendCreateOptions): Promise<SnapshotBackend>;
+}
+/**
+ * Concrete `WorkspaceBackendFactory` for LayerFS copy-on-write branches.
+ *
+ * Returns `null` when LayerFS is explicitly opted out (`config.layerfs: false`),
+ * when another backend is explicitly requested, or when no LayerFS project/SDK
+ * is bound and `config.workspaceBackend` is not `'layerfs'`.
+ */
+export declare class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
+    readonly name = "layerfs";
+    create({ output, runId, config, env, layerfs, }: WorkspaceBackendCreateOptions): Promise<LayerFSBackend | null>;
+}
+/**
+ * Cordis plugin that registers `SnapshotWorkspaceFactory` on `ctx.autoResearch`.
+ */
+export declare const snapshotWorkspacePlugin: Readonly<{
+    name: "dsh-auto-research-workspace-snapshot";
+    inject: readonly ["autoResearch"];
+    apply(ctx: PluginContext): void;
+}>;
+/**
+ * Cordis plugin that registers `LayerFSWorkspaceFactory` on `ctx.autoResearch`.
+ */
+export declare const layerfsWorkspacePlugin: Readonly<{
+    name: "dsh-auto-research-workspace-layerfs";
+    inject: readonly ["autoResearch"];
+    apply(ctx: PluginContext): void;
+}>;
+/**
+ * Build the workspace manager from registered `WorkspaceBackendFactory` providers
+ * (defaulting to `[LayerFSWorkspaceFactory, SnapshotWorkspaceFactory]`), preferring
+ * LayerFS when bound.
+ */
+export declare function createWorkspaceManager({ output, runId, config, env, layerfs, backends, }: WorkspaceBackendCreateOptions & {
+    backends?: WorkspaceBackendFactory[];
 }): Promise<WorkspaceManager>;
 /**
  * Resolve the optional compact research seed named by `plan.workspace`.

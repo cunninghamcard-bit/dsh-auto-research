@@ -10,6 +10,8 @@ import { randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
 import { isAbsolute, join, resolve, sep } from 'node:path'
 import {
+  LayerFSWorkspaceFactory,
+  SnapshotWorkspaceFactory,
   createWorkspaceManager,
   inventory,
   isContained,
@@ -24,6 +26,7 @@ import {
 import { FrozenEvaluator } from './evaluator.js'
 import { ResearchStoppedError, Runner, resolveWorkerAgentOptions } from './runner.js'
 import type {
+  AutoResearchService,
   Config,
   ContentBlock,
   LayerFSBinding,
@@ -35,7 +38,9 @@ import type {
   SubagentResult,
   SubagentRun,
   SubagentStartRequest,
+  SubprocessServiceLike,
   WorkerAgentOptions,
+  WorkspaceBackendFactory,
   WorkspaceState,
 } from './types.js'
 
@@ -742,6 +747,48 @@ export function declaredWorkerEnvKeys(
   return keys
 }
 
+/**
+ * Concrete registry implementation of `ctx.autoResearch` (`AutoResearchService`).
+ *
+ * Pre-seeded with `[LayerFSWorkspaceFactory, SnapshotWorkspaceFactory]`, while
+ * allowing workspace backend plugins (`layerfsWorkspacePlugin`,
+ * `snapshotWorkspacePlugin`, or custom workspace plugins) to register or
+ * override backends.
+ */
+export class AutoResearchServiceImpl implements AutoResearchService {
+  private readonly backends: WorkspaceBackendFactory[] = [
+    new LayerFSWorkspaceFactory(),
+    new SnapshotWorkspaceFactory(),
+  ]
+
+  registerWorkspaceBackend(factory: WorkspaceBackendFactory): () => void {
+    const existingIndex = this.backends.findIndex(item => item.name === factory.name)
+    if (existingIndex >= 0) {
+      this.backends[existingIndex] = factory
+    } else {
+      // Custom backends registered by plugins take priority before snapshot fallback.
+      const snapshotIndex = this.backends.findIndex(item => item.name === 'snapshot')
+      if (snapshotIndex >= 0) this.backends.splice(snapshotIndex, 0, factory)
+      else this.backends.push(factory)
+    }
+    let disposed = false
+    return () => {
+      if (disposed) return
+      disposed = true
+      const idx = this.backends.indexOf(factory)
+      if (idx >= 0) this.backends.splice(idx, 1)
+    }
+  }
+
+  getWorkspaceBackend(name: string): WorkspaceBackendFactory | undefined {
+    return this.backends.find(item => item.name === name)
+  }
+
+  listWorkspaceBackends(): WorkspaceBackendFactory[] {
+    return [...this.backends]
+  }
+}
+
 /** One provider instance, normally created by the Cordis plugin entry. */
 export class AutoResearchProvider implements SubagentProvider {
   readonly ctx: PluginContext
@@ -749,6 +796,8 @@ export class AutoResearchProvider implements SubagentProvider {
   readonly name: string
   readonly capabilities: Record<string, unknown>
   readonly inheritsParentContext: boolean
+  /** Capability registry exposed on `ctx.autoResearch`. */
+  readonly service: AutoResearchService
   /** Branch environments of the workers that are running right now. */
   readonly workerEnvs = new WorkerEnvRegistry({
     resolveCwd: session => this.sessionWorkingDirectory(session),
@@ -773,8 +822,47 @@ export class AutoResearchProvider implements SubagentProvider {
     this.name = this.config.providerName
     this.capabilities = NO_START_CAPABILITIES
     this.inheritsParentContext = false
+    this.service = this.autoResearchService() ?? new AutoResearchServiceImpl()
     this.workerEnvKeys = declaredWorkerEnvKeys(this.config.workerEnv)
     this.installShellEnvContributor()
+  }
+
+  /** The `ctx.subprocess` service (`@deepseek-ai/dsh-subprocess`), read safely. */
+  private subprocessService(context: unknown = this.ctx): SubprocessServiceLike | undefined {
+    const holder = context as { get?: (name: string) => unknown; subprocess?: unknown } | null | undefined
+    if (!holder) return undefined
+    if (typeof holder.get === 'function') {
+      try {
+        const value = holder.get('subprocess')
+        if (value) return value as SubprocessServiceLike
+      } catch {
+        // The service is not injected in this host; try the property fallback.
+      }
+    }
+    try {
+      return holder.subprocess as SubprocessServiceLike | undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** Existing `ctx.autoResearch` service if already provided on `ctx`. */
+  private autoResearchService(context: unknown = this.ctx): AutoResearchService | undefined {
+    const holder = context as { get?: (name: string) => unknown; autoResearch?: unknown } | null | undefined
+    if (!holder) return undefined
+    if (typeof holder.get === 'function') {
+      try {
+        const value = holder.get('autoResearch')
+        if (value) return value as AutoResearchService
+      } catch {
+        // Not registered via ctx.get.
+      }
+    }
+    try {
+      return holder.autoResearch as AutoResearchService | undefined
+    } catch {
+      return undefined
+    }
   }
 
   /** Release the shell-env registration (the Cordis fiber normally owns it). */
@@ -1195,6 +1283,7 @@ export class AutoResearchProvider implements SubagentProvider {
         config: this.config,
         env,
         ...(layerfsConfig?.client ? { layerfs: layerfsConfig } : {}),
+        backends: this.service.listWorkspaceBackends(),
       })
 
       let sourceWorkspace = workspaceRoot
@@ -1265,6 +1354,7 @@ export class AutoResearchProvider implements SubagentProvider {
         output,
         env: evaluatorEnv,
         logger: this.ctx.logger ?? null,
+        subprocess: this.subprocessService() ?? null,
       })
       runner = new Runner({
         config: publicConfig(this.config),

@@ -337,9 +337,15 @@ export interface PluginContext {
     get?: (session: unknown) => unknown
     set?: (session: unknown, cwd: string) => unknown
   }
-  subprocess?: unknown
+  /** `dsh` `ctx.subprocess` service (`@deepseek-ai/dsh-subprocess`). */
+  subprocess?: SubprocessServiceLike
+  /** `dsh-auto-research` capability registry service (`ctx.autoResearch`). */
+  autoResearch?: AutoResearchService
   logger?: Logger
   get?: (name: string) => unknown
+  provide?: (name: string) => void
+  inject?: (deps: string[], callback: (ctx: PluginContext) => void) => unknown
+  effect?: (callback: () => () => void) => unknown
   [key: string]: unknown
 }
 
@@ -579,4 +585,66 @@ export interface WorkspaceManagerLike {
   /** Fold changes made inside a live Sandbox mount back into the host copy. */
   reconcile?: (state: WorkspaceState) => Promise<void>
   close?: () => Promise<void>
+}
+
+/** Structural contract for `dsh`'s `ctx.subprocess` (`@deepseek-ai/dsh-subprocess`). */
+export interface SubprocessServiceLike {
+  spawn: (spec: {
+    argv: readonly string[]
+    cwd: string
+    stdio: {
+      stdin: 'ignore'
+      stdout: { maxBytes: number }
+      stderr: { maxBytes: number }
+    }
+    graceMs: number
+    signal?: AbortSignal | undefined
+    env?: NodeJS.ProcessEnv | undefined
+  }) => {
+    collected: {
+      stdout?: { readFrom: (fromByte: number) => { text: string; nextOffset: number; lossy: boolean; spillPath?: string } }
+      stderr?: { readFrom: (fromByte: number) => { text: string; nextOffset: number; lossy: boolean; spillPath?: string } }
+    }
+    done: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>
+    terminate: () => void
+    waitForExit: (signal?: AbortSignal) => Promise<boolean>
+  }
+}
+
+/** Pluggable isolated branch-workspace backend contract. */
+export interface WorkspaceBackend {
+  readonly name: string
+  baseline: (source: string, id: string, options?: { sync?: boolean }) => Promise<WorkspaceState>
+  fork: (parent: WorkspaceState, id: string) => Promise<WorkspaceState>
+  reconcile?: (state: WorkspaceState) => Promise<void>
+  commit: (state: WorkspaceState, options?: { message?: string }) => Promise<void>
+  adopt?: (branch: string, id: string) => Promise<WorkspaceState>
+  release: (state: WorkspaceState, options?: { discard?: boolean }) => Promise<void>
+  retainCompletedState: (row: TrajectoryRow) => Promise<string>
+  restoreCompletedState: (checkpoint: string, failedRow: TrajectoryRow) => Promise<TrajectoryRow>
+  close?: () => Promise<void>
+}
+
+/** Options passed to a {@link WorkspaceBackendFactory} when creating a backend for a batch. */
+export interface WorkspaceBackendCreateOptions {
+  output: string
+  runId: string
+  config?: Config
+  env?: NodeJS.ProcessEnv | Record<string, unknown>
+  layerfs?: LayerFSBinding
+}
+
+/** Pluggable factory that constructs a {@link WorkspaceBackend} when applicable. */
+export interface WorkspaceBackendFactory {
+  readonly name: string
+  create: (options: WorkspaceBackendCreateOptions) => Promise<WorkspaceBackend | null>
+}
+
+/**
+ * Service Definition for `ctx.autoResearch`: registry of workspace-backend plugins.
+ */
+export interface AutoResearchService {
+  registerWorkspaceBackend: (factory: WorkspaceBackendFactory) => () => void
+  getWorkspaceBackend: (name: string) => WorkspaceBackendFactory | undefined
+  listWorkspaceBackends: () => WorkspaceBackendFactory[]
 }

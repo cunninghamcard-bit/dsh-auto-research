@@ -239,4 +239,54 @@ describe('runEvaluatorProcess', () => {
       assert.ok(failed.error)
     })
   })
+  it('delegates directly to dsh ctx.subprocess.spawn when provided', async () => {
+    await withTemp(async root => {
+      const spawns: any[] = []
+      let waited = false
+      const fakeSubprocess = {
+        spawn(spec: any) {
+          spawns.push(spec)
+          return {
+            pid: 4242,
+            collected: {
+              stdout: {
+                readFrom: () => ({ text: '{"score":9}\n', nextOffset: 12, lossy: false }),
+              },
+              stderr: {
+                readFrom: () => ({ text: 'eval-warn\n', nextOffset: 10, lossy: false }),
+              },
+            },
+            done: Promise.resolve({ exitCode: 0, signal: null, timedOut: false }),
+            terminate() {},
+            waitForExit: async () => {
+              waited = true
+              return true
+            },
+          }
+        },
+      }
+      const stdoutPath = join(root, 'sub-out.log')
+      const stderrPath = join(root, 'sub-err.log')
+      const result = await runEvaluatorProcess({
+        argv: ['python3', 'evaluate.py', root],
+        cwd: root,
+        env: { ...process.env, TEST_VAR: '1' },
+        timeoutMs: 5000,
+        stdoutPath,
+        stderrPath,
+        subprocess: fakeSubprocess,
+      })
+      assert.equal(result.code, 0)
+      assert.equal(result.timedOut, false)
+      assert.equal(result.aborted, false)
+      assert.equal(result.stdout, '{"score":9}\n')
+      assert.equal(result.stderr, 'eval-warn\n')
+      assert.equal(waited, true)
+      assert.equal(spawns.length, 1)
+      assert.deepEqual(spawns[0].argv, ['python3', 'evaluate.py', root])
+      assert.equal(spawns[0].graceMs, 2000)
+      assert.equal(await readFile(stdoutPath, 'utf8'), '{"score":9}\n')
+      assert.equal(await readFile(stderrPath, 'utf8'), 'eval-warn\n')
+    })
+  })
 })

@@ -24,6 +24,7 @@ import type {
   Logger,
   MetricDefinition,
   SelectionMetric,
+  SubprocessServiceLike,
 } from './types.js'
 
 const SECRET_LINE = /(access_token|refresh_token|api_key|apiKey|client_secret|BEGIN [A-Z ]*PRIVATE KEY)/
@@ -36,6 +37,27 @@ export interface EvaluatorPlan {
   selection_metrics?: SelectionMetric[]
   evaluator_interpreter?: string | string[]
   [key: string]: unknown
+}
+
+export interface EvaluatorProcessResult {
+  code: number | null
+  timedOut: boolean
+  aborted: boolean
+  stdout: string
+  stderr: string
+  error?: Error
+}
+
+export interface EvaluatorProcessParts {
+  argv: string[]
+  cwd: string
+  env: NodeJS.ProcessEnv
+  timeoutMs: number
+  signal?: AbortSignal
+  stdoutPath: string
+  stderrPath: string
+  spawn?: typeof spawn
+  subprocess?: SubprocessServiceLike | null
 }
 
 /** A plain decimal number (no hex/binary/octal or `Infinity`). */
@@ -75,34 +97,75 @@ function terminate(child: ChildProcess | undefined, signal: NodeJS.Signals): voi
   }
 }
 
-/** Result of one evaluator process. */
-export interface EvaluatorProcessResult {
-  code: number | null
-  timedOut: boolean
-  aborted: boolean
-  stdout: string
-  stderr: string
-  error?: Error
-}
-
-/** One evaluator process invocation. */
-export interface EvaluatorProcessParts {
-  argv: string[]
-  cwd: string
-  env: NodeJS.ProcessEnv
-  timeoutMs: number
-  signal?: AbortSignal
-  stdoutPath: string
-  stderrPath: string
-  spawn?: typeof spawn
-}
-
 /**
- * Run one evaluator process, capturing stdout/stderr and enforcing a timeout.
- * `settle()` never rejects: a log write failure cannot leave the promise
- * pending, and the hard SIGKILL timer is cleared as soon as the child closes.
+ * Run one evaluator process via `dsh`'s `ctx.subprocess` service when injected
+ * (or fallback to `node:child_process.spawn` in standalone unit tests),
+ * capturing stdout/stderr and enforcing a timeout.
  */
-export function runEvaluatorProcess(parts: EvaluatorProcessParts): Promise<EvaluatorProcessResult> {
+export async function runEvaluatorProcess(parts: EvaluatorProcessParts): Promise<EvaluatorProcessResult> {
+  if (!parts.spawn && parts.subprocess && typeof parts.subprocess.spawn === 'function') {
+    const { argv, cwd, env, timeoutMs, signal, stdoutPath, stderrPath, subprocess } = parts
+    let timedOut = false
+    let aborted = signal?.aborted === true
+    const controller = new AbortController()
+    const onExternalAbort = (): void => {
+      aborted = true
+      controller.abort()
+    }
+    if (aborted) controller.abort()
+    else signal?.addEventListener('abort', onExternalAbort, { once: true })
+    const timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, Math.max(1, timeoutMs))
+    timer.unref?.()
+
+    let stdout = ''
+    let stderr = ''
+    let code: number | null = null
+    let runError: Error | undefined
+    try {
+      const handle = subprocess.spawn({
+        argv,
+        cwd,
+        stdio: {
+          stdin: 'ignore',
+          stdout: { maxBytes: 32 * 1024 * 1024 },
+          stderr: { maxBytes: 4 * 1024 * 1024 },
+        },
+        graceMs: 2000,
+        signal: controller.signal,
+        env,
+      })
+      try {
+        const outcome = await handle.done
+        code = outcome.exitCode
+      } catch (error) {
+        runError = error instanceof Error ? error : new Error(String(error))
+      }
+      stdout = handle.collected?.stdout?.readFrom(0).text ?? ''
+      stderr = handle.collected?.stderr?.readFrom(0).text ?? ''
+      await handle.waitForExit?.().catch(() => {})
+    } catch (error) {
+      if (!aborted && !timedOut) {
+        runError = error instanceof Error ? error : new Error(String(error))
+      }
+    } finally {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onExternalAbort)
+      try {
+        await fsp.mkdir(dirname(stdoutPath), { recursive: true })
+        await fsp.writeFile(stdoutPath, stdout)
+        await fsp.writeFile(stderrPath, stderr)
+      } catch {
+        // Artifact directories can disappear during cancellation cleanup.
+      }
+    }
+    const result: EvaluatorProcessResult = { code, timedOut, aborted, stdout, stderr }
+    if (runError) result.error = runError
+    return result
+  }
+
   const { argv, cwd, env, timeoutMs, signal, stdoutPath, stderrPath } = parts
   const spawnImpl = parts.spawn ?? spawn
   return new Promise<EvaluatorProcessResult>(resolvePromise => {
@@ -186,6 +249,7 @@ export class FrozenEvaluator {
   hash: string | null = null
   script: string | null = null
   private readonly spawnImpl: typeof spawn | undefined
+  private readonly subprocess: SubprocessServiceLike | null
   private readonly extraEnv: Readonly<Record<string, string>>
 
   constructor({
@@ -193,12 +257,14 @@ export class FrozenEvaluator {
     output,
     logger = null,
     spawn: spawnImpl = undefined,
+    subprocess = null,
     env: extraEnv = {},
   }: {
     plan: EvaluatorPlan
     output: string
     logger?: Logger | null
     spawn?: typeof spawn
+    subprocess?: SubprocessServiceLike | null
     env?: Record<string, string>
   }) {
     if (!plan || typeof plan.evaluator !== 'string' || plan.evaluator.length === 0) {
@@ -208,6 +274,7 @@ export class FrozenEvaluator {
     this.output = output
     this.logger = logger
     this.spawnImpl = spawnImpl
+    this.subprocess = subprocess ?? null
     this.extraEnv = Object.freeze({ ...extraEnv })
   }
 
@@ -355,6 +422,7 @@ export class FrozenEvaluator {
       stdoutPath,
       stderrPath,
       ...(this.spawnImpl ? { spawn: this.spawnImpl } : {}),
+      ...(this.subprocess ? { subprocess: this.subprocess } : {}),
     })
     if (await digestFile(this.script) !== this.hash) {
       throw new Error('Evaluator or evaluated workspace changed; result rejected')

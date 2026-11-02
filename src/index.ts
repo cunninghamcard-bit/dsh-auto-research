@@ -6,7 +6,13 @@
  * `cordis.patch.yml` through `@deepseek-ai/dsh-tool-subagent`.
  */
 
-import { AutoResearchProvider, resolveConfig } from './provider.js'
+import { AutoResearchProvider, AutoResearchServiceImpl, resolveConfig } from './provider.js'
+import {
+  LayerFSWorkspaceFactory,
+  SnapshotWorkspaceFactory,
+  layerfsWorkspacePlugin,
+  snapshotWorkspacePlugin,
+} from './layerfs-workspace.js'
 import { coordinatorPolicy } from './policies.js'
 import type { Config as PluginConfig, PluginContext, ResolvedConfig } from './types.js'
 
@@ -36,11 +42,21 @@ export const Config = Object.freeze({
 })
 
 /**
- * Register the provider and coordinator guidance.
+ * Register the `autoResearch` service, concrete workspace backend plugins, the
+ * `auto-research` SubagentProvider, and coordinator guidance.
  */
 export function apply(ctx: PluginContext, config?: PluginConfig): void {
   const resolved = resolveConfig(config)
   const provider = new AutoResearchProvider({ ctx, config: resolved })
+  try {
+    ctx.provide?.('autoResearch')
+    ctx.autoResearch = provider.service
+  } catch {
+    // Host context may have read-only properties in minimal unit tests.
+  }
+  layerfsWorkspacePlugin.apply(ctx)
+  snapshotWorkspacePlugin.apply(ctx)
+
   const disposeProvider = ctx.subagents.registerProvider?.(provider)
   const prompt = ctx.systemPrompt
   let disposeSection: unknown = null
@@ -69,7 +85,23 @@ export function apply(ctx: PluginContext, config?: PluginConfig): void {
   }
 }
 
-export { AutoResearchProvider, resolveConfig, coordinatorPolicy }
+export {
+  AutoResearchProvider,
+  AutoResearchServiceImpl,
+  LayerFSWorkspaceFactory,
+  SnapshotWorkspaceFactory,
+  layerfsWorkspacePlugin,
+  snapshotWorkspacePlugin,
+  resolveConfig,
+  coordinatorPolicy,
+}
+export type {
+  AutoResearchService,
+  SubprocessServiceLike,
+  WorkspaceBackend,
+  WorkspaceBackendCreateOptions,
+  WorkspaceBackendFactory,
+} from './types.js'
 export {
   RESEARCH_POLICY,
   RESEARCH_METHODS_POLICY,
