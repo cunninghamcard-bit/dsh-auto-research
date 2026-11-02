@@ -297,35 +297,6 @@ export function validatePlan(plan: unknown, options: ResearchOptions): ResearchP
   return normalized
 }
 
-/** Port of `provider_outcome`: transport diagnostics are not turn failures. */
-export function providerOutcome(
-  events: unknown[] = [],
-  rc: number | null,
-  timedOut: boolean,
-): ProviderOutcome {
-  let terminal: string | null = null
-  let session: string | null = null
-  const diagnostics: unknown[] = []
-  for (const event of events) {
-    if (!event || typeof event !== 'object') continue
-    const record = event as Record<string, unknown>
-    const kind = record.type
-    if (kind === 'thread.started' && typeof record.thread_id === 'string') session = record.thread_id
-    if (typeof record.session_id === 'string') session = record.session_id
-    if (kind === 'turn.completed') terminal = 'completed'
-    else if (kind === 'turn.failed') terminal = 'failed'
-    else if (kind === 'result') {
-      terminal = record.subtype === 'success' && !record.is_error ? 'completed' : 'failed'
-    } else if (kind === 'error' || record.is_error) diagnostics.push(event)
-  }
-  return {
-    completed: terminal === 'completed' && rc === 0 && !timedOut,
-    provider_session: session,
-    terminal,
-    diagnostic_count: diagnostics.length,
-  }
-}
-
 function combineSignals(signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
   const active = signals.filter((signal): signal is AbortSignal => signal !== undefined)
   if (active.length === 0) return undefined
@@ -472,11 +443,8 @@ export class Runner {
     this.logger = deps.logger ?? console
     this.workerProvider = deps.workerProvider
     if (!this.workerProvider) throw new Error('Runner requires a worker provider')
-    this.workerAgentOptions = resolveWorkerAgentOptions(
-      config,
-      plan as ResearchPlanInput,
-      deps.workerAgentOptions,
-    )
+    // The provider resolves worker model options once.
+    this.workerAgentOptions = deps.workerAgentOptions ?? null
     this.parent = deps.parent
     this.signal = deps.signal
     this.workerEnv = mergeEnv(deps.workerEnv ?? config.workerEnv ?? {}, deps.layerfsEnv ?? {})
@@ -765,27 +733,8 @@ export class Runner {
     return rows
   }
 
-  async run(): Promise<BatchResult> {
-    try {
-      return await this.runBatch()
-    } catch (error) {
-      if (this.intentionalStop()) {
-        await this.writeStoppedResult().catch(() => {})
-      }
-      throw error
-    }
-  }
-
-  /** Persist the honest cancellation artifact (idempotent). */
-  async writeStoppedResult(): Promise<Record<string, unknown>> {
-    const result = {
-      status: 'STOPPED',
-      stop_reason: 'stopped',
-      pending_workspaces: this.pendingWorkspaces(),
-      artifacts_preserved: true,
-    }
-    await writeJsonAtomic(join(this.output, 'RESULT.json'), result)
-    return result
+  run(): Promise<BatchResult> {
+    return this.runBatch()
   }
 
   /** Live branches that have not been committed/unmounted yet. */
@@ -853,11 +802,6 @@ export class Runner {
     this.rows.push(initial)
     if (initial.evaluation.valid !== true) {
       const reason = initial.evaluation.reason ?? 'unknown evaluation failure'
-      await writeJsonAtomic(join(this.output, 'RESULT.json'), {
-        status: 'FAILED',
-        error: 'Initial candidate failed frozen evaluation; no research workers started: ' + reason,
-        artifacts_preserved: true,
-      })
       throw new Error('Initial candidate failed frozen evaluation; no research workers started: ' + reason)
     }
     this.anchor = scoreValue(initial.evaluation.score)

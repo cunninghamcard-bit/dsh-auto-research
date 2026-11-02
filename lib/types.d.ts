@@ -340,6 +340,17 @@ export interface ProviderContext {
         get?: (session: unknown) => unknown;
         set?: (session: unknown, cwd: string) => unknown;
     };
+    /** `dsh` `ctx.llm` catalog, used to resolve a worker model by id or name. */
+    llm?: {
+        listProviders: () => Array<{
+            id: string;
+            name?: string;
+        }>;
+        listModels: (providerId: string) => Promise<Array<{
+            id: string;
+            name?: string;
+        }>>;
+    };
     /** `dsh` `ctx.subprocess` service (`@deepseek-ai/dsh-subprocess`). */
     subprocess?: SubprocessServiceLike;
     /** Workspace backend registry provided by the core plugin. */

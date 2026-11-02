@@ -160,8 +160,6 @@ export declare class AutoResearchProvider implements SubagentProvider {
     readonly workerEnvKeys: Readonly<Record<string, {
         description: string;
     }>>;
-    /** Batches whose runner is still alive (used to reject recursive delegation). */
-    activeBatches: number;
     private disposeShellEnv;
     constructor({ ctx, config, workspaces, executors }: ProviderOptions);
     /** The `ctx.shellEnv` service, read without tripping Cordis's inject guard. */
@@ -217,6 +215,11 @@ export declare class AutoResearchProvider implements SubagentProvider {
      * state and `dsh`'s active `llm` registry so callers only need to specify a
      * model ID or display name (e.g. `glm-5.3-flash` or `GLM Flash`) without
      * hardcoding the internal provider adapter ID.
+     */
+    /**
+     * Resolve the worker model against the live `ctx.llm` catalog: an exact,
+     * case-insensitive match of a model `id` or `name`, in the named provider,
+     * else the parent's provider first, then every other provider.
      */
     private resolveLiveWorkerAgentOptions;
     start(request: SubagentStartRequest): Promise<SubagentRun>;

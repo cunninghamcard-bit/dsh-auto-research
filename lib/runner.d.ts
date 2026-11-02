@@ -10,7 +10,7 @@
  */
 import { jsonDigest, publicRow } from './layerfs-workspace.js';
 import { buildZeroSynthesisContext } from './protocols.js';
-import type { BatchResult, Clock, Config, EvaluationResult, MetricDiagnostic, MetricView, Phase, ProviderOutcome, ResearchOptions, ResearchPlan, ResearchPlanInput, RunnerDeps, SharedCheckpoint, SubagentResult, TrajectoryRow, WorkerAgentOptions, WorkspaceState } from './types.js';
+import type { BatchResult, Clock, Config, EvaluationResult, MetricDiagnostic, MetricView, Phase, ResearchOptions, ResearchPlan, ResearchPlanInput, RunnerDeps, SharedCheckpoint, SubagentResult, TrajectoryRow, WorkerAgentOptions, WorkspaceState } from './types.js';
 /** Raised when a batch is stopped by the caller; artifacts are retained. */
 export declare class ResearchStoppedError extends Error {
     constructor(message?: string);
@@ -37,8 +37,6 @@ export declare function resolveWorkerAgentOptions(config?: Config, plan?: Resear
  * normalized defaults. Values are never replaced with repository heuristics.
  */
 export declare function validatePlan(plan: unknown, options: ResearchOptions): ResearchPlan;
-/** Port of `provider_outcome`: transport diagnostics are not turn failures. */
-export declare function providerOutcome(events: unknown[] | undefined, rc: number | null, timedOut: boolean): ProviderOutcome;
 /** Extract assistant text from a provider `output` value. */
 export declare function outputText(output: SubagentResult['output']): string;
 interface PeerSlot {
@@ -158,8 +156,6 @@ export declare class Runner {
     /** Run all branches; one unexpected rejection aborts its siblings. */
     private runBranches;
     run(): Promise<BatchResult>;
-    /** Persist the honest cancellation artifact (idempotent). */
-    writeStoppedResult(): Promise<Record<string, unknown>>;
     /** Live branches that have not been committed/unmounted yet. */
     pendingWorkspaces(): Array<Record<string, unknown>>;
     private runBatch;

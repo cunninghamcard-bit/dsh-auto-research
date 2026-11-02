@@ -318,6 +318,44 @@ describe('AutoResearchProvider', () => {
     })
   })
 
+  it('resolves the worker model by exact id or name and refuses an unregistered plan workerProvider', async () => {
+    await withTemp(async root => {
+      const { cwd } = await fixture(root)
+      const llm = {
+        listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }, { id: 'openai', name: 'OpenAI' }],
+        listModels: async (provider: string) => provider === 'deepseek'
+          ? [{ id: 'deepseek-chat', name: 'DeepSeek Chat' }]
+          : [{ id: 'gpt-5', name: 'GPT 5' }],
+      }
+      const calls: any[] = []
+      const subagents = fakeSubagents(async (spec: any) => {
+        calls.push(spec)
+        await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
+        return { output: [], stopReason: 'completed' }
+      }, ['worker'])
+      const start = (config: any) => new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
+        ctx: { subagents, llm },
+        config: { workerProvider: 'worker', branches: 2, ...config },
+      }).start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal })
+      const run = await start({ workerModel: 'deepseek chat' })
+      assert.equal((await run.result).stopReason, 'completed')
+      const launch = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'runs', (await readdir(join(cwd, '.auto-research-methods', 'runs')))[0]!, 'round-1-continue-1', 'LAUNCH.json'), 'utf8'))
+      assert.deepEqual(launch.worker_agent_options, { provider: 'deepseek', model: 'deepseek-chat' })
+      await run.dispose()
+      // A token subset is not a name: "chat" alone matched before.
+      await assert.rejects(start({ workerModel: 'chat' }), /worker model "chat" matches no model id or name \(candidates: deepseek\/deepseek-chat, openai\/gpt-5\)/)
+    })
+    await withTemp(async root => {
+      const { cwd } = await fixture(root)
+      await writeFile(join(cwd, '.auto-research-methods', 'plan.json'), JSON.stringify({ ...planObject(cwd), workerProvider: 'missing' }))
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
+        ctx: { subagents: { list: () => ['worker'], startActivation() {} } } as any,
+        config: {},
+      })
+      await assert.rejects(provider.start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }), /plan workerProvider "missing" is not registered/)
+    })
+  })
+
   it('rejects an already-aborted request and maps cancellation to aborted', async () => {
     await withTemp(async root => {
       const { cwd, provider } = await fixture(root)

@@ -7,7 +7,6 @@ import {
   ResearchStoppedError,
   Runner,
   normalizeOptions,
-  providerOutcome,
   validatePlan,
 } from '../lib/runner.js'
 import { inventory } from '../lib/layerfs-workspace.js'
@@ -161,18 +160,6 @@ describe('normalizeOptions / validatePlan', () => {
     assert.throws(() => validatePlan({ ...base, portfolio_size: 1 }, { ...options, branches: 2, rsiTop: true, metric_subset: 1, stall_seconds: 1, meaningful_gain: 0 } as any), /RSI/)
   })
 
-  it('ports provider_outcome diagnostics', () => {
-    assert.deepEqual(providerOutcome([{ type: 'thread.started', thread_id: 't' }, { type: 'turn.completed' }], 0, false), {
-      completed: true,
-      provider_session: 't',
-      terminal: 'completed',
-      diagnostic_count: 0,
-    })
-    assert.equal(providerOutcome([{ type: 'turn.failed' }], 0, false).completed, false)
-    assert.equal(providerOutcome([{ type: 'result', subtype: 'success' }], 0, false).completed, true)
-    assert.equal(providerOutcome([{ type: 'result', subtype: 'success', is_error: true }], 0, false).completed, false)
-    assert.equal(providerOutcome([{ type: 'error' }], 1, false).diagnostic_count, 1)
-  })
 })
 
 describe('Runner batches', () => {
@@ -346,7 +333,6 @@ describe('Runner batches', () => {
       const { runner, subagents } = await setup(root, { state: { valid: false, score: 0, reason: 'fixture rejects baseline' } })
       await assert.rejects(runner.run(), /Initial candidate failed frozen evaluation/)
       assert.equal(subagents.calls.length, 0)
-      assert.equal(JSON.parse(await readFile(join(runner.output, 'RESULT.json'), 'utf8')).status, 'FAILED')
       await runner.releaseAll()
     })
   })

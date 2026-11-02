@@ -54,7 +54,7 @@ describe('package metadata', () => {
     }
     assert.deepEqual(pkg.exports['./colab'], { types: './lib/colab/index.d.ts', default: './lib/colab/index.js' })
     assert.equal(pkg.exports['./package.json'], './package.json')
-    assert.equal(pkg.exports['./src/*'], './src/*')
+    assert.equal(pkg.exports['./src/*'], undefined)
     assert.equal(pkg.exports['./lib/*'], './lib/*')
     assert.equal(pkg.exports['./cordis.patch.yml'], './cordis.patch.yml')
     assert.equal(pkg.exports['./locale/*.json'], './locale/*.json')

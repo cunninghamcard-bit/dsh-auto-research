@@ -785,8 +785,6 @@ export class AutoResearchProvider implements SubagentProvider {
    * session and a second owner is a hard registration error.
    */
   readonly workerEnvKeys: Readonly<Record<string, { description: string }>>
-  /** Batches whose runner is still alive (used to reject recursive delegation). */
-  activeBatches = 0
   private disposeShellEnv: (() => void) | null = null
 
   constructor({ ctx, config = {}, workspaces, executors }: ProviderOptions) {
@@ -988,12 +986,10 @@ export class AutoResearchProvider implements SubagentProvider {
       if (this.isRecursiveWorker(planRequested)) {
         throw new Error('auto-research cannot delegate to itself as a worker')
       }
-      if (names.includes(planRequested)) {
-        return planRequested
+      if (!names.includes(planRequested)) {
+        throw new Error(`plan workerProvider "${planRequested}" is not registered (available: ${names.join(', ') || 'none'})`)
       }
-      this.ctx.logger?.warn?.(
-        `[auto-research] plan requested workerProvider "${planRequested}" which is not registered (available: ${names.join(', ') || 'none'}); falling back to configured/default provider`,
-      )
+      return planRequested
     }
     if (configured !== undefined) return configured
     const candidates = names.filter(name => !this.isRecursiveWorker(name))
@@ -1016,105 +1012,39 @@ export class AutoResearchProvider implements SubagentProvider {
    * model ID or display name (e.g. `glm-5.3-flash` or `GLM Flash`) without
    * hardcoding the internal provider adapter ID.
    */
+  /**
+   * Resolve the worker model against the live `ctx.llm` catalog: an exact,
+   * case-insensitive match of a model `id` or `name`, in the named provider,
+   * else the parent's provider first, then every other provider.
+   */
   private async resolveLiveWorkerAgentOptions(
     rawOptions: WorkerAgentOptions | null,
     parent: unknown,
   ): Promise<WorkerAgentOptions | null> {
     if (!rawOptions) return null
     const resolved: WorkerAgentOptions = { ...rawOptions }
-    const parentRecord = parent && typeof parent === 'object'
-      ? parent as {
-        options?: { provider?: unknown; model?: unknown }
-        session?: { requestHeader?: () => { config?: { provider?: unknown; model?: unknown } } | undefined }
+    const parentConfig = (parent as {
+      session?: { requestHeader?: () => { config?: { provider?: unknown } } | undefined }
+    } | null)?.session?.requestHeader?.()?.config
+    const parentProvider = typeof parentConfig?.provider === 'string' && parentConfig.provider.length > 0
+      ? parentConfig.provider
+      : undefined
+    const llm = this.ctx.llm
+    if (typeof resolved.model === 'string' && resolved.model.length > 0 && llm) {
+      const target = resolved.model.trim().toLowerCase()
+      const providers = resolved.provider
+        ? [resolved.provider]
+        : [...new Set([parentProvider, ...llm.listProviders().map(provider => provider.id)].filter((id): id is string => Boolean(id)))]
+      const candidates: string[] = []
+      for (const providerId of providers) {
+        const models = await llm.listModels(providerId)
+        const match = models.find(model => model.id.toLowerCase() === target || model.name?.toLowerCase() === target)
+        if (match) return { ...resolved, provider: providerId, model: match.id }
+        candidates.push(...models.map(model => `${providerId}/${model.id}`))
       }
-      : null
-    let headerConfig: { provider?: unknown; model?: unknown } | undefined
-    try {
-      headerConfig = parentRecord?.session?.requestHeader?.()?.config
-    } catch {
-      headerConfig = undefined
+      throw new Error(`worker model "${resolved.model}" matches no model id or name (candidates: ${candidates.slice(0, 20).join(', ') || 'none'})`)
     }
-    const parentProvider = typeof headerConfig?.provider === 'string' && headerConfig.provider.length > 0
-      ? headerConfig.provider
-      : typeof parentRecord?.options?.provider === 'string' && parentRecord.options.provider.length > 0
-        ? parentRecord.options.provider
-        : undefined
-
-    if (resolved.provider === undefined && typeof resolved.model === 'string' && resolved.model.includes('/')) {
-      const slashIndex = resolved.model.indexOf('/')
-      const prefix = resolved.model.slice(0, slashIndex).trim()
-      const suffix = resolved.model.slice(slashIndex + 1).trim()
-      if (prefix.length > 0 && suffix.length > 0) {
-        resolved.provider = prefix
-        resolved.model = suffix
-      }
-    }
-
-    const context = this.ctx as (PluginContext & { get?: (name: string) => unknown; llm?: unknown }) | undefined
-    type LlmServiceLike = {
-      listProviders?: () => Array<{ id: string; name?: string }>
-      listModels?: (providerId: string) => Promise<Array<{ id: string; name?: string }>>
-    }
-    let llmService: LlmServiceLike | null = null
-    try {
-      const candidate = typeof context?.get === 'function' ? context.get('llm') : context?.llm
-      if (candidate && typeof candidate === 'object') {
-        llmService = candidate as LlmServiceLike
-      }
-    } catch {
-      llmService = null
-    }
-
-    if (typeof resolved.model === 'string' && resolved.model.length > 0 && llmService) {
-      const targetModel = resolved.model.trim()
-      const targetLower = targetModel.toLowerCase()
-      const targetTokens = targetLower.split(/[^a-z0-9]+/).filter(Boolean)
-      const providerIds: string[] = []
-      if (resolved.provider) {
-        providerIds.push(resolved.provider)
-      } else {
-        if (parentProvider) providerIds.push(parentProvider)
-        try {
-          for (const p of llmService.listProviders?.() ?? []) {
-            if (typeof p?.id === 'string' && p.id.length > 0 && !providerIds.includes(p.id)) {
-              providerIds.push(p.id)
-            }
-          }
-        } catch {
-          // Ignore provider listing errors and fall back to parentProvider.
-        }
-      }
-
-      let matched: { provider: string; model: string } | null = null
-      for (const providerId of providerIds) {
-        let models: Array<{ id: string; name?: string }> = []
-        try {
-          models = (await llmService.listModels?.(providerId)) ?? []
-        } catch {
-          models = []
-        }
-        const exact = models.find(m => m.id === targetModel)
-          ?? models.find(m => m.id.toLowerCase() === targetLower || m.name?.toLowerCase() === targetLower)
-          ?? (targetTokens.length > 0
-            ? models.find(m => {
-              const haystack = `${m.id} ${m.name ?? ''}`.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
-              return targetTokens.every(tok => haystack.includes(tok))
-            })
-            : undefined)
-        if (exact) {
-          matched = { provider: providerId, model: exact.id }
-          break
-        }
-      }
-      if (matched) {
-        resolved.provider = matched.provider
-        resolved.model = matched.model
-      }
-    }
-
-    if (resolved.provider === undefined && parentProvider !== undefined) {
-      resolved.provider = parentProvider
-    }
+    if (resolved.provider === undefined && parentProvider !== undefined) resolved.provider = parentProvider
     return resolved
   }
 
@@ -1169,7 +1099,6 @@ export class AutoResearchProvider implements SubagentProvider {
     // the same checkout must fail without leaving an orphan `runs/<runId>`
     // directory or overwriting `SEED.json`.
     const lock = await acquireRunnerLock(runtimeRoot, runId, { cwd })
-    this.activeBatches += 1
     let manager: WorkspaceManager | null = null
     let initialState: WorkspaceState | null = null
     let runner: Runner | null = null
@@ -1177,7 +1106,6 @@ export class AutoResearchProvider implements SubagentProvider {
     const releaseLock = async (): Promise<void> => {
       if (released) return
       released = true
-      this.activeBatches = Math.max(0, this.activeBatches - 1)
       await lock.release()
     }
     try {

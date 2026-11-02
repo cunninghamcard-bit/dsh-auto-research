@@ -32,7 +32,6 @@
       "default": "./lib/colab/index.js"
     },
     "./package.json": "./package.json",
-    "./src/*": "./src/*",
     "./lib/*": "./lib/*",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./locale/*.json": "./locale/*.json"
