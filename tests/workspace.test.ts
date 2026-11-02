@@ -6,7 +6,6 @@ import {
   LayerFSBackend,
   SnapshotBackend,
   WorkspaceManager,
-  createWorkspaceManager,
   digestFile,
   freeBytes,
   inventory,
@@ -23,7 +22,7 @@ import {
   snapshot,
   writeJsonAtomic,
 } from '../lib/layerfs-workspace.js'
-import { withTemp, writeWorkspace } from './helpers.ts'
+import { withTemp, writeWorkspace, snapshotManager } from './helpers.ts'
 
 describe('inventory and snapshot', () => {
   it('hashes regular files and omits runtime, provider, env and shared-method state', async () => {
@@ -262,7 +261,7 @@ describe('LayerFS configuration', () => {
 
   it('falls back to the snapshot backend without a project', async () => {
     await withTemp(async root => {
-      const manager = await createWorkspaceManager({ output: join(root, 'out'), runId: 'r', env: {} })
+      const manager = snapshotManager({ output: join(root, 'out'), runId: 'r', env: {} })
       assert.equal(manager.kind, 'snapshot')
     })
   })

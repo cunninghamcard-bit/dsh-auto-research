@@ -25,7 +25,6 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type {
   CompletedState,
-  Config,
   LayerFSBinding,
   LayerFSClient,
   LayerFSMount,
@@ -2006,25 +2005,14 @@ export async function loadLayerfs(
 }
 
 /**
- * Concrete `WorkspaceBackendFactory` for full-copy snapshot branches.
- */
-export class SnapshotWorkspaceFactory implements WorkspaceBackendFactory {
-  readonly name = 'snapshot'
-
-  async create({ output, runId }: WorkspaceBackendCreateOptions): Promise<SnapshotBackend> {
-    return new SnapshotBackend({ output, runId })
-  }
-}
-
-/**
  * Concrete `WorkspaceBackendFactory` for LayerFS copy-on-write branches.
  *
- * Returns `null` when LayerFS is explicitly opted out (`config.layerfs: false`),
- * when another backend is explicitly requested, or when no LayerFS project/SDK
- * is bound and `config.workspaceBackend` is not `'layerfs'`.
+ * Returns `null` when LayerFS is opted out (`config.layerfs: false`) or no
+ * LayerFS project/SDK is bound.
  */
 export class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
   readonly name = 'layerfs'
+  readonly priority = 100
 
   async create({
     output,
@@ -2034,9 +2022,6 @@ export class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
     layerfs = undefined,
   }: WorkspaceBackendCreateOptions): Promise<LayerFSBackend | null> {
     if (config.layerfs === false) return null
-    if (config.workspaceBackend !== undefined && config.workspaceBackend !== 'auto' && config.workspaceBackend !== 'layerfs') {
-      return null
-    }
     const configured = config.layerfs && typeof config.layerfs === 'object' ? config.layerfs : null
     if (layerfs?.client) {
       return new LayerFSBackend({
@@ -2064,90 +2049,8 @@ export class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
         activateEnvironment: loaded.activate,
       })
     }
-    if (config.workspaceBackend === 'layerfs') {
-      throw new Error("workspaceBackend is 'layerfs' but no LayerFS project or SDK is configured")
-    }
     return null
   }
-}
-
-/**
- * Cordis plugin that registers `SnapshotWorkspaceFactory` on `ctx.autoResearch`.
- */
-export const snapshotWorkspacePlugin = Object.freeze({
-  name: 'dsh-auto-research-workspace-snapshot',
-  inject: ['autoResearch'] as const,
-  apply(ctx: PluginContext): void {
-    const factory = new SnapshotWorkspaceFactory()
-    const dispose = ctx.autoResearch?.registerWorkspaceBackend(factory)
-    if (typeof dispose === 'function') {
-      ctx.effect?.(() => () => dispose())
-    }
-  },
-})
-
-/**
- * Cordis plugin that registers `LayerFSWorkspaceFactory` on `ctx.autoResearch`.
- */
-export const layerfsWorkspacePlugin = Object.freeze({
-  name: 'dsh-auto-research-workspace-layerfs',
-  inject: ['autoResearch'] as const,
-  apply(ctx: PluginContext): void {
-    const factory = new LayerFSWorkspaceFactory()
-    const dispose = ctx.autoResearch?.registerWorkspaceBackend(factory)
-    if (typeof dispose === 'function') {
-      ctx.effect?.(() => () => dispose())
-    }
-  },
-})
-
-/**
- * Build the workspace manager from registered `WorkspaceBackendFactory` providers
- * (defaulting to `[LayerFSWorkspaceFactory, SnapshotWorkspaceFactory]`), preferring
- * LayerFS when bound.
- */
-export async function createWorkspaceManager({
-  output,
-  runId,
-  config = {},
-  env = process.env,
-  layerfs = undefined,
-  backends = undefined,
-}: WorkspaceBackendCreateOptions & {
-  backends?: WorkspaceBackendFactory[]
-}): Promise<WorkspaceManager> {
-  const registered = backends && backends.length > 0
-    ? backends
-    : [new LayerFSWorkspaceFactory(), new SnapshotWorkspaceFactory()]
-
-  // `config.layerfs: false` is an explicit opt-out: it must win over a
-  // host-injected binding and over ambient DSH_LAYERFS_* variables.
-  const requested = config.layerfs === false
-    ? 'snapshot'
-    : config.workspaceBackend && config.workspaceBackend !== 'auto'
-      ? config.workspaceBackend
-      : null
-
-  if (requested !== null) {
-    const match = registered.find(candidate => candidate.name === requested)
-    if (match) {
-      const backend = await match.create({ output, runId, config, env, ...(layerfs ? { layerfs } : {}) })
-      if (backend) return new WorkspaceManager(backend, { output })
-    }
-    if (requested === 'layerfs') {
-      throw new Error("workspaceBackend is 'layerfs' but no LayerFS project or SDK is configured")
-    }
-    if (requested === 'snapshot') {
-      return new WorkspaceManager(new SnapshotBackend({ output, runId }), { output })
-    }
-    throw new Error(`workspaceBackend "${requested}" is not registered or could not be initialized`)
-  }
-
-  for (const factory of registered) {
-    const backend = await factory.create({ output, runId, config, env, ...(layerfs ? { layerfs } : {}) })
-    if (backend) return new WorkspaceManager(backend, { output })
-  }
-  return new WorkspaceManager(new SnapshotBackend({ output, runId }), { output })
 }
 
 /**

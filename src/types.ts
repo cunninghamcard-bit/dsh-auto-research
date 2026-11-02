@@ -58,6 +58,8 @@ export interface ResearchOptions {
   forkAndFlush: boolean
   shareContext: boolean
   sharingIntervalMinutes: number
+  /** Registered workspace backend name, or `auto` for priority order. */
+  workspaceBackend: string
 }
 
 /** Subset of {@link ResearchOptions} a plan may override. */
@@ -297,7 +299,7 @@ export interface SubagentStartRequest {
 /** `ctx.subagents` service surface. */
 export interface SubagentsService {
   list?: () => string[]
-  registerProvider?: (provider: SubagentProvider) => void
+  registerProvider: (provider: SubagentProvider) => () => void
   startActivation: (spec: SubagentActivationSpec) => Promise<SubagentRun>
   get?: (name: string) => SubagentProvider | null | undefined
   getProvider?: (name: string) => SubagentProvider | null | undefined
@@ -328,8 +330,8 @@ export interface SkillsService {
   }) => unknown
 }
 
-/** Cordis context subset consumed by the plugin. */
-export interface PluginContext {
+/** Cordis context subset the provider reads. */
+export interface ProviderContext {
   subagents: SubagentsService
   skills?: SkillsService
   shellEnv?: ShellEnvService
@@ -340,14 +342,18 @@ export interface PluginContext {
   }
   /** `dsh` `ctx.subprocess` service (`@deepseek-ai/dsh-subprocess`). */
   subprocess?: SubprocessServiceLike
-  /** `dsh-auto-research` capability registry service (`ctx.autoResearch`). */
-  autoResearch?: AutoResearchService
+  /** Workspace backend registry provided by the core plugin. */
+  researchWorkspace?: ResearchWorkspaceService
   logger?: Logger
   get?: (name: string) => unknown
-  provide?: (name: string) => void
-  inject?: (deps: string[], callback: (ctx: PluginContext) => void) => unknown
-  effect?: (callback: () => () => void) => unknown
+  inject?: (deps: string[], callback: (ctx: ProviderContext) => void) => unknown
   [key: string]: unknown
+}
+
+/** Cordis context subset the plugin entries use. */
+export interface PluginContext extends ProviderContext {
+  provide: (name: string, value: unknown) => unknown
+  effect: (callback: () => () => void) => unknown
 }
 
 /** Minimal logger used by the runner and provider. */
@@ -408,8 +414,8 @@ export interface Config {
   forkAndFlush?: boolean
   shareContext?: boolean
   sharingIntervalMinutes?: number
-  /** Explicit workspace backend choice; `auto` is the default resolution. */
-  workspaceBackend?: 'auto' | 'layerfs' | 'snapshot'
+  /** Registered workspace backend name; `auto` (the default) picks by priority. */
+  workspaceBackend?: string
   layerfs?: LayerFSBinding | false | null
   workerEnv?: Record<string, unknown>
   plan?: ResearchPlanInput
@@ -434,7 +440,7 @@ export interface ResolvedConfig {
   forkAndFlush: boolean
   shareContext: boolean
   sharingIntervalMinutes: number
-  workspaceBackend?: 'auto' | 'layerfs' | 'snapshot'
+  workspaceBackend?: string
   layerfs?: LayerFSBinding | false | null
   workerEnv: Record<string, unknown>
   plan?: ResearchPlanInput
@@ -638,14 +644,14 @@ export interface WorkspaceBackendCreateOptions {
 /** Pluggable factory that constructs a {@link WorkspaceBackend} when applicable. */
 export interface WorkspaceBackendFactory {
   readonly name: string
+  /** Higher priorities are tried first when `workspaceBackend` is `auto`. */
+  readonly priority: number
+  /** Return null when this backend does not apply to the batch. */
   create: (options: WorkspaceBackendCreateOptions) => Promise<WorkspaceBackend | null>
 }
 
-/**
- * Service Definition for `ctx.autoResearch`: registry of workspace-backend plugins.
- */
-export interface AutoResearchService {
-  registerWorkspaceBackend: (factory: WorkspaceBackendFactory) => () => void
-  getWorkspaceBackend: (name: string) => WorkspaceBackendFactory | undefined
-  listWorkspaceBackends: () => WorkspaceBackendFactory[]
+/** `ctx.researchWorkspace`: where workspace backend plugins register. */
+export interface ResearchWorkspaceService {
+  register: (factory: WorkspaceBackendFactory) => () => void
+  list: () => WorkspaceBackendFactory[]
 }

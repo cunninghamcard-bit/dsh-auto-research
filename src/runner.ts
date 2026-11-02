@@ -126,6 +126,7 @@ export function normalizeOptions(
     forkAndFlush: overrides.forkAndFlush ?? config.forkAndFlush ?? false,
     shareContext: overrides.shareContext ?? config.shareContext ?? false,
     sharingIntervalMinutes: overrides.sharingIntervalMinutes ?? config.sharingIntervalMinutes ?? 10,
+    workspaceBackend: overrides.workspaceBackend ?? config.workspaceBackend ?? 'auto',
   }
 }
 

@@ -49,6 +49,9 @@ describe('package metadata', () => {
     assert.equal(pkg.scripts.test, 'npm run typecheck && npm run build && node --test tests/*.test.ts')
     assert.equal(pkg.dsh.bundle.patch, './cordis.patch.yml')
     assert.deepEqual(pkg.exports['.'], { types: './lib/index.d.ts', default: './lib/index.js' })
+    for (const entry of ['api', 'layerfs', 'snapshot']) {
+      assert.deepEqual(pkg.exports[`./${entry}`], { types: `./lib/${entry}.d.ts`, default: `./lib/${entry}.js` })
+    }
     assert.equal(pkg.exports['./package.json'], './package.json')
     assert.equal(pkg.exports['./src/*'], './src/*')
     assert.equal(pkg.exports['./lib/*'], './lib/*')
@@ -75,10 +78,12 @@ describe('package metadata', () => {
     assert.match(svg, /<title>Auto Research<\/title>/)
   })
 
-  it('declares both bundle rows in the Cordis patch', async () => {
+  it('declares the core, backend and tool rows in the Cordis patch', async () => {
     const patch = await readFile(join(root, 'cordis.patch.yml'), 'utf8')
     assert.match(patch, /id: subagent-auto-research/)
     assert.match(patch, /name: 'dsh-auto-research'/)
+    assert.match(patch, /name: 'dsh-auto-research\/layerfs'/)
+    assert.match(patch, /name: 'dsh-auto-research\/snapshot'/)
     assert.match(patch, /id: tool-subagent-auto-research/)
     assert.match(patch, /name: '@deepseek-ai\/dsh-tool-subagent'/)
     assert.match(patch, /provider: auto-research/)
@@ -95,6 +100,10 @@ describe('package metadata', () => {
       'evaluator.ts',
       'protocols.ts',
       'skills.ts',
+      'registry.ts',
+      'api.ts',
+      'layerfs.ts',
+      'snapshot.ts',
       'types.ts',
     ]
     for (const name of sources) {
@@ -120,7 +129,7 @@ describe('package metadata', () => {
     assert.equal(tsconfig.compilerOptions.rootDir, 'src')
     assert.equal(tsconfig.compilerOptions.outDir, 'lib')
     assert.match(tsconfig.compilerOptions.target, /^es2024$/i)
-    for (const test of ['protocols', 'evaluator', 'workspace', 'runner', 'provider', 'skills', 'package']) {
+    for (const test of ['protocols', 'evaluator', 'workspace', 'runner', 'provider', 'skills', 'registry', 'package']) {
       assert.equal((await stat(join(root, `tests/${test}.test.ts`))).isFile(), true, test)
     }
     const testFiles = await readdir(join(root, 'tests'))

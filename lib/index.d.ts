@@ -5,8 +5,8 @@
  * skills on `ctx.skills`. Model-facing tools are installed by
  * `cordis.patch.yml` through `@deepseek-ai/dsh-tool-subagent`.
  */
-import { AutoResearchProvider, AutoResearchServiceImpl, resolveConfig } from './provider.js';
-import { LayerFSWorkspaceFactory, SnapshotWorkspaceFactory, layerfsWorkspacePlugin, snapshotWorkspacePlugin } from './layerfs-workspace.js';
+import { AutoResearchProvider, resolveConfig } from './provider.js';
+import { ResearchWorkspaceRegistry } from './registry.js';
 import type { Config as PluginConfig, PluginContext, ResolvedConfig } from './types.js';
 export declare const name = "dsh-auto-research";
 export declare const inject: string[];
@@ -31,11 +31,12 @@ export declare const Config: Readonly<{
     };
 }>;
 /**
- * Register the `autoResearch` service, concrete workspace backend plugins, the
- * `auto-research` SubagentProvider, and the packaged skills.
+ * Provide `ctx.researchWorkspace`, then register the `auto-research`
+ * SubagentProvider and the packaged skills. Workspace backends arrive as
+ * separate plugins (`dsh-auto-research/layerfs`, `dsh-auto-research/snapshot`).
  */
 export declare function apply(ctx: PluginContext, config?: PluginConfig): void;
-export { AutoResearchProvider, AutoResearchServiceImpl, LayerFSWorkspaceFactory, SnapshotWorkspaceFactory, layerfsWorkspacePlugin, snapshotWorkspacePlugin, resolveConfig, };
-export type { AutoResearchService, SubprocessServiceLike, WorkspaceBackend, WorkspaceBackendCreateOptions, WorkspaceBackendFactory, } from './types.js';
+export { AutoResearchProvider, ResearchWorkspaceRegistry, resolveConfig };
+export type { ResearchWorkspaceService, WorkspaceBackend, WorkspaceBackendCreateOptions, WorkspaceBackendFactory, } from './types.js';
 export { COORDINATOR_SKILL, SKILLS_ROOT, WORKER_SKILL, buildWorkerPrompt, skillFile, } from './skills.js';
 //# sourceMappingURL=index.d.ts.map

@@ -367,47 +367,16 @@ export declare function loadLayerfs(settings: LayerFSSettings): Promise<{
     activate: () => void;
 }>;
 /**
- * Concrete `WorkspaceBackendFactory` for full-copy snapshot branches.
- */
-export declare class SnapshotWorkspaceFactory implements WorkspaceBackendFactory {
-    readonly name = "snapshot";
-    create({ output, runId }: WorkspaceBackendCreateOptions): Promise<SnapshotBackend>;
-}
-/**
  * Concrete `WorkspaceBackendFactory` for LayerFS copy-on-write branches.
  *
- * Returns `null` when LayerFS is explicitly opted out (`config.layerfs: false`),
- * when another backend is explicitly requested, or when no LayerFS project/SDK
- * is bound and `config.workspaceBackend` is not `'layerfs'`.
+ * Returns `null` when LayerFS is opted out (`config.layerfs: false`) or no
+ * LayerFS project/SDK is bound.
  */
 export declare class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
     readonly name = "layerfs";
+    readonly priority = 100;
     create({ output, runId, config, env, layerfs, }: WorkspaceBackendCreateOptions): Promise<LayerFSBackend | null>;
 }
-/**
- * Cordis plugin that registers `SnapshotWorkspaceFactory` on `ctx.autoResearch`.
- */
-export declare const snapshotWorkspacePlugin: Readonly<{
-    name: "dsh-auto-research-workspace-snapshot";
-    inject: readonly ["autoResearch"];
-    apply(ctx: PluginContext): void;
-}>;
-/**
- * Cordis plugin that registers `LayerFSWorkspaceFactory` on `ctx.autoResearch`.
- */
-export declare const layerfsWorkspacePlugin: Readonly<{
-    name: "dsh-auto-research-workspace-layerfs";
-    inject: readonly ["autoResearch"];
-    apply(ctx: PluginContext): void;
-}>;
-/**
- * Build the workspace manager from registered `WorkspaceBackendFactory` providers
- * (defaulting to `[LayerFSWorkspaceFactory, SnapshotWorkspaceFactory]`), preferring
- * LayerFS when bound.
- */
-export declare function createWorkspaceManager({ output, runId, config, env, layerfs, backends, }: WorkspaceBackendCreateOptions & {
-    backends?: WorkspaceBackendFactory[];
-}): Promise<WorkspaceManager>;
 /**
  * Resolve the optional compact research seed named by `plan.workspace`.
  * It must be a regular, symlink-free subdirectory inside `root`.

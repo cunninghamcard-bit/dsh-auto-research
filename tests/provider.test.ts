@@ -12,7 +12,8 @@ import {
 } from '../lib/provider.js'
 import { Config, apply, name as pluginName, inject } from '../lib/index.js'
 import { ResearchStoppedError } from '../lib/runner.js'
-import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
+import { ResearchWorkspaceRegistry } from '../lib/registry.js'
+import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, testWorkspaces, fakePluginContext } from './helpers.ts'
 
 function planObject(root: string, extra: Record<string, any> = {}): any {
   return {
@@ -48,7 +49,7 @@ async function fixture(root: string, {
     await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
     return { output: [], stopReason: 'completed' }
   }), ['worker'])
-  const provider = new AutoResearchProvider({
+  const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
     ctx: { subagents, logger: { info() {}, warn() {} } },
     config: {
       workerProvider: 'worker',
@@ -145,13 +146,16 @@ describe('plugin entry', () => {
   it('registers the provider and the packaged skills, without a system prompt section', async () => {
     const registered: any[] = []
     const skillFactories: any[] = []
-    const ctx: any = {
+    const ctx = fakePluginContext({
       subagents: {
-        registerProvider(provider: any) { registered.push(provider) },
+        registerProvider(provider: any) { registered.push(provider); return () => {} },
       },
       skills: { registerProvider(factory: any) { skillFactories.push(factory) } },
-    }
+    })
     apply(ctx, { branches: 2, rsiTop: false })
+    // The core provides the backend registry and registers no backend itself.
+    assert.ok(ctx.researchWorkspace instanceof ResearchWorkspaceRegistry)
+    assert.deepEqual(ctx.researchWorkspace.list(), [])
     assert.equal(pluginName, 'dsh-auto-research')
     assert.deepEqual(inject, ['subagents', 'skills'])
     assert.equal(registered.length, 1)
@@ -167,6 +171,11 @@ describe('plugin entry', () => {
     assert.deepEqual((await skills.list({ cwd: '/work/branch/src' })).map((entry: any) => entry.name), ['auto-research-worker'])
     lease.dispose()
     assert.equal(invalidated, 2)
+    // Unloading releases the provider's shellEnv contributor.
+    let released = 0
+    ;(registered[0] as any).disposeShellEnv = () => { released += 1 }
+    ctx.dispose()
+    assert.equal(released, 1)
   })
 })
 
@@ -218,7 +227,7 @@ describe('AutoResearchProvider', () => {
         await setState(spec.request.cwd, { score: 5, metrics: { score: 5 } })
         return { output: [], stopReason: 'completed' }
       }, ['worker'])
-      const provider = new AutoResearchProvider({ ctx: { subagents, logger: {} }, config: { workerProvider: 'worker' } })
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), ctx: { subagents, logger: {} }, config: { workerProvider: 'worker' } })
       const handle = await provider.start({
         cwd,
         prompt: [{ type: 'text', text: 'Plan:\n```json\n' + JSON.stringify(plan) + '\n```' }],
@@ -236,7 +245,7 @@ describe('AutoResearchProvider', () => {
     await withTemp(async root => {
       const cwd = join(root, 'repo')
       await writeWorkspace(cwd, { score: 1, metrics: { score: 1 } })
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
         ctx: { subagents: fakeSubagents(async () => ({ stopReason: 'completed' }), ['worker']) },
         config: { workerProvider: 'worker' },
       })
@@ -269,7 +278,7 @@ describe('AutoResearchProvider', () => {
       await writeFile(join(cwd, '.auto-research-methods', 'plan.json'), JSON.stringify({
         ...planObject(cwd), evaluator: join(cwd, 'missing.mjs'),
       }))
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
         ctx: { subagents: fakeSubagents(async () => ({ stopReason: 'completed' }), ['worker']) },
         config: { workerProvider: 'worker' },
       })
@@ -277,7 +286,7 @@ describe('AutoResearchProvider', () => {
     })
     await withTemp(async root => {
       const { cwd } = await fixture(root)
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
         ctx: { subagents: fakeSubagents(async () => ({ stopReason: 'completed' }), ['worker']) },
         config: { workerProvider: 'worker', branches: 1 },
       })
@@ -285,7 +294,7 @@ describe('AutoResearchProvider', () => {
     })
     await withTemp(async root => {
       const { cwd } = await fixture(root)
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
         ctx: { subagents: { list: () => ['auto-research'], startActivation() {} } } as any,
         config: { workerProvider: 'auto-research' },
       })
@@ -293,7 +302,7 @@ describe('AutoResearchProvider', () => {
     })
     await withTemp(async root => {
       const { cwd } = await fixture(root)
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
         ctx: { subagents: { list: () => ['auto-research'], startActivation() {} } } as any,
         config: {},
       })
@@ -301,7 +310,7 @@ describe('AutoResearchProvider', () => {
     })
     await withTemp(async root => {
       const { cwd } = await fixture(root)
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
         ctx: { subagents: { list: () => ['worker'], startActivation() {} } } as any,
         config: { workerProvider: 'missing' },
       })
@@ -398,33 +407,5 @@ describe('AutoResearchProvider', () => {
         signal: new AbortController().signal,
       }), /Original workspace changed/)
     })
-  })
-
-  it('exposes ctx.autoResearch service interface for workspace backend plugins', async () => {
-    const ctx: any = {
-      subagents: { registerProvider() {} },
-      skills: { registerProvider() {} },
-    }
-    apply(ctx, {})
-    assert.ok(ctx.autoResearch)
-    assert.deepEqual(
-      ctx.autoResearch.listWorkspaceBackends().map((b: any) => b.name),
-      ['layerfs', 'snapshot'],
-    )
-    const customBackend = {
-      name: 'custom-backend',
-      async create() { return null },
-    }
-    const disposeBackend = ctx.autoResearch.registerWorkspaceBackend(customBackend)
-    assert.deepEqual(
-      ctx.autoResearch.listWorkspaceBackends().map((b: any) => b.name),
-      ['layerfs', 'custom-backend', 'snapshot'],
-    )
-    assert.equal(ctx.autoResearch.getWorkspaceBackend('custom-backend')?.name, 'custom-backend')
-    disposeBackend()
-    assert.deepEqual(
-      ctx.autoResearch.listWorkspaceBackends().map((b: any) => b.name),
-      ['layerfs', 'snapshot'],
-    )
   })
 })

@@ -10,7 +10,9 @@ Stack: strict TypeScript (ES2024, compiled to `lib/` with declarations and sourc
 
 | Cordis row | Contribution |
 | --- | --- |
-| `subagent-auto-research` | Registers the `auto-research` provider and the `auto-research` / `auto-research-worker` skills |
+| `subagent-auto-research` | Provides `ctx.researchWorkspace` and registers the `auto-research` provider and the `auto-research` / `auto-research-worker` skills |
+| `auto-research-layerfs` | Registers LayerFS copy-on-write branches on `ctx.researchWorkspace` (priority 100) |
+| `auto-research-snapshot` | Registers full-copy snapshot branches on `ctx.researchWorkspace` (priority 0, the fallback) |
 | `tool-subagent-auto-research` | Exposes `subagent_auto_research` through `@deepseek-ai/dsh-tool-subagent` with provider-managed depth |
 
 The coordinator loads the `auto-research` skill. It inspects the repository, writes a plan, delegates one batch, then reviews `RESULT.json`, `DASHBOARD.json`, `LEADER.json`, `SELECTIONS.json`, and any cooperative evidence before deciding whether another batch is justified.
@@ -35,7 +37,7 @@ All of these are removed when the activation ends, before evaluation and commit;
 
 ## Install
 
-Add the bundle to a DSH profile (the plugin manager reads `dsh.bundle.patch`), or insert the two rows from [`cordis.patch.yml`](cordis.patch.yml) into the profile patch manually. The block below is that file verbatim; the configuration table lists the code defaults, which a profile row overrides. The plugin injects the `skills` service, so the profile must load `@deepseek-ai/dsh-skill` and `@deepseek-ai/dsh-tool-skill` (the DSH base bundle does). The provider expects at least one other registered `ctx.subagents` provider to execute workers (`claude-code`, `codex`, `acp`, `dsh-sdk`, `spawn`, …). Set `workerProvider` when the profile has more than one candidate.
+Add the bundle to a DSH profile (the plugin manager reads `dsh.bundle.patch`), or insert the rows from [`cordis.patch.yml`](cordis.patch.yml) into the profile patch manually. The block below is that file verbatim; the configuration table lists the code defaults, which a profile row overrides. The plugin injects the `skills` service, so the profile must load `@deepseek-ai/dsh-skill` and `@deepseek-ai/dsh-tool-skill` (the DSH base bundle does). The provider expects at least one other registered `ctx.subagents` provider to execute workers (`claude-code`, `codex`, `acp`, `dsh-sdk`, `spawn`, …). Set `workerProvider` when the profile has more than one candidate.
 
 ```yaml
 - insert:
@@ -51,6 +53,12 @@ Add the bundle to a DSH profile (the plugin manager reads `dsh.bundle.patch`), o
         forkAndFlush: true
         shareContext: false
         sharingIntervalMinutes: 10
+
+    - id: auto-research-layerfs
+      name: 'dsh-auto-research/layerfs'
+
+    - id: auto-research-snapshot
+      name: 'dsh-auto-research/snapshot'
 
     - id: tool-subagent-auto-research
       name: '@deepseek-ai/dsh-tool-subagent'
@@ -75,7 +83,8 @@ Add the bundle to a DSH profile (the plugin manager reads `dsh.bundle.patch`), o
 | `forkAndFlush` | `false` | Force a fresh explore cohort every round |
 | `shareContext` | `false` | Enable cooperative checkpoints and peer review |
 | `sharingIntervalMinutes` | `10` | Checkpoint cadence inside a phase window |
-| `layerfs` | auto | Explicit LayerFS settings; `false` forces the snapshot backend |
+| `workspaceBackend` | `auto` | Registered backend name (`layerfs`, `snapshot`, or a third-party one); `auto` takes the first available by priority. A plan may override it in `options.workspaceBackend` |
+| `layerfs` | auto | Explicit LayerFS settings; `false` makes the `layerfs` backend decline the batch |
 | `workerEnv` | `{}` | Non-secret environment facts shown to workers |
 
 Every plan may include an `options` object that overrides these per-batch values. The model chooses scientific values; the plugin only rejects impossible combinations (for example a metric subset larger than the declared metric set).
@@ -160,7 +169,7 @@ Everything lives under `<checkout>/.auto-research-methods/runs/<run-id>/`:
 
 ## LayerFS integration
 
-When `DSH_LAYERFS_PROJECT` and `DSH_LAYERFS_SDK` are present (or `config.layerfs` provides them), branches use `branch.fork`, `workspace.mount`, `workspace.commit`, and `workspace.unmount`. `Busy` refusals are retried with exponential backoff, branch names stay within Docker's 63-character limit, and adopted branch names are validated. Verified states are committed; completed branches that were scientifically rejected are committed as `rejected` and unmounted with `discard: false`, so losing work remains in LayerFS history. Provider failures and timed-out work are committed as unverified and kept for review. Without a bound project, a full-copy snapshot backend with content-addressed checkpoint objects is used.
+When `DSH_LAYERFS_PROJECT` and `DSH_LAYERFS_SDK` are present (or `config.layerfs` provides them), branches use `branch.fork`, `workspace.mount`, `workspace.commit`, and `workspace.unmount`. `Busy` refusals are retried with exponential backoff, branch names stay within Docker's 63-character limit, and adopted branch names are validated. Verified states are committed; completed branches that were scientifically rejected are committed as `rejected` and unmounted with `discard: false`, so losing work remains in LayerFS history. Provider failures and timed-out work are committed as unverified and kept for review. Without a bound project the `layerfs` factory declines and `auto` selection falls through to the `snapshot` backend (full copies with content-addressed checkpoint objects). The core registers no backend of its own: when nothing is available the batch fails and names the registered backends. A third-party backend imports its types and the shared workspace utilities from `dsh-auto-research/api`, injects `researchWorkspace`, and calls `ctx.researchWorkspace.register({ name, priority, create })`.
 
 The provider resolves `DSH_LAYERFS_PROJECT`, `DSH_LAYERFS_SDK`, `DSH_LAYERFS_OPERATOR`, `DSH_LAYERFS_CLI`, `DSH_LAYERFS_SKILL`, `DSH_LAYERFS_HOME`, `DSH_LAYERFS_STORE_PATH`, `DSH_LAYERFS_DOCKER`, `DSH_LAYERFS_IMAGE`, `DSH_LAYERFS_VOLUME`, `DSH_LAYERFS_DAEMON`, `DSH_LAYERFS_CONTAINER_PREFIX`, and `DSH_LAYERFS_DAEMON_HOST` from `config.layerfs`, `process.env`, and the session's `ctx.shellEnv` contributors. Explicit `config.layerfs` wins. A host-injected `layerfs.client` is never closed by this plugin.
 

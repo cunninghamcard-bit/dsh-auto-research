@@ -6,13 +6,8 @@
  * `cordis.patch.yml` through `@deepseek-ai/dsh-tool-subagent`.
  */
 
-import { AutoResearchProvider, AutoResearchServiceImpl, resolveConfig } from './provider.js'
-import {
-  LayerFSWorkspaceFactory,
-  SnapshotWorkspaceFactory,
-  layerfsWorkspacePlugin,
-  snapshotWorkspacePlugin,
-} from './layerfs-workspace.js'
+import { AutoResearchProvider, resolveConfig } from './provider.js'
+import { ResearchWorkspaceRegistry } from './registry.js'
 import { registerSkills } from './skills.js'
 import type { Config as PluginConfig, PluginContext, ResolvedConfig } from './types.js'
 
@@ -40,49 +35,23 @@ export const Config = Object.freeze({
 })
 
 /**
- * Register the `autoResearch` service, concrete workspace backend plugins, the
- * `auto-research` SubagentProvider, and the packaged skills.
+ * Provide `ctx.researchWorkspace`, then register the `auto-research`
+ * SubagentProvider and the packaged skills. Workspace backends arrive as
+ * separate plugins (`dsh-auto-research/layerfs`, `dsh-auto-research/snapshot`).
  */
 export function apply(ctx: PluginContext, config?: PluginConfig): void {
-  const resolved = resolveConfig(config)
-  const provider = new AutoResearchProvider({ ctx, config: resolved })
-  try {
-    ctx.provide?.('autoResearch')
-    ctx.autoResearch = provider.service
-  } catch {
-    // Host context may have read-only properties in minimal unit tests.
-  }
-  layerfsWorkspacePlugin.apply(ctx)
-  snapshotWorkspacePlugin.apply(ctx)
-
-  const disposeProvider = ctx.subagents.registerProvider?.(provider)
+  const workspaces = new ResearchWorkspaceRegistry()
+  ctx.provide('researchWorkspace', workspaces)
+  const provider = new AutoResearchProvider({ ctx, config: resolveConfig(config), workspaces })
   const skills = registerSkills(ctx.skills!, cwd => provider.workerEnvs.ownsCheckout(cwd))
   provider.workerEnvs.onChange = skills.invalidate
-  const effectFn = (ctx as { effect?: (cb: () => () => void) => void }).effect
-  if (typeof effectFn === 'function') {
-    try {
-      effectFn(() => () => {
-        if (typeof disposeProvider === 'function') (disposeProvider as () => void)()
-        provider.dispose()
-      })
-    } catch {
-      // Host does not support ctx.effect.
-    }
-  }
+  ctx.subagents.registerProvider(provider)
+  ctx.effect(() => () => provider.dispose())
 }
 
-export {
-  AutoResearchProvider,
-  AutoResearchServiceImpl,
-  LayerFSWorkspaceFactory,
-  SnapshotWorkspaceFactory,
-  layerfsWorkspacePlugin,
-  snapshotWorkspacePlugin,
-  resolveConfig,
-}
+export { AutoResearchProvider, ResearchWorkspaceRegistry, resolveConfig }
 export type {
-  AutoResearchService,
-  SubprocessServiceLike,
+  ResearchWorkspaceService,
   WorkspaceBackend,
   WorkspaceBackendCreateOptions,
   WorkspaceBackendFactory,

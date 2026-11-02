@@ -5,7 +5,8 @@
  * `start()` before publication; after the handle is returned, every terminal
  * outcome settles through `result` (never a rejection), as the seam requires.
  */
-import type { AutoResearchService, Config, PluginContext, ResearchPlanInput, ResolvedConfig, SubagentProvider, SubagentRun, SubagentStartRequest, WorkspaceBackendFactory } from './types.js';
+import type { ResearchWorkspaceRegistry } from './registry.js';
+import type { Config, ProviderContext, ResearchPlanInput, ResolvedConfig, SubagentProvider, SubagentRun, SubagentStartRequest } from './types.js';
 /** Out-of-process capability advertisement: forwards child `agentOptions` to worker branches. */
 export declare const NO_START_CAPABILITIES: Record<string, unknown>;
 /** Normalize plugin config (also used by the Cordis standard schema). */
@@ -129,29 +130,15 @@ export declare const DSH_RESERVED_ENV_KEYS: Set<string>;
 export declare function declaredWorkerEnvKeys(workerEnv?: Record<string, unknown> | null): Record<string, {
     description: string;
 }>;
-/**
- * Concrete registry implementation of `ctx.autoResearch` (`AutoResearchService`).
- *
- * Pre-seeded with `[LayerFSWorkspaceFactory, SnapshotWorkspaceFactory]`, while
- * allowing workspace backend plugins (`layerfsWorkspacePlugin`,
- * `snapshotWorkspacePlugin`, or custom workspace plugins) to register or
- * override backends.
- */
-export declare class AutoResearchServiceImpl implements AutoResearchService {
-    private readonly backends;
-    registerWorkspaceBackend(factory: WorkspaceBackendFactory): () => void;
-    getWorkspaceBackend(name: string): WorkspaceBackendFactory | undefined;
-    listWorkspaceBackends(): WorkspaceBackendFactory[];
-}
 /** One provider instance, normally created by the Cordis plugin entry. */
 export declare class AutoResearchProvider implements SubagentProvider {
-    readonly ctx: PluginContext;
+    readonly ctx: ProviderContext;
     readonly config: ResolvedConfig;
     readonly name: string;
     readonly capabilities: Record<string, unknown>;
     readonly inheritsParentContext: boolean;
-    /** Capability registry exposed on `ctx.autoResearch`. */
-    readonly service: AutoResearchService;
+    /** Workspace backends registered by `ctx.researchWorkspace` plugins. */
+    readonly workspaces: ResearchWorkspaceRegistry;
     /** Branch environments of the workers that are running right now. */
     readonly workerEnvs: WorkerEnvRegistry;
     /**
@@ -168,18 +155,17 @@ export declare class AutoResearchProvider implements SubagentProvider {
     /** Batches whose runner is still alive (used to reject recursive delegation). */
     activeBatches: number;
     private disposeShellEnv;
-    constructor({ ctx, config }: {
-        ctx: PluginContext;
+    constructor({ ctx, config, workspaces }: {
+        ctx: ProviderContext;
         config?: Config;
+        workspaces: ResearchWorkspaceRegistry;
     });
     /** The `ctx.subprocess` service (`@deepseek-ai/dsh-subprocess`), read safely. */
     private subprocessService;
-    /** Existing `ctx.autoResearch` service if already provided on `ctx`. */
-    private autoResearchService;
-    /** Release the shell-env registration (the Cordis fiber normally owns it). */
-    dispose(): void;
     /** The `ctx.shellEnv` service, read without tripping Cordis's inject guard. */
     private shellEnvService;
+    /** Release the `shellEnv` contributor when the plugin unloads. */
+    dispose(): void;
     /**
      * Register the branch `shellEnv` contributor once a `dsh` shell registry is
      * available. The registry may be injected after this provider is built, so
@@ -235,7 +221,8 @@ export declare class AutoResearchProvider implements SubagentProvider {
 }
 /** @returns a provider for the Cordis entry point. */
 export declare function createProvider(options: {
-    ctx: PluginContext;
+    ctx: ProviderContext;
     config?: Config;
+    workspaces: ResearchWorkspaceRegistry;
 }): AutoResearchProvider;
 //# sourceMappingURL=provider.d.ts.map

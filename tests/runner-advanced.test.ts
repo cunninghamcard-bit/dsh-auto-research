@@ -7,9 +7,9 @@ import {
   ResearchStoppedError,
   Runner,
 } from '../lib/runner.js'
-import { LayerFSBackend, WorkspaceManager, createWorkspaceManager, inventory } from '../lib/layerfs-workspace.js'
+import { LayerFSBackend, WorkspaceManager, inventory } from '../lib/layerfs-workspace.js'
 import { SHARED_CONTEXT_PREAMBLE } from '../lib/protocols.js'
-import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
+import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, snapshotManager } from './helpers.ts'
 
 const sha256 = (data: any) => createHash('sha256').update(data).digest('hex')
 
@@ -63,7 +63,7 @@ async function setup(root: string, {
   const plan = planFor(root, extraPlan)
   Object.assign(plan.options, options)
   const output = join(root, 'out')
-  const workspaceManager = manager ?? await createWorkspaceManager({ output, runId: 'run', env: {} })
+  const workspaceManager = manager ?? snapshotManager({ output, runId: 'run', env: {} })
   const service = subagents ?? fakeSubagents(worker)
   const runner = new Runner({
     config: {},

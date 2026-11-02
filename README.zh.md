@@ -10,7 +10,9 @@
 
 | Cordis 行 | 作用 |
 | --- | --- |
-| `subagent-auto-research` | 注册 `auto-research` provider 与 `auto-research` / `auto-research-worker` 两个 skill |
+| `subagent-auto-research` | 提供 `ctx.researchWorkspace`，注册 `auto-research` provider 与 `auto-research` / `auto-research-worker` 两个 skill |
+| `auto-research-layerfs` | 在 `ctx.researchWorkspace` 注册 LayerFS 写时复制分支（优先级 100） |
+| `auto-research-snapshot` | 在 `ctx.researchWorkspace` 注册全量复制快照分支（优先级 0，回退） |
 | `tool-subagent-auto-research` | 通过 `@deepseek-ai/dsh-tool-subagent` 暴露 `subagent_auto_research`，深度由 provider 管理 |
 
 协调者加载 `auto-research` skill。它检查仓库、编写计划、委派一个批次，然后审阅 `RESULT.json`、`DASHBOARD.json`、`LEADER.json`、`SELECTIONS.json` 以及协作证据，再决定是否运行下一批。
@@ -36,7 +38,7 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
 
 ## 安装
 
-把该 bundle 加入 DSH profile（插件管理器会读取 `dsh.bundle.patch`），或手动把 [`cordis.patch.yml`](cordis.patch.yml) 中的两行插入 profile patch。下面的代码块与该文件逐字一致；配置表列的是代码默认值，profile 中的配置会覆盖它们。插件注入 `skills` 服务，profile 必须加载 `@deepseek-ai/dsh-skill` 与 `@deepseek-ai/dsh-tool-skill`（DSH base bundle 已包含）。provider 需要至少一个其他已注册的 `ctx.subagents` provider 来执行 worker（`claude-code`、`codex`、`acp`、`dsh-sdk`、`spawn` 等）。存在多个候选时请显式设置 `workerProvider`。
+把该 bundle 加入 DSH profile（插件管理器会读取 `dsh.bundle.patch`），或手动把 [`cordis.patch.yml`](cordis.patch.yml) 中的各行插入 profile patch。下面的代码块与该文件逐字一致；配置表列的是代码默认值，profile 中的配置会覆盖它们。插件注入 `skills` 服务，profile 必须加载 `@deepseek-ai/dsh-skill` 与 `@deepseek-ai/dsh-tool-skill`（DSH base bundle 已包含）。provider 需要至少一个其他已注册的 `ctx.subagents` provider 来执行 worker（`claude-code`、`codex`、`acp`、`dsh-sdk`、`spawn` 等）。存在多个候选时请显式设置 `workerProvider`。
 
 ```yaml
 - insert:
@@ -52,6 +54,12 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
         forkAndFlush: true
         shareContext: false
         sharingIntervalMinutes: 10
+
+    - id: auto-research-layerfs
+      name: 'dsh-auto-research/layerfs'
+
+    - id: auto-research-snapshot
+      name: 'dsh-auto-research/snapshot'
 
     - id: tool-subagent-auto-research
       name: '@deepseek-ai/dsh-tool-subagent'
@@ -76,7 +84,8 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
 | `forkAndFlush` | `false` | 每轮强制启动新的探索 cohort |
 | `shareContext` | `false` | 启用协作检查点与 peer review |
 | `sharingIntervalMinutes` | `10` | 阶段窗口内的检查点节奏 |
-| `layerfs` | 自动 | 显式 LayerFS 设置；`false` 强制使用快照后端 |
+| `workspaceBackend` | `auto` | 已注册的后端名称（`layerfs`、`snapshot` 或第三方后端）；`auto` 按优先级取第一个可用的。计划可在 `options.workspaceBackend` 覆盖 |
+| `layerfs` | 自动 | 显式 LayerFS 设置；`false` 使 `layerfs` 后端拒绝本批次 |
 | `workerEnv` | `{}` | 展示给 worker 的非机密环境事实 |
 
 计划可以包含 `options` 对象，按批次覆盖上述值。科学取值由模型决定；插件只拒绝不可能的组合（例如指标子集大于已声明指标集）。
@@ -161,7 +170,7 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
 
 ## LayerFS 集成
 
-存在 `DSH_LAYERFS_PROJECT` 与 `DSH_LAYERFS_SDK`（或 `config.layerfs` 提供）时，分支使用 `branch.fork`、`workspace.mount`、`workspace.commit` 与 `workspace.unmount`。`Busy` 拒绝会以指数退避重试；分支名保持在 63 字符以内；被采用的分支名会先校验。验证通过的状态会提交，并以其 LayerFS 分支作为检查点；已完成的科学拒绝分支会以 `rejected` 提交并以 `discard: false` 卸载，保留在 LayerFS 历史中；provider 失败与超时的工作会作为未验证状态提交并保留以供审阅。没有绑定项目时，使用全量拷贝快照后端与内容寻址检查点对象。
+存在 `DSH_LAYERFS_PROJECT` 与 `DSH_LAYERFS_SDK`（或 `config.layerfs` 提供）时，分支使用 `branch.fork`、`workspace.mount`、`workspace.commit` 与 `workspace.unmount`。`Busy` 拒绝会以指数退避重试；分支名保持在 63 字符以内；被采用的分支名会先校验。验证通过的状态会提交，并以其 LayerFS 分支作为检查点；已完成的科学拒绝分支会以 `rejected` 提交并以 `discard: false` 卸载，保留在 LayerFS 历史中；provider 失败与超时的工作会作为未验证状态提交并保留以供审阅。没有绑定项目时 `layerfs` 工厂返回 null，`auto` 选择落到 `snapshot` 后端（全量拷贝与内容寻址检查点对象）。核心自身不注册任何后端：没有可用后端时批次失败，错误信息列出已注册的后端。第三方后端从 `dsh-auto-research/api` 引入类型与共享工具，inject `researchWorkspace`，并调用 `ctx.researchWorkspace.register({ name, priority, create })`。
 
 真实 LayerFS 挂载返回 Sandbox 内部路径（如 `/workspaces/1`）。当该路径在宿主上不可访问时，后端在 `<run>/<branch>/workspace` 暂存宿主副本，并在该副本上执行评估与 worker，同时在提交时用 `client.fs.apply`（或 `fs.write`/`fs.rm`）发布新增/修改/删除的文件，再调用 `workspace.commit`。冻结基线后会重新挂载分支，使 Sandbox 内的 `/workspaces/<n>` 与宿主暂存副本一致；worker 轮次结束后会把已提交的 Sandbox 覆盖层同步回宿主副本再评估。`fs.read` 无法表示的二进制文件通过 `workspace.exec` + `base64` 原样复制，无法复制时标记为跳过且绝不会被误删。worker 还会收到 `DSH_AUTO_RESEARCH_BRANCH` 与 `DSH_AUTO_RESEARCH_SANDBOX_PATH`。
 

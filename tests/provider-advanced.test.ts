@@ -6,7 +6,7 @@ import {
   AutoResearchProvider,
   acquireRunnerLock,
 } from '../lib/provider.js'
-import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
+import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, testWorkspaces } from './helpers.ts'
 
 function planObject(root: string, extra: Record<string, any> = {}): any {
   return {
@@ -50,7 +50,7 @@ async function fixture(root: string, {
   }))
   const ctx: any = { subagents, logger: { info() {}, warn() {} } }
   if (shellEnv) ctx.shellEnv = shellEnv
-  const provider = new AutoResearchProvider({
+  const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
     ctx,
     config: {
       workerProvider: 'worker',
@@ -188,7 +188,7 @@ describe('P0/P1: leader adoption, seed runtime, and cancellation artifacts', () 
         await setState(spec.request.cwd, { score: 3, metrics: { score: 3 } })
         return { output: [], stopReason: 'completed' }
       })
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
         ctx: { subagents, logger: {} },
         config: { workerProvider: 'worker', branches: 2, explorationMinutes: 0.5, exploitationMinutes: 0.5 },
       })
@@ -297,29 +297,29 @@ describe('P1: checkout lock and worker selection', () => {
         get: (name: string) => providers[name],
       },
     }
-    assert.equal(new AutoResearchProvider({ ctx, config: {} }).workerProviderName(), 'claude-code')
-    const getter = new AutoResearchProvider({
+    assert.equal(new AutoResearchProvider({ workspaces: testWorkspaces(), ctx, config: {} }).workerProviderName(), 'claude-code')
+    const getter = new AutoResearchProvider({ workspaces: testWorkspaces(),
       ctx: { subagents: { list: () => ['fork', 'acp'], getProvider: (name: string) => providers[name] } } as any,
       config: {},
     })
     assert.equal(getter.workerProviderName(), 'acp')
 
-    const onlyFork = new AutoResearchProvider({
+    const onlyFork = new AutoResearchProvider({ workspaces: testWorkspaces(),
       ctx: { subagents: { list: () => ['fork'], get: (name: string) => providers[name] } } as any,
       config: {},
     })
     assert.equal(onlyFork.workerProviderName(), 'fork')
 
-    const recursive = new AutoResearchProvider({
+    const recursive = new AutoResearchProvider({ workspaces: testWorkspaces(),
       ctx: { subagents: { list: () => ['auto-research', 'fork'], describe: (name: string) => providers[name] } } as any,
       config: {},
     })
     assert.equal(recursive.workerProviderName(), 'fork')
-    assert.throws(() => new AutoResearchProvider({
+    assert.throws(() => new AutoResearchProvider({ workspaces: testWorkspaces(),
       ctx: { subagents: { list: () => ['auto-research'] } } as any,
       config: { workerProvider: 'auto-research' },
     }).workerProviderName(), /cannot delegate to itself/)
-    assert.throws(() => new AutoResearchProvider({
+    assert.throws(() => new AutoResearchProvider({ workspaces: testWorkspaces(),
       ctx: { subagents: { list: () => ['auto-research'] } } as any,
       config: {},
     }).workerProviderName(), /at least one other/)

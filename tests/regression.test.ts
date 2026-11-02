@@ -33,7 +33,6 @@ import {
   LayerFSBackend,
   applyEnvironmentPatch,
   applyLayerfsEnvironment,
-  createWorkspaceManager,
   inventory,
   jsonDigest,
   layerfsEnvironment,
@@ -48,7 +47,7 @@ import {
   writeJsonAtomic,
 } from '../lib/layerfs-workspace.js'
 import { FrozenEvaluator, runEvaluatorProcess, scoreValue } from '../lib/evaluator.js'
-import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
+import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, testWorkspaces, snapshotManager } from './helpers.ts'
 
 const SANDBOX_PATH = `/workspaces/regression-${process.pid}`
 
@@ -93,7 +92,7 @@ async function setupRunner(root: string, {
   const plan = planFor(root, extraPlan)
   Object.assign(plan.options, options)
   const output = join(root, 'out')
-  const workspaceManager = manager ?? await createWorkspaceManager({ output, runId: 'run', env: {} })
+  const workspaceManager = manager ?? snapshotManager({ output, runId: 'run', env: {} })
   const service = subagents ?? fakeSubagents(worker)
   const runner = new Runner({
     config: {},
@@ -197,7 +196,7 @@ async function providerFixture(root: string, { config = {}, shellEnv = null, pla
   })
   const ctx: any = { subagents, logger: { info() {}, warn() {} } }
   if (shellEnv) ctx.shellEnv = shellEnv
-  const provider = new AutoResearchProvider({
+  const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
     ctx,
     config: {
       workerProvider: 'worker',
@@ -255,18 +254,6 @@ export class LayerFS {
         else process.env[key] = saved[key]
       }
     }
-  })
-
-  it('createWorkspaceManager prefers the false opt-out over a bound environment', async () => {
-    await withTemp(async root => {
-      const manager = await createWorkspaceManager({
-        output: join(root, 'out'),
-        runId: 'r',
-        config: { layerfs: false },
-        env: { DSH_LAYERFS_PROJECT: 'p', DSH_LAYERFS_SDK: 'file:///sdk.js' },
-      })
-      assert.equal(manager.kind, 'snapshot')
-    })
   })
 })
 
@@ -839,7 +826,7 @@ describe('R5: worker shell environment injection', () => {
   })
 
   it('filters undeclared keys out of the contributor result', () => {
-    const provider = new AutoResearchProvider({
+    const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
       ctx: {
         subagents: fakeSubagents(async () => ({ output: [], stopReason: 'completed' })),
         logger: {},
@@ -872,7 +859,7 @@ describe('R5: worker shell environment injection', () => {
   it('registers its contributor on the real ctx.shellEnv service shape', () => {
     let registered: any = null
     let disposedWith = null
-    const provider = new AutoResearchProvider({
+    const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
       ctx: {
         subagents: fakeSubagents(async () => ({ output: [], stopReason: 'completed' })),
         logger: {},
@@ -912,7 +899,7 @@ describe('R5: worker shell environment injection', () => {
         await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
         return { output: [], stopReason: 'completed' }
       })
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
         ctx: {
           subagents,
           logger: { info() {}, warn() {} },
@@ -1098,7 +1085,7 @@ describe('R8: the runner lock precedes every artifact write', () => {
         await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
         return { output: [], stopReason: 'completed' }
       })
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
         ctx: { subagents, logger: { info() {}, warn() {} } },
         config: {
           workerProvider: 'worker',
@@ -1383,6 +1370,7 @@ describe('R13: meaningful_gain is validated unconditionally', () => {
     forkAndFlush: false,
     shareContext: false,
     sharingIntervalMinutes: 1,
+    workspaceBackend: 'auto',
   }
 
   it('rejects a negative gain even without RSI', () => {
@@ -1772,7 +1760,7 @@ export class LayerFS {
       [{ rsiTop: 'yes' }, /rsiTop must be a boolean/],
       [{ forkAndFlush: 1 }, /forkAndFlush must be a boolean/],
       [{ shareContext: 'true' }, /shareContext must be a boolean/],
-      [{ workspaceBackend: 'nfs' }, /workspaceBackend must be/],
+      [{ workspaceBackend: '' }, /workspaceBackend must be a non-empty string/],
       [{ providerName: '' }, /providerName must be a non-empty string/],
       [{ planPath: '   ' }, /planPath must be a non-empty string/],
       [{ workerProvider: 7 }, /workerProvider must be a non-empty string/],
@@ -1855,7 +1843,7 @@ describe('R22: worker environments resolve the assigned checkout, not the copied
           async startActivation() { throw new Error('unused') },
         },
       }
-      const provider = new AutoResearchProvider({ ctx, config: { workerEnv: { DSH_R22: '1' } } })
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), ctx, config: { workerEnv: { DSH_R22: '1' } } })
       provider.workerEnvs.register({ id: 'branch-1', checkout, parentSessionId: 'coord', childSessionId: 'child-1' })
       const parent = {
         session: {
@@ -2045,7 +2033,7 @@ describe('R24: staged Sandbox mounts stay bidirectional', () => {
 
   it('calls reconcile after the worker activation and before evaluation', async () => {
     await withTemp(async root => {
-      const base = await createWorkspaceManager({ output: join(root, 'out'), runId: 'run', env: {} })
+      const base = snapshotManager({ output: join(root, 'out'), runId: 'run', env: {} })
       const reconciles: string[] = []
       const manager: any = {
         kind: base.kind,
@@ -2430,7 +2418,7 @@ describe('R31: provider RESULT.json writes are atomic', () => {
         },
         logger: { info() {}, warn() {} },
       }
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
         ctx,
         config: {
           planPath: join(root, 'plan.json'),

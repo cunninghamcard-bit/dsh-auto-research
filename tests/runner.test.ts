@@ -10,8 +10,8 @@ import {
   providerOutcome,
   validatePlan,
 } from '../lib/runner.js'
-import { createWorkspaceManager, inventory } from '../lib/layerfs-workspace.js'
-import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
+import { inventory } from '../lib/layerfs-workspace.js'
+import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, snapshotManager } from './helpers.ts'
 
 const sha256 = (data: any) => createHash('sha256').update(data).digest('hex')
 
@@ -63,7 +63,7 @@ async function setup(root: string, {
   const plan = planFor(root, extraPlan)
   Object.assign(plan.options, options)
   const output = join(root, 'out')
-  const manager = await createWorkspaceManager({ output, runId: 'run', env: {} })
+  const manager = snapshotManager({ output, runId: 'run', env: {} })
   const subagents = fakeSubagents(worker ?? (async (spec: any, index: number) => {
     const target = spec.request.cwd
     await setState(target, { score: 2 + index, metrics: { score: 2 + index } })
@@ -270,7 +270,7 @@ describe('Runner batches', () => {
       assert.ok(latest.frontier.stalled_work_seconds >= 0.001)
 
       const runBatch = async (frontier: any, output: string) => {
-        const manager = await createWorkspaceManager({ output, runId: 'run2', env: {} })
+        const manager = snapshotManager({ output, runId: 'run2', env: {} })
         const subagents = fakeSubagents(flat)
         const runner = new Runner({
           plan: first.plan,

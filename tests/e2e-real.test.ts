@@ -44,6 +44,8 @@ import {
 } from './e2e-support.ts'
 
 const AUTO_RESEARCH = new URL('../lib/index.js', import.meta.url).href
+const LAYERFS_PLUGIN = new URL('../lib/layerfs.js', import.meta.url).href
+const SNAPSHOT_PLUGIN = new URL('../lib/snapshot.js', import.meta.url).href
 const SHELL_ENV = `${DSH_ROOT}/packages/shell/shell-env/lib/index.js`
 const WORKER_KEYS = ['DSH_AUTO_RESEARCH_WORKER', 'DSH_AUTO_RESEARCH_BRANCH', 'DSH_AUTO_RESEARCH_CHECKOUT', 'DSH_AUTO_RESEARCH_SANDBOX_PATH']
 
@@ -321,6 +323,10 @@ async function scenario(backend: string) {
       inject: ['subagents'],
       apply(context: any) { context.subagents.registerProvider(worker) },
     })
+    // The backend plugins load before the core: Cordis holds them until the
+    // core provides `researchWorkspace`.
+    await ctx.plugin(await import(LAYERFS_PLUGIN))
+    const snapshotFiber = await ctx.plugin(await import(SNAPSHOT_PLUGIN))
     const plugin = await import(AUTO_RESEARCH)
     await ctx.plugin(plugin, {
       providerName: 'auto-research',
@@ -399,6 +405,11 @@ async function scenario(backend: string) {
     assert.equal(adopted.workspace.includes(leaderWorkspace), false, 'the deleted checkout was replaced by the adopted branch')
     const secondResult = readJson(join(latest2.run, 'RESULT.json'))
     assert.equal(secondResult.status, 'COMPLETED')
+
+    // Unloading a backend plugin removes its factory.
+    assert.deepEqual(ctx.researchWorkspace.list().map((factory: any) => factory.name), ['layerfs', 'snapshot'])
+    await snapshotFiber.dispose()
+    assert.deepEqual(ctx.researchWorkspace.list().map((factory: any) => factory.name), ['layerfs'])
     return { root, latest, latest2, worker }
   } finally {
     await ctx.fiber?.dispose?.()

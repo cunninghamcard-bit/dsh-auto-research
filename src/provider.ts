@@ -10,9 +10,7 @@ import { randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 import {
-  LayerFSWorkspaceFactory,
-  SnapshotWorkspaceFactory,
-  createWorkspaceManager,
+  WorkspaceManager,
   inventory,
   isContained,
   jsonEqual,
@@ -23,6 +21,7 @@ import {
   withoutLayerfsTrace,
   writeJsonAtomic,
 } from './layerfs-workspace.js'
+import type { ResearchWorkspaceRegistry } from './registry.js'
 import { insideWorkerCheckout } from './skills.js'
 import { FrozenEvaluator } from './evaluator.js'
 import {
@@ -34,12 +33,12 @@ import {
 } from './runner.js'
 import type { Frontier } from './runner.js'
 import type {
-  AutoResearchService,
   Config,
   ContentBlock,
   LayerFSBinding,
   LayerFSSettings,
   PluginContext,
+  ProviderContext,
   ResearchPlanInput,
   ResolvedConfig,
   SubagentProvider,
@@ -48,7 +47,6 @@ import type {
   SubagentStartRequest,
   SubprocessServiceLike,
   WorkerAgentOptions,
-  WorkspaceBackendFactory,
   WorkspaceState,
 } from './types.js'
 
@@ -85,12 +83,7 @@ export function resolveConfig(input: unknown = {}): ResolvedConfig {
       throw new Error(`${key} must be a boolean`)
     }
   }
-  if (config.workspaceBackend !== undefined
-    && config.workspaceBackend !== 'auto'
-    && config.workspaceBackend !== 'layerfs'
-    && config.workspaceBackend !== 'snapshot') {
-    throw new Error("workspaceBackend must be 'auto', 'layerfs' or 'snapshot'")
-  }
+  if (config.workspaceBackend !== undefined) requireNonEmptyString(config.workspaceBackend, 'workspaceBackend')
   for (const key of ['providerName', 'planPath', 'workerProvider'] as const) {
     if (config[key] !== undefined) requireNonEmptyString(config[key], key)
   }
@@ -760,57 +753,15 @@ export function declaredWorkerEnvKeys(
   return keys
 }
 
-/**
- * Concrete registry implementation of `ctx.autoResearch` (`AutoResearchService`).
- *
- * Pre-seeded with `[LayerFSWorkspaceFactory, SnapshotWorkspaceFactory]`, while
- * allowing workspace backend plugins (`layerfsWorkspacePlugin`,
- * `snapshotWorkspacePlugin`, or custom workspace plugins) to register or
- * override backends.
- */
-export class AutoResearchServiceImpl implements AutoResearchService {
-  private readonly backends: WorkspaceBackendFactory[] = [
-    new LayerFSWorkspaceFactory(),
-    new SnapshotWorkspaceFactory(),
-  ]
-
-  registerWorkspaceBackend(factory: WorkspaceBackendFactory): () => void {
-    const existingIndex = this.backends.findIndex(item => item.name === factory.name)
-    if (existingIndex >= 0) {
-      this.backends[existingIndex] = factory
-    } else {
-      // Custom backends registered by plugins take priority before snapshot fallback.
-      const snapshotIndex = this.backends.findIndex(item => item.name === 'snapshot')
-      if (snapshotIndex >= 0) this.backends.splice(snapshotIndex, 0, factory)
-      else this.backends.push(factory)
-    }
-    let disposed = false
-    return () => {
-      if (disposed) return
-      disposed = true
-      const idx = this.backends.indexOf(factory)
-      if (idx >= 0) this.backends.splice(idx, 1)
-    }
-  }
-
-  getWorkspaceBackend(name: string): WorkspaceBackendFactory | undefined {
-    return this.backends.find(item => item.name === name)
-  }
-
-  listWorkspaceBackends(): WorkspaceBackendFactory[] {
-    return [...this.backends]
-  }
-}
-
 /** One provider instance, normally created by the Cordis plugin entry. */
 export class AutoResearchProvider implements SubagentProvider {
-  readonly ctx: PluginContext
+  readonly ctx: ProviderContext
   readonly config: ResolvedConfig
   readonly name: string
   readonly capabilities: Record<string, unknown>
   readonly inheritsParentContext: boolean
-  /** Capability registry exposed on `ctx.autoResearch`. */
-  readonly service: AutoResearchService
+  /** Workspace backends registered by `ctx.researchWorkspace` plugins. */
+  readonly workspaces: ResearchWorkspaceRegistry
   /** Branch environments of the workers that are running right now. */
   readonly workerEnvs = new WorkerEnvRegistry({
     resolveCwd: session => this.sessionWorkingDirectory(session),
@@ -828,14 +779,14 @@ export class AutoResearchProvider implements SubagentProvider {
   activeBatches = 0
   private disposeShellEnv: (() => void) | null = null
 
-  constructor({ ctx, config = {} }: { ctx: PluginContext; config?: Config }) {
+  constructor({ ctx, config = {}, workspaces }: { ctx: ProviderContext; config?: Config; workspaces: ResearchWorkspaceRegistry }) {
     if (!ctx) throw new Error('AutoResearchProvider requires a plugin context')
     this.ctx = ctx
     this.config = resolveConfig(config)
     this.name = this.config.providerName
     this.capabilities = NO_START_CAPABILITIES
     this.inheritsParentContext = false
-    this.service = this.autoResearchService() ?? new AutoResearchServiceImpl()
+    this.workspaces = workspaces
     this.workerEnvKeys = declaredWorkerEnvKeys(this.config.workerEnv)
     this.installShellEnvContributor()
   }
@@ -859,31 +810,6 @@ export class AutoResearchProvider implements SubagentProvider {
     }
   }
 
-  /** Existing `ctx.autoResearch` service if already provided on `ctx`. */
-  private autoResearchService(context: unknown = this.ctx): AutoResearchService | undefined {
-    const holder = context as { get?: (name: string) => unknown; autoResearch?: unknown } | null | undefined
-    if (!holder) return undefined
-    if (typeof holder.get === 'function') {
-      try {
-        const value = holder.get('autoResearch')
-        if (value) return value as AutoResearchService
-      } catch {
-        // Not registered via ctx.get.
-      }
-    }
-    try {
-      return holder.autoResearch as AutoResearchService | undefined
-    } catch {
-      return undefined
-    }
-  }
-
-  /** Release the shell-env registration (the Cordis fiber normally owns it). */
-  dispose(): void {
-    this.disposeShellEnv?.()
-    this.disposeShellEnv = null
-  }
-
   /** The `ctx.shellEnv` service, read without tripping Cordis's inject guard. */
   private shellEnvService(context: unknown = this.ctx): PluginContext['shellEnv'] {
     const holder = context as { get?: (name: string) => unknown; shellEnv?: unknown } | null | undefined
@@ -901,6 +827,12 @@ export class AutoResearchProvider implements SubagentProvider {
     } catch {
       return undefined
     }
+  }
+
+  /** Release the `shellEnv` contributor when the plugin unloads. */
+  dispose(): void {
+    this.disposeShellEnv?.()
+    this.disposeShellEnv = null
   }
 
   /**
@@ -1215,7 +1147,8 @@ export class AutoResearchProvider implements SubagentProvider {
     const evaluatorStat = await fsp.stat(evaluatorPath).catch(() => null)
     if (!evaluatorStat?.isFile()) throw new Error('Research plan evaluator does not exist: ' + evaluatorPath)
     // Validate the complete plan before any lock, run directory or mount exists.
-    validatePlan(plan, normalizeOptions(this.config, plan))
+    const options = normalizeOptions(this.config, plan)
+    validatePlan(plan, options)
 
     const planOptionsRecord = plan.options && typeof plan.options === 'object'
       ? plan.options as Record<string, unknown>
@@ -1245,7 +1178,7 @@ export class AutoResearchProvider implements SubagentProvider {
     // directory or overwriting `SEED.json`.
     const lock = await acquireRunnerLock(runtimeRoot, runId, { cwd })
     this.activeBatches += 1
-    let manager: Awaited<ReturnType<typeof createWorkspaceManager>> | null = null
+    let manager: WorkspaceManager | null = null
     let initialState: WorkspaceState | null = null
     let runner: Runner | null = null
     let released = false
@@ -1272,7 +1205,7 @@ export class AutoResearchProvider implements SubagentProvider {
       const shellEnv = await resolveShellEnvironment(this.ctx, request.parent)
       const env: NodeJS.ProcessEnv & Record<string, unknown> = { ...process.env, ...shellEnv }
       const explicitLayerfs = this.config.layerfs
-      const snapshotForced = explicitLayerfs === false || this.config.workspaceBackend === 'snapshot'
+      const snapshotForced = explicitLayerfs === false || options.workspaceBackend === 'snapshot'
       const layerfsConfig = !snapshotForced && explicitLayerfs && typeof explicitLayerfs === 'object' ? explicitLayerfs : null
       const layerfsSettings: LayerFSSettings | null = layerfsConfig?.client
         ? null
@@ -1282,14 +1215,13 @@ export class AutoResearchProvider implements SubagentProvider {
       const layerfsEnv = snapshotForced
         ? {}
         : withoutLayerfsTrace(layerfsEnvironment(env, layerfsSettings, explicitLayerfs))
-      manager = await createWorkspaceManager({
+      manager = new WorkspaceManager(await this.workspaces.select(options.workspaceBackend, {
         output,
         runId,
         config: this.config,
         env,
         ...(layerfsConfig?.client ? { layerfs: layerfsConfig } : {}),
-        backends: this.service.listWorkspaceBackends(),
-      })
+      }), { output })
 
       let sourceWorkspace = workspaceRoot
       let frontier: Frontier | null = null
@@ -1478,6 +1410,6 @@ export class AutoResearchProvider implements SubagentProvider {
 }
 
 /** @returns a provider for the Cordis entry point. */
-export function createProvider(options: { ctx: PluginContext; config?: Config }): AutoResearchProvider {
+export function createProvider(options: { ctx: ProviderContext; config?: Config; workspaces: ResearchWorkspaceRegistry }): AutoResearchProvider {
   return new AutoResearchProvider(options)
 }
