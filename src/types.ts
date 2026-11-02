@@ -300,35 +300,24 @@ export interface SubagentStartRequest {
   [key: string]: unknown
 }
 
-/** `ctx.subagents` service surface. */
+/** `ctx.subagents` (`SubagentRuntime`) surface this bundle uses. */
 export interface SubagentsService {
-  list?: () => string[]
+  list: () => string[]
+  getProvider: (name: string) => SubagentProvider | undefined
   registerProvider: (provider: SubagentProvider) => () => void
   startActivation: (spec: SubagentActivationSpec) => Promise<SubagentRun>
-  get?: (name: string) => SubagentProvider | null | undefined
-  getProvider?: (name: string) => SubagentProvider | null | undefined
-  providers?: Map<string, SubagentProvider> | Record<string, SubagentProvider>
-  describe?: (name: string) => { name?: string; inheritsParentContext?: boolean } | null | undefined
-  [key: string]: unknown
 }
 
-/** `ctx.shellEnv` contributors differ across host versions; stay structural. */
+/** `ctx.shellEnv` (`ShellEnvRegistry`) surface this bundle uses. */
 export interface ShellEnvService {
-  resolve?: (options: { agent?: unknown }) => Promise<Record<string, unknown>> | Record<string, unknown>
-  snapshot?: (options?: { agent?: unknown }) => Promise<Record<string, unknown>> | Record<string, unknown>
-  /** `dsh` `ShellEnvRegistry.register(contributor)`; returns the disposer. */
-  register?: (contributor: {
+  /** Register a contributor; returns the disposer. */
+  register: (contributor: {
     name: string
     variables: Readonly<Record<string, { description: string }>>
     resolve: (execution: unknown) => Record<string, string>
   }) => () => void
-  /** `dsh` `ShellEnvRegistry.collect(execution)` (the real contributor API). */
-  collect?: (execution: { agent?: unknown; [key: string]: unknown }) => Record<string, unknown>
-  get?: (key: string) => unknown
-  env?: Record<string, unknown>
-  contributors?: unknown
-  sources?: unknown
-  [key: string]: unknown
+  /** The `DSH_*` environment for one shell execution. */
+  collect: (execution: { agent?: unknown; callId: string; rootCallId?: string }) => Readonly<Record<string, string>>
 }
 
 /** `ctx.skills` (`@deepseek-ai/dsh-skill`) registration surface. */
@@ -340,16 +329,16 @@ export interface SkillsService {
   }) => unknown
 }
 
-/** Cordis context subset the provider reads. */
+/**
+ * The host services the provider reads. The core plugin fills the optional
+ * ones from `ctx.inject` sub-fibers while those services exist.
+ */
 export interface ProviderContext {
   subagents: SubagentsService
   skills?: SkillsService
   shellEnv?: ShellEnvService
-  /** `dsh` `ctx.workingDirectory` service (per-session assigned checkout). */
-  workingDirectory?: {
-    get?: (session: unknown) => unknown
-    set?: (session: unknown, cwd: string) => unknown
-  }
+  /** `dsh` `ctx.workingDirectory` (`WorkingDirectoryService.get(session)`). */
+  workingDirectory?: { get: (session: never) => string }
   /** `dsh` `ctx.llm` catalog, used to resolve a worker model by id or name. */
   llm?: {
     listProviders: () => Array<{ id: string; name?: string }>
@@ -362,9 +351,6 @@ export interface ProviderContext {
   /** Executor registry provided by the core plugin. */
   researchExecutor?: ResearchExecutorService
   logger?: Logger
-  get?: (name: string) => unknown
-  inject?: (deps: string[], callback: (ctx: ProviderContext) => void) => unknown
-  [key: string]: unknown
 }
 
 /** Cordis context subset the plugin entries use. */

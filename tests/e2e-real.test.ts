@@ -126,7 +126,7 @@ function workerProvider(probe: any = null) {
       writePeerReview(request.cwd)
       // `dsh` derives the child session id from the returned run's `id`.
       const childId = `worker-${starts.length}`
-      probe?.(request.cwd, childId)
+      await probe?.(request.cwd, childId)
       return {
         id: childId,
         result: Promise.resolve({
@@ -175,7 +175,7 @@ async function mountDshContext(modules: any) {
   const agent = await harness.create('e2e-parent', { provider: 'e2e', model: 'e2e' }, { cwd: tmpdir() })
   await ctx.plugin(modules.SubagentRuntime)
   await ctx.plugin(modules.SkillRegistry)
-  return { ctx, agent }
+  return { ctx, agent, harness }
 }
 
 /**
@@ -304,18 +304,22 @@ async function scenario(backend: string) {
   const live = backend === 'live' ? await setUpLive(host, root) : null
   const env = live ? live.env : simulatedEnv(root, simulatedProjectName())
   let ctx: any = null
+  let harness: any = null
   /** What each worker's own bash call would receive from `ctx.shellEnv`. */
   const workerEnvironments: any[] = []
-  const worker = workerProvider((cwd: string, childId: string) => {
+  const worker = workerProvider(async (cwd: string, childId: string) => {
+    // A real dsh session whose working directory is the branch checkout: the
+    // provider matches it through `ctx.workingDirectory`.
+    const probe = await harness.create(`probe-${childId}`, { provider: 'e2e', model: 'e2e' }, { cwd })
     workerEnvironments.push({
       cwd,
-      bySession: collectFor(ctx, { session: { header: { id: childId, cwd, origin: 'subagent' } } }),
-      byCwd: collectFor(ctx, { session: { header: { id: `unknown-${childId}`, cwd, parentSession: 'e2e-parent' } } }),
+      collected: collectFor(ctx, probe),
       skills: ctx.skills.list({ cwd }),
     })
   })
   const mounted = await mountDshContext(modules)
   ctx = mounted.ctx
+  harness = mounted.harness
   const agent = mounted.agent
   try {
     await mountShellEnv(ctx, env)
@@ -359,13 +363,12 @@ async function scenario(backend: string) {
     // coordinator's calls stay clean.
     assert.ok(workerEnvironments.length > 0, 'workers were probed')
     for (const entry of workerEnvironments) {
-      for (const collected of [entry.bySession, entry.byCwd]) {
-        assert.equal(collected.DSH_AUTO_RESEARCH_WORKER, '1', 'a worker bash call receives DSH_AUTO_RESEARCH_WORKER')
-        assert.match(String(collected.DSH_AUTO_RESEARCH_BRANCH), /^ar-[a-z0-9-]+$/)
-        assert.equal(collected.DSH_AUTO_RESEARCH_CHECKOUT, entry.cwd)
-      }
+      const { collected } = entry
+      assert.equal(collected.DSH_AUTO_RESEARCH_WORKER, '1', 'a worker bash call receives DSH_AUTO_RESEARCH_WORKER')
+      assert.match(String(collected.DSH_AUTO_RESEARCH_BRANCH), /^ar-[a-z0-9-]+$/)
+      assert.equal(collected.DSH_AUTO_RESEARCH_CHECKOUT, entry.cwd)
       // The session's LayerFS facts are still contributed to the same call.
-      assert.ok(entry.bySession.DSH_LAYERFS_PROJECT, 'the LayerFS contributor still publishes the project')
+      assert.ok(collected.DSH_LAYERFS_PROJECT, 'the LayerFS contributor still publishes the project')
       // The real skill registry shows a running worker its own skill only.
       assert.deepEqual((await entry.skills).map((skill: any) => skill.name).filter((name: string) => name.startsWith('auto-research')), ['auto-research-worker'])
     }

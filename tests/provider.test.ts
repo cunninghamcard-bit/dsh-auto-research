@@ -171,9 +171,23 @@ describe('plugin entry', () => {
     assert.deepEqual((await skills.list({ cwd: '/work/branch/src' })).map((entry: any) => entry.name), ['auto-research-worker'])
     lease.dispose()
     assert.equal(invalidated, 2)
-    // Unloading releases the provider's shellEnv contributor.
+    ctx.dispose()
+  })
+
+  it('registers the branch shellEnv contributor while ctx.shellEnv exists', () => {
+    const contributors: any[] = []
     let released = 0
-    ;(registered[0] as any).disposeShellEnv = () => { released += 1 }
+    const shellEnv = {
+      register(contributor: any) { contributors.push(contributor); return () => { released += 1 } },
+      collect: () => ({}),
+    }
+    const ctx = fakePluginContext({
+      subagents: { registerProvider: () => () => {} },
+      skills: { registerProvider() {} },
+      shellEnv,
+    })
+    apply(ctx, {})
+    assert.deepEqual(contributors.map(item => item.name), ['auto-research'])
     ctx.dispose()
     assert.equal(released, 1)
   })

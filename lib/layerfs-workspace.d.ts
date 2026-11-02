@@ -17,7 +17,7 @@
  * is allowed to inspect) and the retained / restored completed-state objects
  * used by cooperative cohorts.
  */
-import type { LayerFSBinding, LayerFSClient, LayerFSSettings, Logger, PluginContext, Reconciliation, TrajectoryRow, WorkspaceBackend, WorkspaceBackendCreateOptions, WorkspaceBackendFactory, WorkspaceManagerLike, WorkspaceState } from './types.js';
+import type { LayerFSBinding, LayerFSClient, LayerFSSettings, Logger, ShellEnvService, Reconciliation, TrajectoryRow, WorkspaceBackend, WorkspaceBackendCreateOptions, WorkspaceBackendFactory, WorkspaceManagerLike, WorkspaceState } from './types.js';
 /** Harness and provider state that never enters an inventory or a branch. */
 export declare const OMIT: Set<string>;
 /** @returns the lowercase hexadecimal SHA-256 of `data`. */
@@ -343,11 +343,12 @@ export declare const LAYERFS_TRACE_KEYS: readonly ['DSH_LAYERFS_TRACE', 'DSH_LAY
  */
 export declare function withoutLayerfsTrace(environment: Record<string, string>): Record<string, string>;
 /**
- * Resolve the environment contributed by `ctx.shellEnv` (the same service
- * `@dsh-layerfs/host` binds). Host versions expose contributors, `resolve`,
- * `snapshot` or a plain `env`; all shapes are handled and merged.
+ * The environment `ctx.shellEnv` (`ShellEnvRegistry.collect`) gives a shell
+ * call of `agent`. `@dsh-layerfs/host` contributes the session's
+ * `DSH_LAYERFS_*` binding here. Contributors read
+ * `execution.rootCallId ?? execution.callId`, so both are set.
  */
-export declare function resolveShellEnvironment(ctx: Pick<PluginContext, 'shellEnv' | 'get'>, agent?: unknown): Promise<Record<string, string>>;
+export declare function resolveShellEnvironment(shellEnv: ShellEnvService | undefined, agent?: unknown): Record<string, string>;
 /** The synthetic tool-call id used for a session-wide environment snapshot. */
 export declare const SHELL_ENV_CALL_ID = "auto-research-env";
 /**

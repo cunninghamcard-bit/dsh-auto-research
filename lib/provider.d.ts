@@ -160,18 +160,7 @@ export declare class AutoResearchProvider implements SubagentProvider {
     readonly workerEnvKeys: Readonly<Record<string, {
         description: string;
     }>>;
-    private disposeShellEnv;
     constructor({ ctx, config, workspaces, executors }: ProviderOptions);
-    /** The `ctx.shellEnv` service, read without tripping Cordis's inject guard. */
-    private shellEnvService;
-    /** Release the `shellEnv` contributor when the plugin unloads. */
-    dispose(): void;
-    /**
-     * Register the branch `shellEnv` contributor once a `dsh` shell registry is
-     * available. The registry may be injected after this provider is built, so
-     * `ctx.inject` is used when the service is not there yet.
-     */
-    private installShellEnvContributor;
     /** The contributor handed to `ctx.shellEnv.register`. */
     workerEnvContributor(): {
         name: string;
@@ -187,7 +176,6 @@ export declare class AutoResearchProvider implements SubagentProvider {
      * {@link WorkerEnvRegistry.match}); a coordinator's call gets nothing.
      */
     workerEnvFor(execution: unknown): Record<string, string>;
-    private providerInfo;
     private isRecursiveWorker;
     /**
      * Refuse `subagent_auto_research` from a branch worker.
@@ -199,11 +187,6 @@ export declare class AutoResearchProvider implements SubagentProvider {
      * live worker's child session.
      */
     private assertNotRecursive;
-    /**
-     * The assigned checkout of one session, when the host exposes
-     * `ctx.workingDirectory.get(session)`.
-     */
-    private sessionWorkingDirectory;
     /**
      * Choose the worker provider. Explicit configuration wins (after validation);
      * a plan-level override is honored when registered; otherwise external/non-inheriting

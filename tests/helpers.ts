@@ -62,6 +62,7 @@ export function fakeSubagents(
 ): {
   calls: any[]
   list: () => string[]
+  getProvider: (name: string) => any
   registerProvider: () => () => void
   startActivation: (spec: any) => Promise<any>
 } {
@@ -69,6 +70,9 @@ export function fakeSubagents(
   return {
     calls,
     list: () => [...names],
+    getProvider: (name: string) => names.includes(name)
+      ? { name, inheritsParentContext: false, capabilities: { agentOptions: true } }
+      : undefined,
     registerProvider: () => () => {},
     async startActivation(input: any) {
       const index = calls.length

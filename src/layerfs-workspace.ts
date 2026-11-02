@@ -30,7 +30,7 @@ import type {
   LayerFSMount,
   LayerFSSettings,
   Logger,
-  PluginContext,
+  ShellEnvService,
   Reconciliation,
   TrajectoryRow,
   WorkspaceBackend,
@@ -1764,90 +1764,17 @@ export function withoutLayerfsTrace(
 }
 
 /**
- * Resolve the environment contributed by `ctx.shellEnv` (the same service
- * `@dsh-layerfs/host` binds). Host versions expose contributors, `resolve`,
- * `snapshot` or a plain `env`; all shapes are handled and merged.
+ * The environment `ctx.shellEnv` (`ShellEnvRegistry.collect`) gives a shell
+ * call of `agent`. `@dsh-layerfs/host` contributes the session's
+ * `DSH_LAYERFS_*` binding here. Contributors read
+ * `execution.rootCallId ?? execution.callId`, so both are set.
  */
-export async function resolveShellEnvironment(
-  ctx: Pick<PluginContext, 'shellEnv' | 'get'>,
+export function resolveShellEnvironment(
+  shellEnv: ShellEnvService | undefined,
   agent?: unknown,
-): Promise<Record<string, string>> {
-  // A Cordis context throws when an un-injected service is read as a
-  // property, so `get(name)` is the only safe lookup; the property form is a
-  // fallback for host snapshots that ignore `inject`.
-  let service: PluginContext['shellEnv']
-  if (typeof ctx.get === 'function') {
-    try {
-      service = ctx.get('shellEnv') as PluginContext['shellEnv']
-    } catch {
-      service = undefined
-    }
-  }
-  if (!service) {
-    try {
-      service = ctx.shellEnv
-    } catch {
-      service = undefined
-    }
-  }
-  if (!service || typeof service !== 'object') return {}
-  // `dsh`'s `ShellEnvRegistry.collect(execution)` is a `ToolExecution`: its
-  // contributors read `execution.rootCallId ?? execution.callId` (for example
-  // `@dsh-layerfs/host` labels the SDK trace step with it). A malformed
-  // execution would publish `DSH_LAYERFS_TRACE_STEP: "undefined"`, so a
-  // complete synthetic execution is always supplied.
-  const execution = { agent, callId: SHELL_ENV_CALL_ID, rootCallId: SHELL_ENV_CALL_ID }
-  const merged: Record<string, unknown> = {}
-  const absorb = (value: unknown): void => {
-    if (!value || typeof value !== 'object') return
-    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-      if (typeof entry === 'string') merged[key] = entry
-      else if (entry === null || entry === undefined) delete merged[key]
-    }
-  }
-  if (service.env && typeof service.env === 'object') absorb(service.env)
-  for (const method of ['collect', 'resolve', 'snapshot'] as const) {
-    const fn = service[method]
-    if (typeof fn === 'function') {
-      try {
-        absorb(await fn.call(service, execution))
-      } catch {
-        // A host without this contributor style simply contributes nothing.
-      }
-    }
-  }
-  const contributors = service.contributors ?? service.sources
-  if (Array.isArray(contributors)) {
-    for (const contributor of contributors) {
-      if (typeof contributor === 'function') {
-        try {
-          absorb(await contributor(execution))
-        } catch {
-          // Ignore a contributor that cannot resolve for this agent.
-        }
-        continue
-      }
-      if (!contributor || typeof contributor !== 'object') continue
-      absorb(contributor)
-      for (const method of ['contribute', 'resolve', 'snapshot', 'env'] as const) {
-        const fn = (contributor as Record<string, unknown>)[method]
-        if (typeof fn === 'function') {
-          try {
-            absorb(await fn.call(contributor, execution))
-          } catch {
-            // Ignore a contributor that cannot resolve for this agent.
-          }
-        } else if (method === 'env' && fn && typeof fn === 'object') {
-          absorb(fn)
-        }
-      }
-    }
-  }
-  const result: Record<string, string> = {}
-  for (const [key, value] of Object.entries(merged)) {
-    if (typeof value === 'string') result[key] = value
-  }
-  return result
+): Record<string, string> {
+  if (!shellEnv) return {}
+  return { ...shellEnv.collect({ agent, callId: SHELL_ENV_CALL_ID, rootCallId: SHELL_ENV_CALL_ID }) }
 }
 
 /** The synthetic tool-call id used for a session-wide environment snapshot. */

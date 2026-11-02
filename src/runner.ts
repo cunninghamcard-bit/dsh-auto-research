@@ -437,7 +437,6 @@ export class Runner {
     this.manager = deps.workspaceManager
     if (!this.manager) throw new Error('Runner requires a workspace manager')
     this.subagents = deps.subagents
-    if (!this.subagents?.startActivation) throw new Error('Runner requires ctx.subagents.startActivation')
     this.clock = deps.clock ?? DEFAULT_CLOCK
     this.rng = deps.rng ?? Math.random
     this.logger = deps.logger ?? console
@@ -497,34 +496,7 @@ export class Runner {
 
   /** Whether the configured worker provider accepts `request.agentOptions`. */
   private workerProviderAcceptsAgentOptions(): boolean {
-    const service = this.subagents
-    const registry = service.providers
-    let entry: { capabilities?: Record<string, unknown> } | null | undefined = null
-    if (registry && typeof registry === 'object') {
-      entry = registry instanceof Map
-        ? registry.get(this.workerProvider)
-        : (registry as Record<string, { capabilities?: Record<string, unknown> }>)[this.workerProvider]
-    }
-    if (!entry) {
-      for (const method of ['getProvider', 'get', 'describe'] as const) {
-        const fn = service[method]
-        if (typeof fn === 'function') {
-          try {
-            const candidate = fn.call(service, this.workerProvider) as { capabilities?: Record<string, unknown> } | null | undefined
-            if (candidate && typeof candidate === 'object') {
-              entry = candidate
-              break
-            }
-          } catch {
-            // Try the next introspection method.
-          }
-        }
-      }
-    }
-    if (entry && entry.capabilities && entry.capabilities.agentOptions === false) {
-      return false
-    }
-    return true
+    return this.subagents.getProvider(this.workerProvider)?.capabilities.agentOptions === true
   }
 
   signalForWork(): AbortSignal {

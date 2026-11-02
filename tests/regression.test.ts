@@ -230,7 +230,8 @@ export class LayerFS {
         const { cwd, provider, subagents } = await providerFixture(root, {
           config: { layerfs: false },
           shellEnv: {
-            async resolve() {
+            register: () => () => {},
+            collect() {
               return {
                 DSH_LAYERFS_PROJECT: 'ambient-project',
                 DSH_LAYERFS_SDK: sdk,
@@ -858,29 +859,6 @@ describe('R5: worker shell environment injection', () => {
     }
   })
 
-  it('registers its contributor on the real ctx.shellEnv service shape', () => {
-    let registered: any = null
-    let disposedWith = null
-    const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
-      ctx: {
-        subagents: fakeSubagents(async () => ({ output: [], stopReason: 'completed' })),
-        logger: {},
-        shellEnv: {
-          register(contributor: any) {
-            registered = contributor
-            return () => { disposedWith = contributor }
-          },
-        },
-      },
-      config: { workerProvider: 'worker' },
-    })
-    assert.ok(registered, 'the constructor registers the contributor')
-    assert.equal(registered.name, 'auto-research')
-    assert.equal(typeof registered.resolve, 'function')
-    provider.dispose()
-    assert.equal(disposedWith, registered)
-  })
-
   it('hands a live branch environment to the worker bash call during a batch', async () => {
     await withTemp(async root => {
       const cwd = join(root, 'repo')
@@ -902,11 +880,7 @@ describe('R5: worker shell environment injection', () => {
         return { output: [], stopReason: 'completed' }
       })
       const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
-        ctx: {
-          subagents,
-          logger: { info() {}, warn() {} },
-          shellEnv: { register(value: any) { contributor = value; return () => {} } },
-        },
+        ctx: { subagents, logger: { info() {}, warn() {} } },
         config: {
           workerProvider: 'worker',
           branches: 2,
@@ -915,6 +889,7 @@ describe('R5: worker shell environment injection', () => {
           plan,
         },
       })
+      contributor = provider.workerEnvContributor()
       const handle = await provider.start({
         cwd,
         prompt: [],
@@ -938,15 +913,14 @@ describe('R5: worker shell environment injection', () => {
 describe('R6: ShellEnvRegistry.collect contract and trace hygiene', () => {
   it('passes a complete tool execution to collect()', async () => {
     const seen: any[] = []
-    const merged = await resolveShellEnvironment({
-      shellEnv: {
-        collect(execution) {
+    const merged = resolveShellEnvironment({
+      register: () => () => {},
+      collect(execution) {
           seen.push(execution)
           return {
             DSH_LAYERFS_TRACE_STEP: String(execution.rootCallId ?? execution.callId),
             DSH_LAYERFS_PROJECT: 'p',
           }
-        },
       },
     }, { session: { header: { id: 'parent-1' } } })
     assert.equal(seen.length, 1)
@@ -954,16 +928,6 @@ describe('R6: ShellEnvRegistry.collect contract and trace hygiene', () => {
     assert.equal(seen[0].rootCallId, 'auto-research-env')
     assert.equal(merged.DSH_LAYERFS_TRACE_STEP, 'auto-research-env')
     assert.notEqual(merged.DSH_LAYERFS_TRACE_STEP, 'undefined')
-  })
-
-  it('still merges resolve(), snapshot(), env and contributors', async () => {
-    const service = {
-      env: { A: '1' },
-      async resolve(execution: any) { return { B: execution.callId === 'auto-research-env' ? '2' : 'wrong' } },
-      snapshot() { return { C: '3' } },
-      contributors: [{ env: { D: '4' } }],
-    }
-    assert.deepEqual(await resolveShellEnvironment({ shellEnv: service }), { A: '1', B: '2', C: '3', D: '4' })
   })
 
   it('strips transient SDK trace keys from a copied session environment', () => {
@@ -990,7 +954,8 @@ describe('R6: ShellEnvRegistry.collect contract and trace hygiene', () => {
       await withTemp(async root => {
         const { provider, cwd } = await providerFixture(root, {
           shellEnv: {
-            async resolve() {
+            register: () => () => {},
+            collect() {
               return {
                 DSH_LAYERFS_TRACE: '/tmp/parent-trace.jsonl',
                 DSH_LAYERFS_TRACE_STEP: 'parent-step',
@@ -2488,6 +2453,7 @@ describe('R31: provider RESULT.json writes are atomic', () => {
       const ctx: any = {
         subagents: {
           list: () => ['worker'],
+          getProvider: () => undefined,
           registerProvider() {},
           async startActivation() {
             return { childId: 'unused', result: Promise.resolve({ output: [], stopReason: 'completed' }), async dispose() {} }

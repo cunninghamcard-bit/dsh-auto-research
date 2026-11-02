@@ -774,7 +774,7 @@ export class AutoResearchProvider implements SubagentProvider {
   readonly executors: ResearchExecutorRegistry
   /** Branch environments of the workers that are running right now. */
   readonly workerEnvs = new WorkerEnvRegistry({
-    resolveCwd: session => this.sessionWorkingDirectory(session),
+    resolveCwd: session => session ? this.ctx.workingDirectory?.get(session as never) ?? null : null,
   })
   /**
    * `DSH_*` keys the shell contributor may return.
@@ -785,7 +785,6 @@ export class AutoResearchProvider implements SubagentProvider {
    * session and a second owner is a hard registration error.
    */
   readonly workerEnvKeys: Readonly<Record<string, { description: string }>>
-  private disposeShellEnv: (() => void) | null = null
 
   constructor({ ctx, config = {}, workspaces, executors }: ProviderOptions) {
     if (!ctx) throw new Error('AutoResearchProvider requires a plugin context')
@@ -797,66 +796,6 @@ export class AutoResearchProvider implements SubagentProvider {
     this.workspaces = workspaces
     this.executors = executors
     this.workerEnvKeys = declaredWorkerEnvKeys(this.config.workerEnv)
-    this.installShellEnvContributor()
-  }
-
-  /** The `ctx.shellEnv` service, read without tripping Cordis's inject guard. */
-  private shellEnvService(context: unknown = this.ctx): PluginContext['shellEnv'] {
-    const holder = context as { get?: (name: string) => unknown; shellEnv?: unknown } | null | undefined
-    if (!holder) return undefined
-    if (typeof holder.get === 'function') {
-      try {
-        const value = holder.get('shellEnv')
-        if (value) return value as PluginContext['shellEnv']
-      } catch {
-        // The service is not injected in this host; try the property fallback.
-      }
-    }
-    try {
-      return holder.shellEnv as PluginContext['shellEnv']
-    } catch {
-      return undefined
-    }
-  }
-
-  /** Release the `shellEnv` contributor when the plugin unloads. */
-  dispose(): void {
-    this.disposeShellEnv?.()
-    this.disposeShellEnv = null
-  }
-
-  /**
-   * Register the branch `shellEnv` contributor once a `dsh` shell registry is
-   * available. The registry may be injected after this provider is built, so
-   * `ctx.inject` is used when the service is not there yet.
-   */
-  private installShellEnvContributor(): void {
-    const install = (service: PluginContext['shellEnv'] | null | undefined): void => {
-      if (!service || typeof service.register !== 'function' || this.disposeShellEnv) return
-      try {
-        this.disposeShellEnv = service.register(this.workerEnvContributor())
-      } catch (error) {
-        // A host that refuses the registration still runs; workers then rely on
-        // the documented prompt environment only.
-        this.ctx.logger?.warn?.(`[auto-research] shellEnv contributor unavailable: ${(error as Error).message}`)
-      }
-    }
-    const existing = this.shellEnvService()
-    if (existing) {
-      install(existing)
-      return
-    }
-    const inject = (this.ctx as { inject?: unknown }).inject
-    if (typeof inject !== 'function') return
-    try {
-      ;(inject as (names: string[], callback: (child: unknown) => void) => unknown).call(
-        this.ctx,
-        ['shellEnv'],
-        child => install(this.shellEnvService(child)),
-      )
-    } catch {
-      // shellEnv is optional for this plugin.
-    }
   }
 
   /** The contributor handed to `ctx.shellEnv.register`. */
@@ -887,35 +826,6 @@ export class AutoResearchProvider implements SubagentProvider {
     return allowed
   }
 
-  private providerInfo(name: string): {
-    inheritsParentContext?: boolean
-    name?: string
-    capabilities?: { agentOptions?: unknown; [key: string]: unknown }
-  } | null {
-    const service = this.ctx.subagents
-    const registry = service.providers
-    if (registry && typeof registry === 'object') {
-      const entry = registry instanceof Map ? registry.get(name) : (registry as Record<string, SubagentProvider>)[name]
-      if (entry && typeof entry === 'object') return entry
-    }
-    for (const method of ['getProvider', 'get', 'describe'] as const) {
-      const fn = service[method]
-      if (typeof fn === 'function') {
-        try {
-          const value = fn.call(service, name) as {
-            inheritsParentContext?: boolean
-            name?: string
-            capabilities?: { agentOptions?: unknown; [key: string]: unknown }
-          } | null | undefined
-          if (value && typeof value === 'object') return value
-        } catch {
-          // Fall through to the next introspection hook.
-        }
-      }
-    }
-    return null
-  }
-
   private isRecursiveWorker(name: string): boolean {
     return name === this.name || name === 'auto-research'
   }
@@ -937,41 +847,12 @@ export class AutoResearchProvider implements SubagentProvider {
   }
 
   /**
-   * The assigned checkout of one session, when the host exposes
-   * `ctx.workingDirectory.get(session)`.
-   */
-  private sessionWorkingDirectory(session: unknown): string | null {
-    let value: unknown
-    const context = this.ctx as (PluginContext & { get?: (name: string) => unknown }) | undefined
-    try {
-      if (typeof context?.get === 'function') value = context.get('workingDirectory')
-    } catch {
-      value = undefined
-    }
-    if (!value) {
-      try {
-        value = context?.workingDirectory
-      } catch {
-        value = undefined
-      }
-    }
-    const get = (value as { get?: unknown } | null | undefined)?.get
-    if (typeof get !== 'function') return null
-    try {
-      const cwd = get.call(value, session)
-      return typeof cwd === 'string' && cwd.length > 0 ? cwd : null
-    } catch {
-      return null
-    }
-  }
-
-  /**
    * Choose the worker provider. Explicit configuration wins (after validation);
    * a plan-level override is honored when registered; otherwise external/non-inheriting
    * providers are preferred over in-process context-inheriting providers such as `fork`.
    */
   workerProviderName(planOverride?: unknown, preferAgentOptions = false): string {
-    const names = typeof this.ctx.subagents?.list === 'function' ? this.ctx.subagents.list() : []
+    const names = this.ctx.subagents.list()
     const configured = this.config.workerProvider
     if (configured !== undefined) {
       if (!names.includes(configured)) {
@@ -994,10 +875,10 @@ export class AutoResearchProvider implements SubagentProvider {
     if (configured !== undefined) return configured
     const candidates = names.filter(name => !this.isRecursiveWorker(name))
     if (candidates.length === 0) throw new Error('auto-research requires at least one other registered subagent provider')
-    const external = candidates.filter(name => this.providerInfo(name)?.inheritsParentContext !== true)
+    const external = candidates.filter(name => this.ctx.subagents.getProvider(name)?.inheritsParentContext !== true)
     const basePool = external.length > 0 ? external : candidates
     const optionCapable = preferAgentOptions
-      ? basePool.filter(name => (this.providerInfo(name)?.capabilities as { agentOptions?: unknown } | undefined)?.agentOptions === true)
+      ? basePool.filter(name => this.ctx.subagents.getProvider(name)?.capabilities.agentOptions === true)
       : []
     const pool = optionCapable.length > 0 ? optionCapable : basePool
     for (const preferred of PREFERRED_WORKERS) {
@@ -1122,7 +1003,7 @@ export class AutoResearchProvider implements SubagentProvider {
       const originalManifest = await inventory(workspaceRoot)
       const selectionFile = join(runtimeRoot, 'LATEST.json')
 
-      const shellEnv = await resolveShellEnvironment(this.ctx, request.parent)
+      const shellEnv = resolveShellEnvironment(this.ctx.shellEnv, request.parent)
       const env: NodeJS.ProcessEnv & Record<string, unknown> = { ...process.env, ...shellEnv }
       const explicitLayerfs = this.config.layerfs
       const snapshotForced = explicitLayerfs === false || options.workspaceBackend === 'snapshot'

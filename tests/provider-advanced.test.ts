@@ -118,7 +118,8 @@ describe('P0: LayerFS environment from ctx.shellEnv', () => {
         const sdk = join(root, 'sdk.mjs')
         await writeFile(sdk, sdkModule(mounts))
         const shellEnv = {
-          async resolve() {
+          register: () => () => {},
+          collect() {
             return {
               DSH_LAYERFS_PROJECT: 'shell-project',
               DSH_LAYERFS_SDK: sdk,
@@ -294,7 +295,7 @@ describe('P1: checkout lock and worker selection', () => {
     const ctx: any = {
       subagents: {
         list: () => ['fork', 'claude-code', 'codex'],
-        get: (name: string) => providers[name],
+        getProvider: (name: string) => providers[name],
       },
     }
     assert.equal(new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(), ctx, config: {} }).workerProviderName(), 'claude-code')
@@ -305,13 +306,13 @@ describe('P1: checkout lock and worker selection', () => {
     assert.equal(getter.workerProviderName(), 'acp')
 
     const onlyFork = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
-      ctx: { subagents: { list: () => ['fork'], get: (name: string) => providers[name] } } as any,
+      ctx: { subagents: { list: () => ['fork'], getProvider: (name: string) => providers[name] } } as any,
       config: {},
     })
     assert.equal(onlyFork.workerProviderName(), 'fork')
 
     const recursive = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
-      ctx: { subagents: { list: () => ['auto-research', 'fork'], describe: (name: string) => providers[name] } } as any,
+      ctx: { subagents: { list: () => ['auto-research', 'fork'], getProvider: (name: string) => providers[name] } } as any,
       config: {},
     })
     assert.equal(recursive.workerProviderName(), 'fork')

@@ -9,7 +9,7 @@
 import { AutoResearchProvider, resolveConfig } from './provider.js'
 import { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js'
 import { registerSkills } from './skills.js'
-import type { Config as PluginConfig, PluginContext, ResolvedConfig } from './types.js'
+import type { Config as PluginConfig, PluginContext, ProviderContext, ResolvedConfig } from './types.js'
 
 export const name = 'dsh-auto-research'
 export const inject: string[] = ['subagents', 'skills']
@@ -44,11 +44,24 @@ export function apply(ctx: PluginContext, config?: PluginConfig): void {
   const executors = new ResearchExecutorRegistry()
   ctx.provide('researchWorkspace', workspaces)
   ctx.provide('researchExecutor', executors)
-  const provider = new AutoResearchProvider({ ctx, config: resolveConfig(config), workspaces, executors })
-  const skills = registerSkills(ctx.skills!, cwd => provider.workerEnvs.ownsCheckout(cwd))
+  // The provider reads optional host services from this object; each one is
+  // present only while its `ctx.inject` sub-fiber is alive.
+  const host: ProviderContext = { subagents: ctx.subagents, skills: ctx.skills!, ...(ctx.logger ? { logger: ctx.logger } : {}) }
+  const provider = new AutoResearchProvider({ ctx: host, config: resolveConfig(config), workspaces, executors })
+  for (const service of ['llm', 'workingDirectory'] as const) {
+    ctx.inject([service], inner => {
+      host[service] = inner[service] as never
+      inner.effect(() => () => { delete host[service] })
+    })
+  }
+  ctx.inject(['shellEnv'], inner => {
+    host.shellEnv = inner.shellEnv!
+    inner.effect(() => inner.shellEnv!.register(provider.workerEnvContributor()))
+    inner.effect(() => () => { delete host.shellEnv })
+  })
+  const skills = registerSkills(host.skills!, cwd => provider.workerEnvs.ownsCheckout(cwd))
   provider.workerEnvs.onChange = skills.invalidate
   ctx.subagents.registerProvider(provider)
-  ctx.effect(() => () => provider.dispose())
 }
 
 export { AutoResearchProvider, ResearchExecutorRegistry, ResearchWorkspaceRegistry, resolveConfig }
