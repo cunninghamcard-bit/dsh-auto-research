@@ -10,7 +10,7 @@
  */
 import { jsonDigest, publicRow } from './layerfs-workspace.js';
 import { buildZeroSynthesisContext } from './protocols.js';
-import type { BatchResult, Clock, Config, EvaluationResult, MetricDiagnostic, MetricView, Phase, ProviderOutcome, ResearchOptions, ResearchPlan, ResearchPlanInput, RunnerDeps, SharedCheckpoint, SubagentResult, TrajectoryRow, WorkspaceState } from './types.js';
+import type { BatchResult, Clock, Config, EvaluationResult, MetricDiagnostic, MetricView, Phase, ProviderOutcome, ResearchOptions, ResearchPlan, ResearchPlanInput, RunnerDeps, SharedCheckpoint, SubagentResult, TrajectoryRow, WorkerAgentOptions, WorkspaceState } from './types.js';
 /** Raised when a batch is stopped by the caller; artifacts are retained. */
 export declare class ResearchStoppedError extends Error {
     constructor(message?: string);
@@ -18,6 +18,8 @@ export declare class ResearchStoppedError extends Error {
 declare const DEFAULT_CLOCK: Clock;
 /** Merge plan-level option overrides over plugin configuration. */
 export declare function normalizeOptions(config?: Config, plan?: ResearchPlanInput): ResearchOptions;
+/** Merge config-level, plan-level, and request-level child LLM selection options. */
+export declare function resolveWorkerAgentOptions(config?: Config, plan?: ResearchPlanInput, override?: WorkerAgentOptions | null): WorkerAgentOptions | null;
 /**
  * Validate the model-written plan against the execution contract and return
  * normalized defaults. Values are never replaced with repository heuristics.
@@ -52,6 +54,7 @@ export declare class Runner {
     readonly rng: () => number;
     readonly logger: RunnerDeps['logger'];
     readonly workerProvider: string;
+    readonly workerAgentOptions: WorkerAgentOptions | null;
     readonly parent: unknown;
     readonly signal: AbortSignal | undefined;
     readonly workerEnv: Record<string, string>;
@@ -106,6 +109,8 @@ export declare class Runner {
     checkCancelled(): void;
     /** Stop scheduling and abort in-flight workers/evaluations. */
     stop(): void;
+    /** Whether the configured worker provider accepts `request.agentOptions`. */
+    private workerProviderAcceptsAgentOptions;
     signalForWork(): AbortSignal;
     /** Remember a created state so a failed sibling or cohort cannot leak it. */
     private trackState;

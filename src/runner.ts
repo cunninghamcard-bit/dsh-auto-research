@@ -52,6 +52,7 @@ import type {
   SubagentResult,
   SubagentRun,
   TrajectoryRow,
+  WorkerAgentOptions,
   WorkspaceState,
 } from './types.js'
 
@@ -97,9 +98,15 @@ export function normalizeOptions(
   const overrides: PlanOptions = plan.options && typeof plan.options === 'object'
     ? plan.options as PlanOptions
     : {}
+  const topRounds = typeof plan.rounds === 'number' ? plan.rounds : undefined
+  const topBranches = typeof plan.branches === 'number'
+    ? plan.branches
+    : typeof plan.parallelism === 'number'
+      ? plan.parallelism
+      : undefined
   return {
-    rounds: overrides.rounds ?? config.rounds ?? 1,
-    branches: overrides.branches ?? config.branches ?? 4,
+    rounds: overrides.rounds ?? topRounds ?? config.rounds ?? 1,
+    branches: overrides.branches ?? overrides.parallelism ?? topBranches ?? config.branches ?? config.parallelism ?? 4,
     explorationMinutes: overrides.explorationMinutes ?? config.explorationMinutes ?? 30,
     exploitationMinutes: overrides.exploitationMinutes ?? config.exploitationMinutes ?? 30,
     rsiTop: overrides.rsiTop ?? config.rsiTop ?? false,
@@ -107,6 +114,72 @@ export function normalizeOptions(
     shareContext: overrides.shareContext ?? config.shareContext ?? false,
     sharingIntervalMinutes: overrides.sharingIntervalMinutes ?? config.sharingIntervalMinutes ?? 10,
   }
+}
+
+function nonEmptyTrimmed(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
+}
+
+/** Merge config-level, plan-level, and request-level child LLM selection options. */
+export function resolveWorkerAgentOptions(
+  config: Config = {},
+  plan: ResearchPlanInput = {},
+  override?: WorkerAgentOptions | null,
+): WorkerAgentOptions | null {
+  const planOptions = plan.options && typeof plan.options === 'object'
+    ? plan.options as Record<string, unknown>
+    : {}
+  const cfgOpts = config.workerAgentOptions && typeof config.workerAgentOptions === 'object'
+    ? config.workerAgentOptions
+    : {}
+  const planOpts = (plan.worker_agent_options && typeof plan.worker_agent_options === 'object'
+    ? plan.worker_agent_options
+    : plan.workerAgentOptions && typeof plan.workerAgentOptions === 'object'
+      ? plan.workerAgentOptions
+      : planOptions.workerAgentOptions && typeof planOptions.workerAgentOptions === 'object'
+        ? planOptions.workerAgentOptions
+        : {}) as Record<string, unknown>
+  const reqOpts = override && typeof override === 'object' ? override : {}
+
+  const provider = nonEmptyTrimmed(reqOpts.provider)
+    ?? nonEmptyTrimmed(planOpts.provider)
+    ?? nonEmptyTrimmed(plan.worker_llm_provider)
+    ?? nonEmptyTrimmed(plan.workerLlmProvider)
+    ?? nonEmptyTrimmed(planOptions.workerLlmProvider)
+    ?? nonEmptyTrimmed(cfgOpts.provider)
+    ?? nonEmptyTrimmed(config.workerLlmProvider)
+
+  const model = nonEmptyTrimmed(reqOpts.model)
+    ?? nonEmptyTrimmed(planOpts.model)
+    ?? nonEmptyTrimmed(plan.worker_model)
+    ?? nonEmptyTrimmed(plan.workerModel)
+    ?? nonEmptyTrimmed(planOptions.workerModel)
+    ?? nonEmptyTrimmed(cfgOpts.model)
+    ?? nonEmptyTrimmed(config.workerModel)
+
+  const reasoningEffort = nonEmptyTrimmed(reqOpts.reasoningEffort)
+    ?? nonEmptyTrimmed(planOpts.reasoningEffort)
+    ?? nonEmptyTrimmed(plan.worker_reasoning_effort)
+    ?? nonEmptyTrimmed(plan.workerReasoningEffort)
+    ?? nonEmptyTrimmed(planOptions.workerReasoningEffort)
+    ?? nonEmptyTrimmed(cfgOpts.reasoningEffort)
+    ?? nonEmptyTrimmed(config.workerReasoningEffort)
+
+  const maxTokens = typeof reqOpts.maxTokens === 'number' && Number.isFinite(reqOpts.maxTokens) && reqOpts.maxTokens > 0
+    ? reqOpts.maxTokens
+    : typeof planOpts.maxTokens === 'number' && Number.isFinite(planOpts.maxTokens) && planOpts.maxTokens > 0
+      ? planOpts.maxTokens
+      : typeof cfgOpts.maxTokens === 'number' && Number.isFinite(cfgOpts.maxTokens) && cfgOpts.maxTokens > 0
+        ? cfgOpts.maxTokens
+        : undefined
+
+  const merged: WorkerAgentOptions = {
+    ...(provider !== undefined ? { provider } : {}),
+    ...(model !== undefined ? { model } : {}),
+    ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+    ...(maxTokens !== undefined ? { maxTokens } : {}),
+  }
+  return Object.keys(merged).length > 0 ? merged : null
 }
 
 function finitePositive(value: unknown): value is number {
@@ -320,6 +393,7 @@ export class Runner {
   readonly rng: () => number
   readonly logger: RunnerDeps['logger']
   readonly workerProvider: string
+  readonly workerAgentOptions: WorkerAgentOptions | null
   readonly parent: unknown
   readonly signal: AbortSignal | undefined
   readonly workerEnv: Record<string, string>
@@ -380,6 +454,11 @@ export class Runner {
     this.logger = deps.logger ?? console
     this.workerProvider = deps.workerProvider
     if (!this.workerProvider) throw new Error('Runner requires a worker provider')
+    this.workerAgentOptions = resolveWorkerAgentOptions(
+      config,
+      plan as ResearchPlanInput,
+      deps.workerAgentOptions,
+    )
     this.parent = deps.parent
     this.signal = deps.signal
     this.workerEnv = mergeEnv(deps.workerEnv ?? config.workerEnv ?? {}, deps.layerfsEnv ?? {})
@@ -422,6 +501,38 @@ export class Runner {
   stop(): void {
     this.cancelled = true
     this.abort.abort()
+  }
+
+  /** Whether the configured worker provider accepts `request.agentOptions`. */
+  private workerProviderAcceptsAgentOptions(): boolean {
+    const service = this.subagents
+    const registry = service.providers
+    let entry: { capabilities?: Record<string, unknown> } | null | undefined = null
+    if (registry && typeof registry === 'object') {
+      entry = registry instanceof Map
+        ? registry.get(this.workerProvider)
+        : (registry as Record<string, { capabilities?: Record<string, unknown> }>)[this.workerProvider]
+    }
+    if (!entry) {
+      for (const method of ['getProvider', 'get', 'describe'] as const) {
+        const fn = service[method]
+        if (typeof fn === 'function') {
+          try {
+            const candidate = fn.call(service, this.workerProvider) as { capabilities?: Record<string, unknown> } | null | undefined
+            if (candidate && typeof candidate === 'object') {
+              entry = candidate
+              break
+            }
+          } catch {
+            // Try the next introspection method.
+          }
+        }
+      }
+    }
+    if (entry && entry.capabilities && entry.capabilities.agentOptions === false) {
+      return false
+    }
+    return true
   }
 
   signalForWork(): AbortSignal {
@@ -1108,6 +1219,7 @@ export class Runner {
         peer_manifest_sha256: peer?.digest ?? null,
         share_target_unix: cooperation ? Date.now() + Math.max(0, cooperation.shareAt - this.now()) : null,
         worker_provider: this.workerProvider,
+        worker_agent_options: this.workerAgentOptions,
         environment: Object.keys(branchEnv),
         handoff_from: handoff?.from ?? null,
         handoff_path: handoff?.path ?? null,
@@ -1135,6 +1247,7 @@ export class Runner {
         type: 'prompt',
         at: new Date(started).toISOString(),
         provider: this.workerProvider,
+        ...(this.workerAgentOptions ? { agent_options: this.workerAgentOptions } : {}),
         text: prompt,
       }]
       // Register the branch environment before the worker starts, so its very
@@ -1146,6 +1259,7 @@ export class Runner {
         parentSessionId: this.parentSessionId,
         env: branchEnv,
       }) ?? null
+      const passAgentOptions = this.workerAgentOptions && this.workerProviderAcceptsAgentOptions()
       try {
         const activation = await this.subagents.startActivation({
           provider: this.workerProvider,
@@ -1154,6 +1268,7 @@ export class Runner {
             cwd: checkout,
             prompt: [{ type: 'text', text: prompt }],
             parent: this.parent,
+            ...(passAgentOptions ? { agentOptions: this.workerAgentOptions } : {}),
           },
           ...(signal ? { signal } : {}),
           delivery: 'caller',

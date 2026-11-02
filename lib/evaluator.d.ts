@@ -60,11 +60,13 @@ export declare class FrozenEvaluator {
     hash: string | null;
     script: string | null;
     private readonly spawnImpl;
-    constructor({ plan, output, logger, spawn: spawnImpl, }: {
+    private readonly extraEnv;
+    constructor({ plan, output, logger, spawn: spawnImpl, env: extraEnv, }: {
         plan: EvaluatorPlan;
         output: string;
         logger?: Logger | null;
         spawn?: typeof spawn;
+        env?: Record<string, string>;
     });
     /**
      * Copy the evaluator outside every candidate workspace and hash it.

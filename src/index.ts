@@ -41,18 +41,32 @@ export const Config = Object.freeze({
 export function apply(ctx: PluginContext, config?: PluginConfig): void {
   const resolved = resolveConfig(config)
   const provider = new AutoResearchProvider({ ctx, config: resolved })
-  ctx.subagents.registerProvider?.(provider)
+  const disposeProvider = ctx.subagents.registerProvider?.(provider)
   const prompt = ctx.systemPrompt
-  if (!prompt) return
-  const order = typeof prompt.getSectionOrder === 'function'
-    ? prompt.getSectionOrder(PLACEMENT) ?? 500
-    : 500
-  prompt.section({
-    name: 'auto-research:coordinator',
-    order,
-    interpolate: false,
-    text: coordinatorPolicy(),
-  })
+  let disposeSection: unknown = null
+  if (prompt) {
+    const order = typeof prompt.getSectionOrder === 'function'
+      ? prompt.getSectionOrder(PLACEMENT) ?? 500
+      : 500
+    disposeSection = prompt.section({
+      name: 'auto-research:coordinator',
+      order,
+      interpolate: false,
+      text: coordinatorPolicy(),
+    })
+  }
+  const effectFn = (ctx as { effect?: (cb: () => () => void) => void }).effect
+  if (typeof effectFn === 'function') {
+    try {
+      effectFn(() => () => {
+        if (typeof disposeSection === 'function') (disposeSection as () => void)()
+        if (typeof disposeProvider === 'function') (disposeProvider as () => void)()
+        provider.dispose()
+      })
+    } catch {
+      // Host does not support ctx.effect.
+    }
+  }
 }
 
 export { AutoResearchProvider, resolveConfig, coordinatorPolicy }

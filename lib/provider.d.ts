@@ -6,7 +6,7 @@
  * outcome settles through `result` (never a rejection), as the seam requires.
  */
 import type { Config, PluginContext, ResearchPlanInput, ResolvedConfig, SubagentProvider, SubagentRun, SubagentStartRequest } from './types.js';
-/** Out-of-process capability advertisement: no parent-enforced start features. */
+/** Out-of-process capability advertisement: forwards child `agentOptions` to worker branches. */
 export declare const NO_START_CAPABILITIES: Record<string, unknown>;
 /** Normalize plugin config (also used by the Cordis standard schema). */
 export declare function resolveConfig(input?: unknown): ResolvedConfig;
@@ -197,10 +197,17 @@ export declare class AutoResearchProvider implements SubagentProvider {
     private sessionWorkingDirectory;
     /**
      * Choose the worker provider. Explicit configuration wins (after validation);
-     * otherwise external/non-inheriting providers are preferred over in-process
-     * context-inheriting providers such as `fork`.
+     * a plan-level override is honored when registered; otherwise external/non-inheriting
+     * providers are preferred over in-process context-inheriting providers such as `fork`.
      */
-    workerProviderName(): string;
+    workerProviderName(planOverride?: unknown, preferAgentOptions?: boolean): string;
+    /**
+     * Resolve worker `agentOptions` against the live parent agent's current LLM
+     * state and `dsh`'s active `llm` registry so callers only need to specify a
+     * model ID or display name (e.g. `glm-5.3-flash` or `GLM Flash`) without
+     * hardcoding the internal provider adapter ID.
+     */
+    private resolveLiveWorkerAgentOptions;
     start(request: SubagentStartRequest): Promise<SubagentRun>;
 }
 /** @returns a provider for the Cordis entry point. */

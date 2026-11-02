@@ -22,7 +22,7 @@ import {
   writeJsonAtomic,
 } from './layerfs-workspace.js'
 import { FrozenEvaluator } from './evaluator.js'
-import { ResearchStoppedError, Runner } from './runner.js'
+import { ResearchStoppedError, Runner, resolveWorkerAgentOptions } from './runner.js'
 import type {
   Config,
   ContentBlock,
@@ -35,12 +35,13 @@ import type {
   SubagentResult,
   SubagentRun,
   SubagentStartRequest,
+  WorkerAgentOptions,
   WorkspaceState,
 } from './types.js'
 
-/** Out-of-process capability advertisement: no parent-enforced start features. */
+/** Out-of-process capability advertisement: forwards child `agentOptions` to worker branches. */
 export const NO_START_CAPABILITIES: Record<string, unknown> = Object.freeze({
-  agentOptions: false,
+  agentOptions: true,
   agentPreset: false,
   outputSchema: false,
   depthLimit: false,
@@ -62,6 +63,7 @@ export function resolveConfig(input: unknown = {}): ResolvedConfig {
   }
   if (config.rounds !== undefined) requirePositiveInteger(config.rounds, 'rounds')
   if (config.branches !== undefined) requirePositiveInteger(config.branches, 'branches')
+  if (config.parallelism !== undefined) requirePositiveInteger(config.parallelism, 'parallelism')
   for (const key of ['explorationMinutes', 'exploitationMinutes', 'sharingIntervalMinutes'] as const) {
     if (config[key] !== undefined) requirePositiveNumber(config[key], key)
   }
@@ -79,11 +81,21 @@ export function resolveConfig(input: unknown = {}): ResolvedConfig {
   for (const key of ['providerName', 'planPath', 'workerProvider'] as const) {
     if (config[key] !== undefined) requireNonEmptyString(config[key], key)
   }
+  for (const key of ['workerLlmProvider', 'workerModel', 'workerReasoningEffort'] as const) {
+    if (config[key] !== undefined && config[key] !== null) {
+      requireNonEmptyString(config[key], key)
+    }
+  }
+  if (config.workerAgentOptions !== undefined && config.workerAgentOptions !== null) {
+    if (typeof config.workerAgentOptions !== 'object' || Array.isArray(config.workerAgentOptions)) {
+      throw new Error('workerAgentOptions must be an object')
+    }
+  }
   const resolved: ResolvedConfig = {
     providerName: config.providerName ?? 'auto-research',
     planPath: config.planPath ?? '.auto-research-methods/plan.json',
     rounds: config.rounds ?? 1,
-    branches: config.branches ?? 4,
+    branches: config.branches ?? config.parallelism ?? 4,
     explorationMinutes: config.explorationMinutes ?? 30,
     exploitationMinutes: config.exploitationMinutes ?? 30,
     rsiTop: config.rsiTop ?? false,
@@ -92,7 +104,18 @@ export function resolveConfig(input: unknown = {}): ResolvedConfig {
     sharingIntervalMinutes: config.sharingIntervalMinutes ?? 10,
     workerEnv: config.workerEnv ?? {},
   }
+  if (config.parallelism !== undefined) resolved.parallelism = config.parallelism
   if (config.workerProvider !== undefined) resolved.workerProvider = config.workerProvider
+  if (config.workerLlmProvider !== undefined) {
+    resolved.workerLlmProvider = config.workerLlmProvider ? config.workerLlmProvider.trim() : null
+  }
+  if (config.workerModel !== undefined) {
+    resolved.workerModel = config.workerModel ? config.workerModel.trim() : null
+  }
+  if (config.workerReasoningEffort !== undefined) {
+    resolved.workerReasoningEffort = config.workerReasoningEffort ? config.workerReasoningEffort.trim() : null
+  }
+  if (config.workerAgentOptions !== undefined) resolved.workerAgentOptions = config.workerAgentOptions
   if (config.workspaceBackend !== undefined) resolved.workspaceBackend = config.workspaceBackend
   if (config.layerfs !== undefined) resolved.layerfs = config.layerfs
   if (config.plan !== undefined) resolved.plan = config.plan
@@ -206,6 +229,14 @@ export async function resolvePlan({
     if (!looksLikePlan(value)) throw new Error(`Research plan is incomplete: ${planPath}`)
     return { plan: value, source: planPath }
   }
+  if (config.planPath === '.auto-research-methods/plan.json') {
+    const fallbackPath = resolve(cwd, 'auto-research.json')
+    if (await pathExists(fallbackPath)) {
+      const value = await readJson(fallbackPath)
+      if (!looksLikePlan(value)) throw new Error(`Research plan is incomplete: ${fallbackPath}`)
+      return { plan: value, source: fallbackPath }
+    }
+  }
   const embedded = parsePlanFromPrompt(promptText)
   if (embedded) return { plan: embedded, source: 'prompt' }
   throw new Error(
@@ -227,15 +258,20 @@ function textOutput(text: string): ContentBlock[] {
   return [{ type: 'text', text }]
 }
 
+function redactObjectSecrets<T extends Record<string, unknown>>(obj: T, secretPattern: RegExp): T {
+  const safe: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(obj)) {
+    if (!secretPattern.test(key)) safe[key] = value
+  }
+  return safe as T
+}
+
 /** Strip live handles and obvious secret values before config is serialized. */
 function publicConfig(config: ResolvedConfig): Config {
   const { plan, layerfs, workerEnv, ...rest } = config
   void plan
-  const safeEnv: Record<string, unknown> = {}
   const secret = /(token|key|secret|password|credential)/i
-  for (const [key, value] of Object.entries(workerEnv ?? {})) {
-    if (!secret.test(key)) safeEnv[key] = value
-  }
+  const safeEnv = redactObjectSecrets(workerEnv ?? {}, secret)
   // The tri-state opt-out is part of the public contract: CONFIG.json must
   // record `layerfs: false`, not silently drop the field.
   const safeLayerfs: LayerFSBinding | false | undefined = layerfs === false
@@ -243,7 +279,7 @@ function publicConfig(config: ResolvedConfig): Config {
     : layerfs && typeof layerfs === 'object'
       ? layerfs.client
         ? { project: layerfs.project ?? null }
-        : layerfs
+        : redactObjectSecrets(layerfs, secret)
       : undefined
   return {
     ...rest,
@@ -413,8 +449,31 @@ export async function acquireRunnerLock(
           )
         }
       }
-      // Stale lock: reclaim only when the owner is definitely gone.
-      await fsp.unlink(path).catch(() => {})
+      // Stale lock: reclaim atomically by moving to a unique stale path and
+      // verifying its owner is still dead before deleting.
+      const stalePath = join(runtimeRoot, `.runner.lock.stale.${pid}.${randomUUID()}`)
+      try {
+        await fsp.rename(path, stalePath)
+        let movedSaved: { pid?: unknown } | null = null
+        try {
+          movedSaved = JSON.parse(await fsp.readFile(stalePath, 'utf8')) as { pid?: unknown }
+        } catch {
+          movedSaved = null
+        }
+        const movedOwner = typeof movedSaved?.pid === 'number' ? movedSaved.pid : null
+        if (movedOwner !== null && movedOwner !== owner && alive(movedOwner)) {
+          await fsp.link(stalePath, path).catch(() => {})
+          await fsp.unlink(stalePath).catch(() => {})
+          throw new Error(
+            `Another auto-research batch is already running for this checkout: ${path} (pid ${movedOwner})`,
+          )
+        }
+        await fsp.unlink(stalePath).catch(() => {})
+      } catch (reclaimErr) {
+        if (reclaimErr instanceof Error && reclaimErr.message.startsWith('Another auto-research batch')) {
+          throw reclaimErr
+        }
+      }
     } finally {
       await fsp.unlink(temporary).catch(() => {})
     }
@@ -805,7 +864,11 @@ export class AutoResearchProvider implements SubagentProvider {
     return allowed
   }
 
-  private providerInfo(name: string): { inheritsParentContext?: boolean; name?: string } | null {
+  private providerInfo(name: string): {
+    inheritsParentContext?: boolean
+    name?: string
+    capabilities?: { agentOptions?: unknown; [key: string]: unknown }
+  } | null {
     const service = this.ctx.subagents
     const registry = service.providers
     if (registry && typeof registry === 'object') {
@@ -816,7 +879,11 @@ export class AutoResearchProvider implements SubagentProvider {
       const fn = service[method]
       if (typeof fn === 'function') {
         try {
-          const value = fn.call(service, name) as { inheritsParentContext?: boolean; name?: string } | null | undefined
+          const value = fn.call(service, name) as {
+            inheritsParentContext?: boolean
+            name?: string
+            capabilities?: { agentOptions?: unknown; [key: string]: unknown }
+          } | null | undefined
           if (value && typeof value === 'object') return value
         } catch {
           // Fall through to the next introspection hook.
@@ -887,10 +954,10 @@ export class AutoResearchProvider implements SubagentProvider {
 
   /**
    * Choose the worker provider. Explicit configuration wins (after validation);
-   * otherwise external/non-inheriting providers are preferred over in-process
-   * context-inheriting providers such as `fork`.
+   * a plan-level override is honored when registered; otherwise external/non-inheriting
+   * providers are preferred over in-process context-inheriting providers such as `fork`.
    */
-  workerProviderName(): string {
+  workerProviderName(planOverride?: unknown, preferAgentOptions = false): string {
     const names = typeof this.ctx.subagents?.list === 'function' ? this.ctx.subagents.list() : []
     const configured = this.config.workerProvider
     if (configured !== undefined) {
@@ -898,16 +965,142 @@ export class AutoResearchProvider implements SubagentProvider {
         throw new Error(`worker provider "${configured}" is not registered (available: ${names.join(', ') || 'none'})`)
       }
       if (this.isRecursiveWorker(configured)) throw new Error('auto-research cannot delegate to itself as a worker')
-      return configured
     }
+    const planRequested = typeof planOverride === 'string' && planOverride.trim().length > 0
+      ? planOverride.trim()
+      : undefined
+    if (planRequested !== undefined) {
+      if (this.isRecursiveWorker(planRequested)) {
+        throw new Error('auto-research cannot delegate to itself as a worker')
+      }
+      if (names.includes(planRequested)) {
+        return planRequested
+      }
+      this.ctx.logger?.warn?.(
+        `[auto-research] plan requested workerProvider "${planRequested}" which is not registered (available: ${names.join(', ') || 'none'}); falling back to configured/default provider`,
+      )
+    }
+    if (configured !== undefined) return configured
     const candidates = names.filter(name => !this.isRecursiveWorker(name))
     if (candidates.length === 0) throw new Error('auto-research requires at least one other registered subagent provider')
     const external = candidates.filter(name => this.providerInfo(name)?.inheritsParentContext !== true)
-    const pool = external.length > 0 ? external : candidates
+    const basePool = external.length > 0 ? external : candidates
+    const optionCapable = preferAgentOptions
+      ? basePool.filter(name => (this.providerInfo(name)?.capabilities as { agentOptions?: unknown } | undefined)?.agentOptions === true)
+      : []
+    const pool = optionCapable.length > 0 ? optionCapable : basePool
     for (const preferred of PREFERRED_WORKERS) {
       if (pool.includes(preferred)) return preferred
     }
     return pool[0] as string
+  }
+
+  /**
+   * Resolve worker `agentOptions` against the live parent agent's current LLM
+   * state and `dsh`'s active `llm` registry so callers only need to specify a
+   * model ID or display name (e.g. `glm-5.3-flash` or `GLM Flash`) without
+   * hardcoding the internal provider adapter ID.
+   */
+  private async resolveLiveWorkerAgentOptions(
+    rawOptions: WorkerAgentOptions | null,
+    parent: unknown,
+  ): Promise<WorkerAgentOptions | null> {
+    if (!rawOptions) return null
+    const resolved: WorkerAgentOptions = { ...rawOptions }
+    const parentRecord = parent && typeof parent === 'object'
+      ? parent as {
+        options?: { provider?: unknown; model?: unknown }
+        session?: { requestHeader?: () => { config?: { provider?: unknown; model?: unknown } } | undefined }
+      }
+      : null
+    let headerConfig: { provider?: unknown; model?: unknown } | undefined
+    try {
+      headerConfig = parentRecord?.session?.requestHeader?.()?.config
+    } catch {
+      headerConfig = undefined
+    }
+    const parentProvider = typeof headerConfig?.provider === 'string' && headerConfig.provider.length > 0
+      ? headerConfig.provider
+      : typeof parentRecord?.options?.provider === 'string' && parentRecord.options.provider.length > 0
+        ? parentRecord.options.provider
+        : undefined
+
+    if (resolved.provider === undefined && typeof resolved.model === 'string' && resolved.model.includes('/')) {
+      const slashIndex = resolved.model.indexOf('/')
+      const prefix = resolved.model.slice(0, slashIndex).trim()
+      const suffix = resolved.model.slice(slashIndex + 1).trim()
+      if (prefix.length > 0 && suffix.length > 0) {
+        resolved.provider = prefix
+        resolved.model = suffix
+      }
+    }
+
+    const context = this.ctx as (PluginContext & { get?: (name: string) => unknown; llm?: unknown }) | undefined
+    type LlmServiceLike = {
+      listProviders?: () => Array<{ id: string; name?: string }>
+      listModels?: (providerId: string) => Promise<Array<{ id: string; name?: string }>>
+    }
+    let llmService: LlmServiceLike | null = null
+    try {
+      const candidate = typeof context?.get === 'function' ? context.get('llm') : context?.llm
+      if (candidate && typeof candidate === 'object') {
+        llmService = candidate as LlmServiceLike
+      }
+    } catch {
+      llmService = null
+    }
+
+    if (typeof resolved.model === 'string' && resolved.model.length > 0 && llmService) {
+      const targetModel = resolved.model.trim()
+      const targetLower = targetModel.toLowerCase()
+      const targetTokens = targetLower.split(/[^a-z0-9]+/).filter(Boolean)
+      const providerIds: string[] = []
+      if (resolved.provider) {
+        providerIds.push(resolved.provider)
+      } else {
+        if (parentProvider) providerIds.push(parentProvider)
+        try {
+          for (const p of llmService.listProviders?.() ?? []) {
+            if (typeof p?.id === 'string' && p.id.length > 0 && !providerIds.includes(p.id)) {
+              providerIds.push(p.id)
+            }
+          }
+        } catch {
+          // Ignore provider listing errors and fall back to parentProvider.
+        }
+      }
+
+      let matched: { provider: string; model: string } | null = null
+      for (const providerId of providerIds) {
+        let models: Array<{ id: string; name?: string }> = []
+        try {
+          models = (await llmService.listModels?.(providerId)) ?? []
+        } catch {
+          models = []
+        }
+        const exact = models.find(m => m.id === targetModel)
+          ?? models.find(m => m.id.toLowerCase() === targetLower || m.name?.toLowerCase() === targetLower)
+          ?? (targetTokens.length > 0
+            ? models.find(m => {
+              const haystack = `${m.id} ${m.name ?? ''}`.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
+              return targetTokens.every(tok => haystack.includes(tok))
+            })
+            : undefined)
+        if (exact) {
+          matched = { provider: providerId, model: exact.id }
+          break
+        }
+      }
+      if (matched) {
+        resolved.provider = matched.provider
+        resolved.model = matched.model
+      }
+    }
+
+    if (resolved.provider === undefined && parentProvider !== undefined) {
+      resolved.provider = parentProvider
+    }
+    return resolved
   }
 
   async start(request: SubagentStartRequest): Promise<SubagentRun> {
@@ -931,7 +1124,19 @@ export class AutoResearchProvider implements SubagentProvider {
     const evaluatorStat = await fsp.stat(evaluatorPath).catch(() => null)
     if (!evaluatorStat?.isFile()) throw new Error('Research plan evaluator does not exist: ' + evaluatorPath)
 
-    const workerProvider = this.workerProviderName()
+    const planOptionsRecord = plan.options && typeof plan.options === 'object'
+      ? plan.options as Record<string, unknown>
+      : {}
+    const workerAgentOptions: WorkerAgentOptions | null = await this.resolveLiveWorkerAgentOptions(
+      resolveWorkerAgentOptions(
+        this.config,
+        plan,
+        request.agentOptions,
+      ),
+      request.parent,
+    )
+    const planWorkerProvider = plan.workerProvider ?? plan.worker_provider ?? planOptionsRecord.workerProvider
+    const workerProvider = this.workerProviderName(planWorkerProvider, Boolean(workerAgentOptions))
     const workspaceRoot = await selectPlanWorkspace(cwd, plan as { workspace?: unknown })
     const runtimeRoot = join(workspaceRoot, '.auto-research-methods')
     await assertRuntimeRootContained(workspaceRoot, runtimeRoot)
@@ -1046,7 +1251,21 @@ export class AutoResearchProvider implements SubagentProvider {
           )
         }
       }
-      const evaluator = new FrozenEvaluator({ plan: plan as unknown as import('./evaluator.js').EvaluatorPlan, output, logger: this.ctx.logger ?? null })
+
+      const evaluatorEnv: Record<string, string> = {}
+      for (const [k, v] of Object.entries(process.env)) {
+        if (typeof v === 'string') evaluatorEnv[k] = v
+      }
+      for (const [k, v] of Object.entries(shellEnv)) {
+        if (typeof v === 'string') evaluatorEnv[k] = v
+      }
+
+      const evaluator = new FrozenEvaluator({
+        plan: plan as unknown as import('./evaluator.js').EvaluatorPlan,
+        output,
+        env: evaluatorEnv,
+        logger: this.ctx.logger ?? null,
+      })
       runner = new Runner({
         config: publicConfig(this.config),
         plan,
@@ -1063,6 +1282,7 @@ export class AutoResearchProvider implements SubagentProvider {
           ...(sessionIdOf(request.parent) ? { parentSessionId: sessionIdOf(request.parent) as string } : {}),
           ...(request.signal ? { signal: request.signal } : {}),
           workerProvider,
+          ...(workerAgentOptions ? { workerAgentOptions } : {}),
           workerEnv: this.config.workerEnv,
           layerfsEnv,
           workerEnvRegistry: this.workerEnvs,
@@ -1072,7 +1292,7 @@ export class AutoResearchProvider implements SubagentProvider {
       })
 
       this.ctx.logger?.info?.(
-        `[auto-research] batch ${runId}: plan=${source} workspace=${sourceWorkspace} run=${output} worker=${workerProvider}`,
+        `[auto-research] batch ${runId}: plan=${source} workspace=${sourceWorkspace} run=${output} worker=${workerProvider}${workerAgentOptions?.model ? ` model=${workerAgentOptions.provider ?? ''}/${workerAgentOptions.model}` : ''}`,
       )
 
       const activeRunner = runner

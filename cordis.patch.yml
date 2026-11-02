@@ -12,7 +12,7 @@
         explorationMinutes: 30
         exploitationMinutes: 30
         rsiTop: true
-        forkAndFlush: false
+        forkAndFlush: true
         shareContext: false
         sharingIntervalMinutes: 10
 

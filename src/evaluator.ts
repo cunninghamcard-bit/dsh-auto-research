@@ -186,17 +186,20 @@ export class FrozenEvaluator {
   hash: string | null = null
   script: string | null = null
   private readonly spawnImpl: typeof spawn | undefined
+  private readonly extraEnv: Readonly<Record<string, string>>
 
   constructor({
     plan,
     output,
     logger = null,
     spawn: spawnImpl = undefined,
+    env: extraEnv = {},
   }: {
     plan: EvaluatorPlan
     output: string
     logger?: Logger | null
     spawn?: typeof spawn
+    env?: Record<string, string>
   }) {
     if (!plan || typeof plan.evaluator !== 'string' || plan.evaluator.length === 0) {
       throw new Error('Plan requires an evaluator script')
@@ -205,6 +208,7 @@ export class FrozenEvaluator {
     this.output = output
     this.logger = logger
     this.spawnImpl = spawnImpl
+    this.extraEnv = Object.freeze({ ...extraEnv })
   }
 
   /**
@@ -287,7 +291,8 @@ export class FrozenEvaluator {
       if (segments.some(segment => segment === '' || segment === '.' || segment === '..')) {
         throw new Error('Evidence must exist within the evaluated workspace')
       }
-      if (!Object.hasOwn(before, relative)) {
+      const inMethodEval = segments[0] === '.method-evaluation' && segments.length > 1
+      if (!Object.hasOwn(before, relative) && !inMethodEval) {
         throw new Error('Evidence must exist within the evaluated workspace')
       }
       const path = resolve(workspace, relative)
@@ -334,12 +339,13 @@ export class FrozenEvaluator {
     const stderrPath = join(folder, 'evaluation.err.log')
     const temp = join(folder, '.method-evaluation', 'tmp')
     await fsp.mkdir(temp, { recursive: true })
-    const env: NodeJS.ProcessEnv = { ...process.env }
+    const env: NodeJS.ProcessEnv = { ...process.env, ...this.extraEnv }
     delete env.CLAUDECODE
     delete env.CODEX_THREAD_ID
     env.PYTHONDONTWRITEBYTECODE = '1'
     env.TMPDIR = temp
     env.XDG_CACHE_HOME = join(temp, 'cache')
+    env.DSH_AUTO_RESEARCH_EVAL_TIMEOUT_SECONDS = String(Math.max(1, Math.ceil(seconds)))
     const run = await runEvaluatorProcess({
       argv: this.argv(workspace),
       cwd: this.output,
@@ -360,9 +366,11 @@ export class FrozenEvaluator {
     if (run.aborted) return { valid: false, reason: 'Evaluation aborted' }
     if (run.error) return { valid: false, reason: `Evaluator failed to start: ${run.error.message}` }
     if (run.code !== 0 || run.timedOut) {
+      const rawErr = run.stderr.trim().slice(0, 300)
+      const safeErr = rawErr && !SECRET_LINE.test(rawErr) ? `: ${rawErr}` : ''
       return {
         valid: false,
-        reason: 'Evaluator failed or exceeded its budget',
+        reason: `Evaluator failed or exceeded its budget${safeErr}`,
         exit_code: run.code,
       }
     }

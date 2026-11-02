@@ -53,7 +53,22 @@ export interface ResearchOptions {
     sharingIntervalMinutes: number;
 }
 /** Subset of {@link ResearchOptions} a plan may override. */
-export type PlanOptions = Partial<ResearchOptions>;
+export type PlanOptions = Partial<ResearchOptions> & {
+    parallelism?: number;
+    workerProvider?: string;
+    workerLlmProvider?: string;
+    workerModel?: string;
+    workerReasoningEffort?: string;
+    workerAgentOptions?: WorkerAgentOptions;
+};
+/** Child agent LLM selection options passed to `ctx.subagents.startActivation`. */
+export interface WorkerAgentOptions {
+    provider?: string;
+    model?: string;
+    reasoningEffort?: string;
+    maxTokens?: number;
+    [key: string]: unknown;
+}
 /** Raw plan object as written by the coordinator (before validation). */
 export interface ResearchPlanInput {
     objective?: unknown;
@@ -70,6 +85,19 @@ export interface ResearchPlanInput {
     workspace?: unknown;
     evaluator_interpreter?: unknown;
     options?: unknown;
+    branches?: unknown;
+    parallelism?: unknown;
+    rounds?: unknown;
+    workerProvider?: unknown;
+    worker_provider?: unknown;
+    workerLlmProvider?: unknown;
+    worker_llm_provider?: unknown;
+    workerModel?: unknown;
+    worker_model?: unknown;
+    workerReasoningEffort?: unknown;
+    worker_reasoning_effort?: unknown;
+    workerAgentOptions?: unknown;
+    worker_agent_options?: unknown;
     [key: string]: unknown;
 }
 /** Validated, normalized plan used by the runner. */
@@ -211,6 +239,7 @@ export interface ResolvedSubagentStartRequest {
     cwd: string;
     prompt: ContentBlock[];
     parent: unknown;
+    agentOptions?: WorkerAgentOptions;
     [key: string]: unknown;
 }
 /** Specification accepted by `ctx.subagents.startActivation`. */
@@ -234,6 +263,7 @@ export interface SubagentStartRequest {
     prompt?: Prompt;
     parent?: unknown;
     signal?: AbortSignal;
+    agentOptions?: WorkerAgentOptions;
     [key: string]: unknown;
 }
 /** `ctx.subagents` service surface. */
@@ -334,9 +364,14 @@ export interface LayerFSBinding {
 export interface Config {
     providerName?: string;
     workerProvider?: string;
+    workerLlmProvider?: string | null;
+    workerModel?: string | null;
+    workerReasoningEffort?: string | null;
+    workerAgentOptions?: WorkerAgentOptions | null;
     planPath?: string;
     rounds?: number;
     branches?: number;
+    parallelism?: number;
     explorationMinutes?: number;
     exploitationMinutes?: number;
     rsiTop?: boolean;
@@ -354,9 +389,14 @@ export interface Config {
 export interface ResolvedConfig {
     providerName: string;
     workerProvider?: string;
+    workerLlmProvider?: string | null;
+    workerModel?: string | null;
+    workerReasoningEffort?: string | null;
+    workerAgentOptions?: WorkerAgentOptions | null;
     planPath: string;
     rounds: number;
     branches: number;
+    parallelism?: number;
     explorationMinutes: number;
     exploitationMinutes: number;
     rsiTop: boolean;
@@ -485,6 +525,7 @@ export interface RunnerDeps {
     parentSessionId?: string;
     signal?: AbortSignal;
     workerProvider: string;
+    workerAgentOptions?: WorkerAgentOptions | null;
     workerEnv?: Record<string, unknown>;
     layerfsEnv?: Record<string, unknown>;
     workerEnvRegistry?: WorkerEnvRegistryLike;
