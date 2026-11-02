@@ -49,9 +49,10 @@ describe('package metadata', () => {
     assert.equal(pkg.scripts.test, 'npm run typecheck && npm run build && node --test tests/*.test.ts')
     assert.equal(pkg.dsh.bundle.patch, './cordis.patch.yml')
     assert.deepEqual(pkg.exports['.'], { types: './lib/index.d.ts', default: './lib/index.js' })
-    for (const entry of ['api', 'layerfs', 'snapshot']) {
+    for (const entry of ['api', 'layerfs', 'snapshot', 'local']) {
       assert.deepEqual(pkg.exports[`./${entry}`], { types: `./lib/${entry}.d.ts`, default: `./lib/${entry}.js` })
     }
+    assert.deepEqual(pkg.exports['./colab'], { types: './lib/colab/index.d.ts', default: './lib/colab/index.js' })
     assert.equal(pkg.exports['./package.json'], './package.json')
     assert.equal(pkg.exports['./src/*'], './src/*')
     assert.equal(pkg.exports['./lib/*'], './lib/*')
@@ -84,6 +85,9 @@ describe('package metadata', () => {
     assert.match(patch, /name: 'dsh-auto-research'/)
     assert.match(patch, /name: 'dsh-auto-research\/layerfs'/)
     assert.match(patch, /name: 'dsh-auto-research\/snapshot'/)
+    assert.match(patch, /name: 'dsh-auto-research\/local'/)
+    // Colab needs an endpoint; users insert its row themselves.
+    assert.doesNotMatch(patch, /name: 'dsh-auto-research\/colab'/)
     assert.match(patch, /id: tool-subagent-auto-research/)
     assert.match(patch, /name: '@deepseek-ai\/dsh-tool-subagent'/)
     assert.match(patch, /provider: auto-research/)
@@ -104,6 +108,13 @@ describe('package metadata', () => {
       'api.ts',
       'layerfs.ts',
       'snapshot.ts',
+      'local.ts',
+      'colab/index.ts',
+      'colab/client.ts',
+      'colab/cli.ts',
+      'colab/server-script.ts',
+      'colab/benchmarks.ts',
+      'colab/types.ts',
       'types.ts',
     ]
     for (const name of sources) {
@@ -129,7 +140,7 @@ describe('package metadata', () => {
     assert.equal(tsconfig.compilerOptions.rootDir, 'src')
     assert.equal(tsconfig.compilerOptions.outDir, 'lib')
     assert.match(tsconfig.compilerOptions.target, /^es2024$/i)
-    for (const test of ['protocols', 'evaluator', 'workspace', 'runner', 'provider', 'skills', 'registry', 'package']) {
+    for (const test of ['protocols', 'evaluator', 'workspace', 'runner', 'provider', 'skills', 'registry', 'colab', 'package']) {
       assert.equal((await stat(join(root, `tests/${test}.test.ts`))).isFile(), true, test)
     }
     const testFiles = await readdir(join(root, 'tests'))
@@ -226,7 +237,7 @@ describe('packaged skills', () => {
   it('ships both SKILL.md files in the published package', async () => {
     const pkg = await json('package.json')
     assert.ok(pkg.files.includes('skills'))
-    for (const name of ['auto-research', 'auto-research-worker']) {
+    for (const name of ['auto-research', 'auto-research-worker', 'auto-research-colab']) {
       assert.equal((await stat(join(root, 'skills', name, 'SKILL.md'))).isFile(), true, name)
     }
   })

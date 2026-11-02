@@ -21,7 +21,7 @@ import {
   withoutLayerfsTrace,
   writeJsonAtomic,
 } from './layerfs-workspace.js'
-import type { ResearchWorkspaceRegistry } from './registry.js'
+import type { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js'
 import { insideWorkerCheckout } from './skills.js'
 import { FrozenEvaluator } from './evaluator.js'
 import {
@@ -45,7 +45,6 @@ import type {
   SubagentResult,
   SubagentRun,
   SubagentStartRequest,
-  SubprocessServiceLike,
   WorkerAgentOptions,
   WorkspaceState,
 } from './types.js'
@@ -84,6 +83,7 @@ export function resolveConfig(input: unknown = {}): ResolvedConfig {
     }
   }
   if (config.workspaceBackend !== undefined) requireNonEmptyString(config.workspaceBackend, 'workspaceBackend')
+  if (config.executor !== undefined) requireNonEmptyString(config.executor, 'executor')
   for (const key of ['providerName', 'planPath', 'workerProvider'] as const) {
     if (config[key] !== undefined) requireNonEmptyString(config[key], key)
   }
@@ -123,6 +123,7 @@ export function resolveConfig(input: unknown = {}): ResolvedConfig {
   }
   if (config.workerAgentOptions !== undefined) resolved.workerAgentOptions = config.workerAgentOptions
   if (config.workspaceBackend !== undefined) resolved.workspaceBackend = config.workspaceBackend
+  if (config.executor !== undefined) resolved.executor = config.executor
   if (config.layerfs !== undefined) resolved.layerfs = config.layerfs
   if (config.plan !== undefined) resolved.plan = config.plan
   return resolved
@@ -753,6 +754,13 @@ export function declaredWorkerEnvKeys(
   return keys
 }
 
+export interface ProviderOptions {
+  ctx: ProviderContext
+  config?: Config
+  workspaces: ResearchWorkspaceRegistry
+  executors: ResearchExecutorRegistry
+}
+
 /** One provider instance, normally created by the Cordis plugin entry. */
 export class AutoResearchProvider implements SubagentProvider {
   readonly ctx: ProviderContext
@@ -762,6 +770,8 @@ export class AutoResearchProvider implements SubagentProvider {
   readonly inheritsParentContext: boolean
   /** Workspace backends registered by `ctx.researchWorkspace` plugins. */
   readonly workspaces: ResearchWorkspaceRegistry
+  /** Evaluator executors registered by `ctx.researchExecutor` plugins. */
+  readonly executors: ResearchExecutorRegistry
   /** Branch environments of the workers that are running right now. */
   readonly workerEnvs = new WorkerEnvRegistry({
     resolveCwd: session => this.sessionWorkingDirectory(session),
@@ -779,7 +789,7 @@ export class AutoResearchProvider implements SubagentProvider {
   activeBatches = 0
   private disposeShellEnv: (() => void) | null = null
 
-  constructor({ ctx, config = {}, workspaces }: { ctx: ProviderContext; config?: Config; workspaces: ResearchWorkspaceRegistry }) {
+  constructor({ ctx, config = {}, workspaces, executors }: ProviderOptions) {
     if (!ctx) throw new Error('AutoResearchProvider requires a plugin context')
     this.ctx = ctx
     this.config = resolveConfig(config)
@@ -787,27 +797,9 @@ export class AutoResearchProvider implements SubagentProvider {
     this.capabilities = NO_START_CAPABILITIES
     this.inheritsParentContext = false
     this.workspaces = workspaces
+    this.executors = executors
     this.workerEnvKeys = declaredWorkerEnvKeys(this.config.workerEnv)
     this.installShellEnvContributor()
-  }
-
-  /** The `ctx.subprocess` service (`@deepseek-ai/dsh-subprocess`), read safely. */
-  private subprocessService(context: unknown = this.ctx): SubprocessServiceLike | undefined {
-    const holder = context as { get?: (name: string) => unknown; subprocess?: unknown } | null | undefined
-    if (!holder) return undefined
-    if (typeof holder.get === 'function') {
-      try {
-        const value = holder.get('subprocess')
-        if (value) return value as SubprocessServiceLike
-      } catch {
-        // The service is not injected in this host; try the property fallback.
-      }
-    }
-    try {
-      return holder.subprocess as SubprocessServiceLike | undefined
-    } catch {
-      return undefined
-    }
   }
 
   /** The `ctx.shellEnv` service, read without tripping Cordis's inject guard. */
@@ -1293,7 +1285,7 @@ export class AutoResearchProvider implements SubagentProvider {
         output,
         env: evaluatorEnv,
         logger: this.ctx.logger ?? null,
-        subprocess: this.subprocessService() ?? null,
+        executor: await this.executors.select(options.executor, { config: this.config, plan }),
       })
       runner = new Runner({
         config: publicConfig(this.config),
@@ -1410,6 +1402,6 @@ export class AutoResearchProvider implements SubagentProvider {
 }
 
 /** @returns a provider for the Cordis entry point. */
-export function createProvider(options: { ctx: ProviderContext; config?: Config; workspaces: ResearchWorkspaceRegistry }): AutoResearchProvider {
+export function createProvider(options: ProviderOptions): AutoResearchProvider {
   return new AutoResearchProvider(options)
 }

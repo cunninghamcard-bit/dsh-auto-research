@@ -6,7 +6,7 @@
  * `cordis.patch.yml` through `@deepseek-ai/dsh-tool-subagent`.
  */
 import { AutoResearchProvider, resolveConfig } from './provider.js';
-import { ResearchWorkspaceRegistry } from './registry.js';
+import { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js';
 import type { Config as PluginConfig, PluginContext, ResolvedConfig } from './types.js';
 export declare const name = "dsh-auto-research";
 export declare const inject: string[];
@@ -36,7 +36,7 @@ export declare const Config: Readonly<{
  * separate plugins (`dsh-auto-research/layerfs`, `dsh-auto-research/snapshot`).
  */
 export declare function apply(ctx: PluginContext, config?: PluginConfig): void;
-export { AutoResearchProvider, ResearchWorkspaceRegistry, resolveConfig };
-export type { ResearchWorkspaceService, WorkspaceBackend, WorkspaceBackendCreateOptions, WorkspaceBackendFactory, } from './types.js';
+export { AutoResearchProvider, ResearchExecutorRegistry, ResearchWorkspaceRegistry, resolveConfig };
+export type { ExecutorBackend, ExecutorBackendCreateOptions, ExecutorBackendFactory, FrozenEvaluationRequest, ResearchExecutorService, ResearchWorkspaceService, WorkspaceBackend, WorkspaceBackendCreateOptions, WorkspaceBackendFactory, } from './types.js';
 export { COORDINATOR_SKILL, SKILLS_ROOT, WORKER_SKILL, buildWorkerPrompt, skillFile, } from './skills.js';
 //# sourceMappingURL=index.d.ts.map

@@ -10,9 +10,10 @@
 
 | Cordis 行 | 作用 |
 | --- | --- |
-| `subagent-auto-research` | 提供 `ctx.researchWorkspace`，注册 `auto-research` provider 与 `auto-research` / `auto-research-worker` 两个 skill |
+| `subagent-auto-research` | 提供 `ctx.researchWorkspace` 与 `ctx.researchExecutor`，注册 `auto-research` provider 与 `auto-research` / `auto-research-worker` 两个 skill |
 | `auto-research-layerfs` | 在 `ctx.researchWorkspace` 注册 LayerFS 写时复制分支（优先级 100） |
 | `auto-research-snapshot` | 在 `ctx.researchWorkspace` 注册全量复制快照分支（优先级 0，回退） |
+| `auto-research-local` | 在本机运行冻结评估器，存在 `ctx.subprocess` 时经由它（`ctx.researchExecutor`，优先级 0） |
 | `tool-subagent-auto-research` | 通过 `@deepseek-ai/dsh-tool-subagent` 暴露 `subagent_auto_research`，深度由 provider 管理 |
 
 协调者加载 `auto-research` skill。它检查仓库、编写计划、委派一个批次，然后审阅 `RESULT.json`、`DASHBOARD.json`、`LEADER.json`、`SELECTIONS.json` 以及协作证据，再决定是否运行下一批。
@@ -26,6 +27,7 @@
 | --- | --- | --- |
 | `auto-research` | 分支 checkout 之外的所有 cwd | 协调者流程、plan 结构、evaluator 契约、审阅 |
 | `auto-research-worker` | 存活分支 checkout 内的 cwd（用户不可调用） | 分支规则、`BRANCH.json` 字段、RSI-top portfolio、协作 epoch |
+| `auto-research-colab` | 加载 `dsh-auto-research/colab` 时的所有 cwd | 用 `$DSH_COLAB_CLI` 做 GPU 预检、`options.executor: "colab"` |
 
 worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以及指向 worker skill 和 `.auto-research-methods/BRANCH.json` 的说明组成。启动前 runner 在 checkout 中写入：
 
@@ -61,6 +63,9 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
     - id: auto-research-snapshot
       name: 'dsh-auto-research/snapshot'
 
+    - id: auto-research-local
+      name: 'dsh-auto-research/local'
+
     - id: tool-subagent-auto-research
       name: '@deepseek-ai/dsh-tool-subagent'
       config:
@@ -84,6 +89,7 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
 | `forkAndFlush` | `false` | 每轮强制启动新的探索 cohort |
 | `shareContext` | `false` | 启用协作检查点与 peer review |
 | `sharingIntervalMinutes` | `10` | 阶段窗口内的检查点节奏 |
+| `executor` | `auto` | 运行冻结评估器的已注册执行后端（`local`、`colab` 或第三方）；`auto` 按优先级取第一个可用的。计划可在 `options.executor` 覆盖 |
 | `workspaceBackend` | `auto` | 已注册的后端名称（`layerfs`、`snapshot` 或第三方后端）；`auto` 按优先级取第一个可用的。计划可在 `options.workspaceBackend` 覆盖 |
 | `layerfs` | 自动 | 显式 LayerFS 设置；`false` 使 `layerfs` 后端拒绝本批次 |
 | `workerEnv` | `{}` | 展示给 worker 的非机密环境事实 |
@@ -181,6 +187,20 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
 符号链接在清单中记为 `symlink:<链接文本>`，不跟随。snapshot 复制时原样重建；已完成状态的检查点记在 `links` 中；暂存的 LayerFS 分支只在宿主副本保留链接（SDK 不能写入链接），并列入 `skippedFiles`。
 
 provider 从 `config.layerfs`、`process.env` 与会话的 `ctx.shellEnv` contributor 解析 `DSH_LAYERFS_PROJECT`、`DSH_LAYERFS_SDK`、`DSH_LAYERFS_OPERATOR`、`DSH_LAYERFS_CLI`、`DSH_LAYERFS_SKILL`、`DSH_LAYERFS_HOME`、`DSH_LAYERFS_STORE_PATH`、`DSH_LAYERFS_DOCKER`、`DSH_LAYERFS_IMAGE`、`DSH_LAYERFS_VOLUME`、`DSH_LAYERFS_DAEMON`、`DSH_LAYERFS_CONTAINER_PREFIX`、`DSH_LAYERFS_DAEMON_HOST`、`DSH_LAYERFS_STORE_CONTAINER`、`DSH_LAYERFS_BUNDLE`、`DSH_LAYERFS_WSL_ENDPOINT`、`DSH_LAYERFS_TRACE`、`DSH_LAYERFS_TRACE_STEP` 与 `DSH_LAYERFS_TRACE_START`。显式 `config.layerfs` 优先；宿主注入的 `layerfs.client` 从不由本插件关闭。
+
+## Colab GPU 评估
+
+默认 patch 不含 `dsh-auto-research/colab`，需要连同 endpoint 自行插入：
+
+```yaml
+- insert:
+    - id: auto-research-colab
+      name: 'dsh-auto-research/colab'
+      config:
+        connectionFile: ~/.config/dsh-colab/connection.json
+```
+
+`node lib/colab/cli.js bootstrap` 输出启动队列服务（`COLAB_WORKER_PY`）与隧道的单格 Colab notebook 代码。配置了 endpoint 或连接文件（在该行中，或 `DSH_COLAB_ENDPOINT` / `DSH_COLAB_CONNECTION`）时，`colab` 执行后端（优先级 100）在 `auto` 选择中胜出；未配置时它返回 null，由 `local` 运行评估器。队列一次只跑一个任务。每次评估上传冻结评估器及其哈希和工作区清单；远端评估器哈希与冻结副本不同，或评估改动了上传的工作区时，结果被拒绝。`FrozenEvaluator` 本地的哈希与清单校验照常执行。worker 通过 `ctx.shellEnv` 获得 `DSH_COLAB_*`，用 `node "$DSH_COLAB_CLI" exec . -- <命令>` 做 GPU 预检。
 
 ## 安全
 

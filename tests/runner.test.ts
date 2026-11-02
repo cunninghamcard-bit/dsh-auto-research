@@ -11,7 +11,7 @@ import {
   validatePlan,
 } from '../lib/runner.js'
 import { inventory } from '../lib/layerfs-workspace.js'
-import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, snapshotManager } from './helpers.ts'
+import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, snapshotManager, localExecutor } from './helpers.ts'
 
 const sha256 = (data: any) => createHash('sha256').update(data).digest('hex')
 
@@ -77,6 +77,7 @@ async function setup(root: string, {
     originalManifest: await inventory(workspace),
     selectionFile: join(root, '.auto-research-methods', 'LATEST.json'),
     deps: {
+      executor: localExecutor,
       subagents,
       workspaceManager: manager,
       parent: { id: 'parent' },
@@ -292,6 +293,7 @@ describe('Runner batches', () => {
           output,
           frontier,
           deps: {
+            executor: localExecutor,
             subagents,
             workspaceManager: manager,
             parent: { id: 'parent' },

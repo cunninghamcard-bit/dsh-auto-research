@@ -53,6 +53,8 @@ export interface ResearchOptions {
     sharingIntervalMinutes: number;
     /** Registered workspace backend name, or `auto` for priority order. */
     workspaceBackend: string;
+    /** Registered executor name for the frozen evaluator, or `auto`. */
+    executor: string;
 }
 /** Subset of {@link ResearchOptions} a plan may override. */
 export type PlanOptions = Partial<ResearchOptions> & {
@@ -292,6 +294,14 @@ export interface ShellEnvService {
     snapshot?: (options?: {
         agent?: unknown;
     }) => Promise<Record<string, unknown>> | Record<string, unknown>;
+    /** `dsh` `ShellEnvRegistry.register(contributor)`; returns the disposer. */
+    register?: (contributor: {
+        name: string;
+        variables: Readonly<Record<string, {
+            description: string;
+        }>>;
+        resolve: (execution: unknown) => Record<string, string>;
+    }) => () => void;
     /** `dsh` `ShellEnvRegistry.collect(execution)` (the real contributor API). */
     collect?: (execution: {
         agent?: unknown;
@@ -334,6 +344,8 @@ export interface ProviderContext {
     subprocess?: SubprocessServiceLike;
     /** Workspace backend registry provided by the core plugin. */
     researchWorkspace?: ResearchWorkspaceService;
+    /** Executor registry provided by the core plugin. */
+    researchExecutor?: ResearchExecutorService;
     logger?: Logger;
     get?: (name: string) => unknown;
     inject?: (deps: string[], callback: (ctx: ProviderContext) => void) => unknown;
@@ -343,6 +355,7 @@ export interface ProviderContext {
 export interface PluginContext extends ProviderContext {
     provide: (name: string, value: unknown) => unknown;
     effect: (callback: () => () => void) => unknown;
+    inject: (deps: string[], callback: (ctx: PluginContext) => void) => unknown;
 }
 /** Minimal logger used by the runner and provider. */
 export interface Logger {
@@ -402,6 +415,8 @@ export interface Config {
     sharingIntervalMinutes?: number;
     /** Registered workspace backend name; `auto` (the default) picks by priority. */
     workspaceBackend?: string;
+    /** Registered executor name; `auto` (the default) picks by priority. */
+    executor?: string;
     layerfs?: LayerFSBinding | false | null;
     workerEnv?: Record<string, unknown>;
     plan?: ResearchPlanInput;
@@ -426,6 +441,7 @@ export interface ResolvedConfig {
     shareContext: boolean;
     sharingIntervalMinutes: number;
     workspaceBackend?: string;
+    executor?: string;
     layerfs?: LayerFSBinding | false | null;
     workerEnv: Record<string, unknown>;
     plan?: ResearchPlanInput;
@@ -541,6 +557,8 @@ export interface RunnerDeps {
     subagents: SubagentsService;
     workspaceManager: WorkspaceManagerLike;
     evaluator?: EvaluatorLike;
+    /** Executor for the evaluator the runner builds when `evaluator` is absent. */
+    executor?: ExecutorBackend;
     initialState?: WorkspaceState;
     parent?: unknown;
     /** Runtime session id of the coordinator, used to match worker shell calls. */
@@ -668,6 +686,54 @@ export interface WorkspaceBackendFactory {
     readonly priority: number;
     /** Return null when this backend does not apply to the batch. */
     create: (options: WorkspaceBackendCreateOptions) => Promise<WorkspaceBackend | null>;
+}
+/** One run of the frozen evaluator, as `FrozenEvaluator` prepared it. */
+export interface FrozenEvaluationRequest {
+    /** The frozen evaluator copy and its SHA-256. */
+    script: string;
+    sha256: string;
+    /** The candidate workspace. */
+    workspace: string;
+    /** Local command line: interpreter, script, workspace. */
+    argv: string[];
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    timeoutMs: number;
+    signal?: AbortSignal;
+    /** Where the run's stdout and stderr are kept. */
+    stdoutPath: string;
+    stderrPath: string;
+}
+/** What one evaluator run returned; `FrozenEvaluator` verifies and parses it. */
+export interface EvaluatorProcessResult {
+    code: number | null;
+    timedOut: boolean;
+    aborted: boolean;
+    stdout: string;
+    stderr: string;
+    error?: Error;
+}
+/** Where the frozen evaluator runs. */
+export interface ExecutorBackend {
+    readonly name: string;
+    evaluate: (request: FrozenEvaluationRequest) => Promise<EvaluatorProcessResult>;
+}
+export interface ExecutorBackendCreateOptions {
+    config: Config;
+    plan: ResearchPlanInput;
+}
+/** Pluggable factory that constructs an {@link ExecutorBackend} when applicable. */
+export interface ExecutorBackendFactory {
+    readonly name: string;
+    /** Higher priorities are tried first when `executor` is `auto`. */
+    readonly priority: number;
+    /** Return null when this executor does not apply to the batch. */
+    create: (options: ExecutorBackendCreateOptions) => Promise<ExecutorBackend | null>;
+}
+/** `ctx.researchExecutor`: where executor plugins register. */
+export interface ResearchExecutorService {
+    register: (factory: ExecutorBackendFactory) => () => void;
+    list: () => ExecutorBackendFactory[];
 }
 /** `ctx.researchWorkspace`: where workspace backend plugins register. */
 export interface ResearchWorkspaceService {

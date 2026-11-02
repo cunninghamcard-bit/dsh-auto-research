@@ -60,7 +60,7 @@ export function parseSkill(text: string): ParsedSkill {
 }
 
 /** The `ctx.skills` provider shape this bundle registers. */
-interface SkillCandidate {
+export interface SkillCandidate {
   name: string
   description: string
   invocation: { modelInvocable: boolean; userInvocable: boolean }
@@ -71,47 +71,50 @@ interface SkillCandidate {
   locator: string
 }
 
+/** @returns the `ctx.skills` candidate for a packaged skill. */
+export function skillCandidate(name: string, provider = 'dsh-auto-research'): SkillCandidate {
+  const parsed = parseSkill(readFileSync(skillFile(name), 'utf8'))
+  return {
+    name: parsed.name,
+    description: parsed.description,
+    invocation: { modelInvocable: true, userInvocable: parsed.userInvocable },
+    provider,
+    source: 'bundled',
+    rank: BUNDLED_SKILL_RANK,
+    resourceBase: { kind: 'directory', path: join(SKILLS_ROOT, name) },
+    locator: skillFile(name),
+  }
+}
+
+/** Load a packaged skill's body for `ctx.skills`. */
+export async function loadSkill(found: SkillCandidate, options: { signal?: AbortSignal }) {
+  const { rank: _rank, locator, ...summary } = found
+  const text = await fsp.readFile(locator, { encoding: 'utf8', signal: options.signal })
+  return { ...summary, content: parseSkill(text).content }
+}
+
 /**
  * Register the packaged skills on `ctx.skills`.
  *
  * `list({ cwd })` returns the worker skill inside a live branch checkout and
- * the coordinator skill everywhere else. The answer depends on which workers
- * are running, so worker results are reported incomplete (never cached) and
- * `invalidate` is returned for the runner to call when workers start or stop.
+ * the coordinator skill everywhere else. The registry caches catalogs by cwd,
+ * so the returned `invalidate` must run when workers start or stop.
  */
 export function registerSkills(
   skills: SkillsService,
   isWorkerCwd: (cwd: string) => boolean,
 ): { invalidate: () => void } {
-  const candidate = (name: string): SkillCandidate => {
-    const parsed = parseSkill(readFileSync(skillFile(name), 'utf8'))
-    return {
-      name: parsed.name,
-      description: parsed.description,
-      invocation: { modelInvocable: true, userInvocable: parsed.userInvocable },
-      provider: 'dsh-auto-research',
-      source: 'bundled',
-      rank: BUNDLED_SKILL_RANK,
-      resourceBase: { kind: 'directory', path: join(SKILLS_ROOT, name) },
-      locator: skillFile(name),
-    }
-  }
-  const coordinator = [candidate(COORDINATOR_SKILL)]
-  const worker = [candidate(WORKER_SKILL)]
+  const coordinator = [skillCandidate(COORDINATOR_SKILL)]
+  const worker = [skillCandidate(WORKER_SKILL)]
   let control: { invalidate: () => void } | null = null
   skills.registerProvider(registration => {
     control = registration
     return {
       name: 'dsh-auto-research',
       async list(options: { cwd?: string }) {
-        // The registry caches by cwd; worker register/dispose calls invalidate().
         return options.cwd && isWorkerCwd(options.cwd) ? worker : coordinator
       },
-      async get(found: SkillCandidate, options: { signal?: AbortSignal }) {
-        const { rank: _rank, locator, ...summary } = found
-        const text = await fsp.readFile(locator, { encoding: 'utf8', signal: options.signal })
-        return { ...summary, content: parseSkill(text).content }
-      },
+      get: loadSkill,
     }
   })
   return { invalidate: () => control?.invalidate() }

@@ -10,9 +10,10 @@ Stack: strict TypeScript (ES2024, compiled to `lib/` with declarations and sourc
 
 | Cordis row | Contribution |
 | --- | --- |
-| `subagent-auto-research` | Provides `ctx.researchWorkspace` and registers the `auto-research` provider and the `auto-research` / `auto-research-worker` skills |
+| `subagent-auto-research` | Provides `ctx.researchWorkspace` and `ctx.researchExecutor`, and registers the `auto-research` provider and the `auto-research` / `auto-research-worker` skills |
 | `auto-research-layerfs` | Registers LayerFS copy-on-write branches on `ctx.researchWorkspace` (priority 100) |
 | `auto-research-snapshot` | Registers full-copy snapshot branches on `ctx.researchWorkspace` (priority 0, the fallback) |
+| `auto-research-local` | Runs the frozen evaluator on this host, through `ctx.subprocess` when present (`ctx.researchExecutor`, priority 0) |
 | `tool-subagent-auto-research` | Exposes `subagent_auto_research` through `@deepseek-ai/dsh-tool-subagent` with provider-managed depth |
 
 The coordinator loads the `auto-research` skill. It inspects the repository, writes a plan, delegates one batch, then reviews `RESULT.json`, `DASHBOARD.json`, `LEADER.json`, `SELECTIONS.json`, and any cooperative evidence before deciding whether another batch is justified.
@@ -25,6 +26,7 @@ Every model-facing instruction ships as a skill under [`skills/`](skills); the p
 | --- | --- | --- |
 | `auto-research` | every cwd outside a branch checkout | coordinator workflow, plan schema, evaluator contract, review |
 | `auto-research-worker` | cwds inside a live branch checkout (not user-invocable) | branch rules, `BRANCH.json` fields, RSI-top portfolio, cooperative epochs |
+| `auto-research-colab` | every cwd, when `dsh-auto-research/colab` is loaded | `$DSH_COLAB_CLI` pre-flight GPU commands, `options.executor: "colab"` |
 
 A worker's prompt is the plan's `worker_prompt`, the objective, the checkout, and a pointer to the worker skill and to `.auto-research-methods/BRANCH.json`. Before launch the runner writes into the checkout:
 
@@ -60,6 +62,9 @@ Add the bundle to a DSH profile (the plugin manager reads `dsh.bundle.patch`), o
     - id: auto-research-snapshot
       name: 'dsh-auto-research/snapshot'
 
+    - id: auto-research-local
+      name: 'dsh-auto-research/local'
+
     - id: tool-subagent-auto-research
       name: '@deepseek-ai/dsh-tool-subagent'
       config:
@@ -83,6 +88,7 @@ Add the bundle to a DSH profile (the plugin manager reads `dsh.bundle.patch`), o
 | `forkAndFlush` | `false` | Force a fresh explore cohort every round |
 | `shareContext` | `false` | Enable cooperative checkpoints and peer review |
 | `sharingIntervalMinutes` | `10` | Checkpoint cadence inside a phase window |
+| `executor` | `auto` | Registered executor for the frozen evaluator (`local`, `colab`, or a third-party one); `auto` takes the first available by priority. A plan may override it in `options.executor` |
 | `workspaceBackend` | `auto` | Registered backend name (`layerfs`, `snapshot`, or a third-party one); `auto` takes the first available by priority. A plan may override it in `options.workspaceBackend` |
 | `layerfs` | auto | Explicit LayerFS settings; `false` makes the `layerfs` backend decline the batch |
 | `workerEnv` | `{}` | Non-secret environment facts shown to workers |
@@ -180,6 +186,20 @@ The host staging copy is the only writer; the Sandbox mount is for execution. Af
 Before a cohort, the backend estimates the bytes its forks add: full host copies for the snapshot backend and staged LayerFS mounts, nothing for host-accessible LayerFS mounts (copy-on-write). The cohort is refused only when that estimate does not fit.
 
 Symlinks are recorded in manifests as `symlink:<link text>` and never followed. Snapshot copies recreate them, completed-state checkpoints store them under `links`, and a staged LayerFS branch keeps them on the host copy only (the SDK cannot write links), listed in `skippedFiles`.
+
+## Colab GPU evaluation
+
+`dsh-auto-research/colab` is not in the default patch; insert it with an endpoint:
+
+```yaml
+- insert:
+    - id: auto-research-colab
+      name: 'dsh-auto-research/colab'
+      config:
+        connectionFile: ~/.config/dsh-colab/connection.json
+```
+
+`node lib/colab/cli.js bootstrap` prints the one-cell Colab notebook that starts the queue server (`COLAB_WORKER_PY`) behind a tunnel. With an endpoint or connection file configured (in the row, or `DSH_COLAB_ENDPOINT` / `DSH_COLAB_CONNECTION`), the `colab` executor (priority 100) wins `auto` selection; without one it declines and `local` runs the evaluator. The queue runs one job at a time. Each evaluation uploads the frozen evaluator with its hash and a manifest of the workspace; a result is rejected when the remote evaluator hash differs from the frozen copy or the evaluation changed the uploaded workspace. `FrozenEvaluator` keeps its own local hash and manifest checks either way. Workers get `DSH_COLAB_*` through `ctx.shellEnv` and run `node "$DSH_COLAB_CLI" exec . -- <command>` for pre-flight GPU work.
 
 ## Safety
 

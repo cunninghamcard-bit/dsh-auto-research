@@ -13,7 +13,7 @@ import {
 import { Config, apply, name as pluginName, inject } from '../lib/index.js'
 import { ResearchStoppedError } from '../lib/runner.js'
 import { ResearchWorkspaceRegistry } from '../lib/registry.js'
-import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, testWorkspaces, fakePluginContext } from './helpers.ts'
+import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, testWorkspaces, fakePluginContext, testExecutors } from './helpers.ts'
 
 function planObject(root: string, extra: Record<string, any> = {}): any {
   return {
@@ -49,7 +49,7 @@ async function fixture(root: string, {
     await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
     return { output: [], stopReason: 'completed' }
   }), ['worker'])
-  const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
+  const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
     ctx: { subagents, logger: { info() {}, warn() {} } },
     config: {
       workerProvider: 'worker',
@@ -227,7 +227,7 @@ describe('AutoResearchProvider', () => {
         await setState(spec.request.cwd, { score: 5, metrics: { score: 5 } })
         return { output: [], stopReason: 'completed' }
       }, ['worker'])
-      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), ctx: { subagents, logger: {} }, config: { workerProvider: 'worker' } })
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(), ctx: { subagents, logger: {} }, config: { workerProvider: 'worker' } })
       const handle = await provider.start({
         cwd,
         prompt: [{ type: 'text', text: 'Plan:\n```json\n' + JSON.stringify(plan) + '\n```' }],
@@ -245,7 +245,7 @@ describe('AutoResearchProvider', () => {
     await withTemp(async root => {
       const cwd = join(root, 'repo')
       await writeWorkspace(cwd, { score: 1, metrics: { score: 1 } })
-      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents: fakeSubagents(async () => ({ stopReason: 'completed' }), ['worker']) },
         config: { workerProvider: 'worker' },
       })
@@ -278,7 +278,7 @@ describe('AutoResearchProvider', () => {
       await writeFile(join(cwd, '.auto-research-methods', 'plan.json'), JSON.stringify({
         ...planObject(cwd), evaluator: join(cwd, 'missing.mjs'),
       }))
-      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents: fakeSubagents(async () => ({ stopReason: 'completed' }), ['worker']) },
         config: { workerProvider: 'worker' },
       })
@@ -286,7 +286,7 @@ describe('AutoResearchProvider', () => {
     })
     await withTemp(async root => {
       const { cwd } = await fixture(root)
-      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents: fakeSubagents(async () => ({ stopReason: 'completed' }), ['worker']) },
         config: { workerProvider: 'worker', branches: 1 },
       })
@@ -294,7 +294,7 @@ describe('AutoResearchProvider', () => {
     })
     await withTemp(async root => {
       const { cwd } = await fixture(root)
-      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents: { list: () => ['auto-research'], startActivation() {} } } as any,
         config: { workerProvider: 'auto-research' },
       })
@@ -302,7 +302,7 @@ describe('AutoResearchProvider', () => {
     })
     await withTemp(async root => {
       const { cwd } = await fixture(root)
-      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents: { list: () => ['auto-research'], startActivation() {} } } as any,
         config: {},
       })
@@ -310,7 +310,7 @@ describe('AutoResearchProvider', () => {
     })
     await withTemp(async root => {
       const { cwd } = await fixture(root)
-      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents: { list: () => ['worker'], startActivation() {} } } as any,
         config: { workerProvider: 'missing' },
       })

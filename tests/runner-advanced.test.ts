@@ -9,7 +9,7 @@ import {
 } from '../lib/runner.js'
 import { LayerFSBackend, WorkspaceManager, inventory } from '../lib/layerfs-workspace.js'
 import { SHARED_CONTEXT_PREAMBLE } from '../lib/protocols.js'
-import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, snapshotManager } from './helpers.ts'
+import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, snapshotManager, localExecutor } from './helpers.ts'
 
 const sha256 = (data: any) => createHash('sha256').update(data).digest('hex')
 
@@ -73,6 +73,7 @@ async function setup(root: string, {
     originalManifest: await inventory(workspace),
     selectionFile: join(root, '.auto-research-methods', 'LATEST.json'),
     deps: {
+      executor: localExecutor,
       subagents: service,
       workspaceManager,
       parent: { id: 'parent' },

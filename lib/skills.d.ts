@@ -23,13 +23,49 @@ interface ParsedSkill {
 }
 /** Split a packaged `SKILL.md` into its frontmatter fields and body. */
 export declare function parseSkill(text: string): ParsedSkill;
+/** The `ctx.skills` provider shape this bundle registers. */
+export interface SkillCandidate {
+    name: string;
+    description: string;
+    invocation: {
+        modelInvocable: boolean;
+        userInvocable: boolean;
+    };
+    provider: string;
+    source: string;
+    rank: number;
+    resourceBase: {
+        kind: 'directory';
+        path: string;
+    };
+    locator: string;
+}
+/** @returns the `ctx.skills` candidate for a packaged skill. */
+export declare function skillCandidate(name: string, provider?: string): SkillCandidate;
+/** Load a packaged skill's body for `ctx.skills`. */
+export declare function loadSkill(found: SkillCandidate, options: {
+    signal?: AbortSignal;
+}): Promise<{
+    name: string;
+    description: string;
+    invocation: {
+        modelInvocable: boolean;
+        userInvocable: boolean;
+    };
+    provider: string;
+    source: string;
+    resourceBase: {
+        kind: 'directory';
+        path: string;
+    };
+    content: string;
+}>;
 /**
  * Register the packaged skills on `ctx.skills`.
  *
  * `list({ cwd })` returns the worker skill inside a live branch checkout and
- * the coordinator skill everywhere else. The answer depends on which workers
- * are running, so worker results are reported incomplete (never cached) and
- * `invalidate` is returned for the runner to call when workers start or stop.
+ * the coordinator skill everywhere else. The registry caches catalogs by cwd,
+ * so the returned `invalidate` must run when workers start or stop.
  */
 export declare function registerSkills(skills: SkillsService, isWorkerCwd: (cwd: string) => boolean): {
     invalidate: () => void;

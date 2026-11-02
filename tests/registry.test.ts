@@ -1,7 +1,8 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { join } from 'node:path'
-import { ResearchWorkspaceRegistry } from '../lib/registry.js'
+import { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from '../lib/registry.js'
+import * as localPlugin from '../lib/local.js'
 import * as layerfsPlugin from '../lib/layerfs.js'
 import * as snapshotPlugin from '../lib/snapshot.js'
 import { fakePluginContext, withTemp } from './helpers.ts'
@@ -80,5 +81,23 @@ describe('workspace backend plugins', () => {
       })
       assert.equal(backend.name, 'snapshot')
     })
+  })
+})
+
+describe('executor plugins', () => {
+  it('local registers on ctx.researchExecutor, picks up ctx.subprocess, and unregisters on unload', async () => {
+    const registry = new ResearchExecutorRegistry()
+    const subprocess = { spawn() { throw new Error('unused') } }
+    const ctx = fakePluginContext({ researchExecutor: registry, subprocess })
+    assert.deepEqual(localPlugin.inject, ['researchExecutor'])
+    localPlugin.apply(ctx)
+    assert.deepEqual(registry.list().map(item => [item.name, item.priority]), [['local', 0]])
+    const executor = await registry.select('auto', { config: {}, plan: {} }) as any
+    assert.equal(executor.name, 'local')
+    assert.equal(executor.subprocess, subprocess)
+    ctx.dispose()
+    assert.equal(executor.subprocess, null)
+    assert.deepEqual(registry.list(), [])
+    await assert.rejects(registry.select('auto', { config: {}, plan: {} }), /no executor is available \(registered: none\); load dsh-auto-research\/local/)
   })
 })

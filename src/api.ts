@@ -15,10 +15,19 @@ export {
   snapshot,
   writeJsonAtomic,
 } from './layerfs-workspace.js'
+export { runEvaluatorProcess } from './evaluator.js'
 export type {
+  EvaluatorProcessResult,
+  ExecutorBackend,
+  ExecutorBackendCreateOptions,
+  ExecutorBackendFactory,
+  FrozenEvaluationRequest,
+  Logger,
   PluginContext,
   ReconcileOutcome,
   Reconciliation,
+  ResearchExecutorService,
+  ResearchPlanInput,
   ResearchWorkspaceService,
   TrajectoryRow,
   WorkspaceBackend,

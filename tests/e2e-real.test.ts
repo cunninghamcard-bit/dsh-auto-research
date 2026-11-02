@@ -46,6 +46,7 @@ import {
 const AUTO_RESEARCH = new URL('../lib/index.js', import.meta.url).href
 const LAYERFS_PLUGIN = new URL('../lib/layerfs.js', import.meta.url).href
 const SNAPSHOT_PLUGIN = new URL('../lib/snapshot.js', import.meta.url).href
+const LOCAL_PLUGIN = new URL('../lib/local.js', import.meta.url).href
 const SHELL_ENV = `${DSH_ROOT}/packages/shell/shell-env/lib/index.js`
 const WORKER_KEYS = ['DSH_AUTO_RESEARCH_WORKER', 'DSH_AUTO_RESEARCH_BRANCH', 'DSH_AUTO_RESEARCH_CHECKOUT', 'DSH_AUTO_RESEARCH_SANDBOX_PATH']
 
@@ -327,6 +328,7 @@ async function scenario(backend: string) {
     // core provides `researchWorkspace`.
     await ctx.plugin(await import(LAYERFS_PLUGIN))
     const snapshotFiber = await ctx.plugin(await import(SNAPSHOT_PLUGIN))
+    await ctx.plugin(await import(LOCAL_PLUGIN))
     const plugin = await import(AUTO_RESEARCH)
     await ctx.plugin(plugin, {
       providerName: 'auto-research',
@@ -405,6 +407,8 @@ async function scenario(backend: string) {
     assert.equal(adopted.workspace.includes(leaderWorkspace), false, 'the deleted checkout was replaced by the adopted branch')
     const secondResult = readJson(join(latest2.run, 'RESULT.json'))
     assert.equal(secondResult.status, 'COMPLETED')
+
+    assert.deepEqual(ctx.researchExecutor.list().map((factory: any) => factory.name), ['local'])
 
     // Unloading a backend plugin removes its factory.
     assert.deepEqual(ctx.researchWorkspace.list().map((factory: any) => factory.name), ['layerfs', 'snapshot'])

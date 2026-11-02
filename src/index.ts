@@ -7,7 +7,7 @@
  */
 
 import { AutoResearchProvider, resolveConfig } from './provider.js'
-import { ResearchWorkspaceRegistry } from './registry.js'
+import { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js'
 import { registerSkills } from './skills.js'
 import type { Config as PluginConfig, PluginContext, ResolvedConfig } from './types.js'
 
@@ -41,16 +41,23 @@ export const Config = Object.freeze({
  */
 export function apply(ctx: PluginContext, config?: PluginConfig): void {
   const workspaces = new ResearchWorkspaceRegistry()
+  const executors = new ResearchExecutorRegistry()
   ctx.provide('researchWorkspace', workspaces)
-  const provider = new AutoResearchProvider({ ctx, config: resolveConfig(config), workspaces })
+  ctx.provide('researchExecutor', executors)
+  const provider = new AutoResearchProvider({ ctx, config: resolveConfig(config), workspaces, executors })
   const skills = registerSkills(ctx.skills!, cwd => provider.workerEnvs.ownsCheckout(cwd))
   provider.workerEnvs.onChange = skills.invalidate
   ctx.subagents.registerProvider(provider)
   ctx.effect(() => () => provider.dispose())
 }
 
-export { AutoResearchProvider, ResearchWorkspaceRegistry, resolveConfig }
+export { AutoResearchProvider, ResearchExecutorRegistry, ResearchWorkspaceRegistry, resolveConfig }
 export type {
+  ExecutorBackend,
+  ExecutorBackendCreateOptions,
+  ExecutorBackendFactory,
+  FrozenEvaluationRequest,
+  ResearchExecutorService,
   ResearchWorkspaceService,
   WorkspaceBackend,
   WorkspaceBackendCreateOptions,

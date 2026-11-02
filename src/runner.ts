@@ -126,6 +126,7 @@ export function normalizeOptions(
     shareContext: overrides.shareContext ?? config.shareContext ?? false,
     sharingIntervalMinutes: overrides.sharingIntervalMinutes ?? config.sharingIntervalMinutes ?? 10,
     workspaceBackend: overrides.workspaceBackend ?? config.workspaceBackend ?? 'auto',
+    executor: overrides.executor ?? config.executor ?? 'auto',
   }
 }
 
@@ -483,7 +484,13 @@ export class Runner {
     this.parentSessionId = typeof deps.parentSessionId === 'string' && deps.parentSessionId.length > 0
       ? deps.parentSessionId
       : null
-    this.evaluator = (deps.evaluator ?? new FrozenEvaluator({ plan: this.plan, output, logger: this.logger ?? null })) as RunnerDeps['evaluator'] & { hash: string | null }
+    if (!deps.evaluator && !deps.executor) throw new Error('Runner needs an evaluator or an executor to build one')
+    this.evaluator = (deps.evaluator ?? new FrozenEvaluator({
+      plan: this.plan,
+      output,
+      executor: deps.executor!,
+      logger: this.logger ?? null,
+    })) as RunnerDeps['evaluator'] & { hash: string | null }
     this.originalManifest = originalManifest
     this.selectionFile = selectionFile
     this.savedFrontier = frontier

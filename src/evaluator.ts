@@ -21,11 +21,15 @@ import {
 } from './layerfs-workspace.js'
 import type {
   EvaluationResult,
+  EvaluatorProcessResult,
+  ExecutorBackend,
   Logger,
   MetricDefinition,
   SelectionMetric,
   SubprocessServiceLike,
 } from './types.js'
+
+export type { EvaluatorProcessResult }
 
 const SECRET_LINE = /(access_token|refresh_token|api_key|apiKey|client_secret|BEGIN [A-Z ]*PRIVATE KEY)/
 
@@ -37,15 +41,6 @@ export interface EvaluatorPlan {
   selection_metrics?: SelectionMetric[]
   evaluator_interpreter?: string | string[]
   [key: string]: unknown
-}
-
-export interface EvaluatorProcessResult {
-  code: number | null
-  timedOut: boolean
-  aborted: boolean
-  stdout: string
-  stderr: string
-  error?: Error
 }
 
 export interface EvaluatorProcessParts {
@@ -248,23 +243,21 @@ export class FrozenEvaluator {
   readonly plan: EvaluatorPlan
   hash: string | null = null
   script: string | null = null
-  private readonly spawnImpl: typeof spawn | undefined
-  private readonly subprocess: SubprocessServiceLike | null
+  /** Where the evaluator process runs; integrity checks stay here. */
+  readonly executor: ExecutorBackend
   private readonly extraEnv: Readonly<Record<string, string>>
 
   constructor({
     plan,
     output,
+    executor,
     logger = null,
-    spawn: spawnImpl = undefined,
-    subprocess = null,
     env: extraEnv = {},
   }: {
     plan: EvaluatorPlan
     output: string
+    executor: ExecutorBackend
     logger?: Logger | null
-    spawn?: typeof spawn
-    subprocess?: SubprocessServiceLike | null
     env?: Record<string, string>
   }) {
     if (!plan || typeof plan.evaluator !== 'string' || plan.evaluator.length === 0) {
@@ -273,8 +266,7 @@ export class FrozenEvaluator {
     this.plan = plan
     this.output = output
     this.logger = logger
-    this.spawnImpl = spawnImpl
-    this.subprocess = subprocess ?? null
+    this.executor = executor
     this.extraEnv = Object.freeze({ ...extraEnv })
   }
 
@@ -413,7 +405,13 @@ export class FrozenEvaluator {
     env.TMPDIR = temp
     env.XDG_CACHE_HOME = join(temp, 'cache')
     env.DSH_AUTO_RESEARCH_EVAL_TIMEOUT_SECONDS = String(Math.max(1, Math.ceil(seconds)))
-    const run = await runEvaluatorProcess({
+    // An executor reports a run that could not start as `error`; anything it
+    // throws (an integrity failure on a remote copy) fails loud like the local
+    // checks below.
+    const run = await this.executor.evaluate({
+      script: this.script,
+      sha256: this.hash,
+      workspace,
       argv: this.argv(workspace),
       cwd: this.output,
       env,
@@ -421,8 +419,6 @@ export class FrozenEvaluator {
       ...(options.signal ? { signal: options.signal } : {}),
       stdoutPath,
       stderrPath,
-      ...(this.spawnImpl ? { spawn: this.spawnImpl } : {}),
-      ...(this.subprocess ? { subprocess: this.subprocess } : {}),
     })
     if (await digestFile(this.script) !== this.hash) {
       throw new Error('Evaluator or evaluated workspace changed; result rejected')

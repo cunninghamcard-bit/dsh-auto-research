@@ -2,7 +2,8 @@ import { existsSync, readFileSync } from 'node:fs'
 import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { ResearchWorkspaceRegistry } from '../lib/registry.js'
+import { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from '../lib/registry.js'
+import { LocalExecutor, LocalExecutorFactory } from '../lib/local.js'
 import { LayerFSWorkspaceFactory } from '../lib/layerfs.js'
 import { SnapshotWorkspaceFactory } from '../lib/snapshot.js'
 import { SnapshotBackend, WorkspaceManager } from '../lib/layerfs-workspace.js'
@@ -178,6 +179,10 @@ export function fakePluginContext(services: Record<string, unknown> = {}): any {
   const disposers: Array<() => void> = []
   const ctx: any = {
     ...services,
+    // Runs the callback now when every dependency is present, like Cordis.
+    inject(deps: string[], callback: (inner: any) => void) {
+      if (deps.every(dep => ctx[dep])) callback(ctx)
+    },
     provide(name: string, value: unknown) {
       ctx[name] = value
       return () => { delete ctx[name] }
@@ -191,3 +196,13 @@ export function fakePluginContext(services: Record<string, unknown> = {}): any {
   }
   return ctx
 }
+
+/** The registry the recommended profile builds for evaluators: local only. */
+export function testExecutors(): ResearchExecutorRegistry {
+  const registry = new ResearchExecutorRegistry()
+  registry.register(new LocalExecutorFactory())
+  return registry
+}
+
+/** The executor runner-level tests evaluate with. */
+export const localExecutor = new LocalExecutor()

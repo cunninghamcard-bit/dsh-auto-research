@@ -48,7 +48,7 @@ import {
   writeJsonAtomic,
 } from '../lib/layerfs-workspace.js'
 import { FrozenEvaluator, runEvaluatorProcess, scoreValue } from '../lib/evaluator.js'
-import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, testWorkspaces, snapshotManager } from './helpers.ts'
+import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, testWorkspaces, snapshotManager, testExecutors, localExecutor } from './helpers.ts'
 
 const SANDBOX_PATH = `/workspaces/regression-${process.pid}`
 
@@ -103,6 +103,7 @@ async function setupRunner(root: string, {
     originalManifest: await inventory(workspace),
     selectionFile: join(root, '.auto-research-methods', 'LATEST.json'),
     deps: {
+      executor: localExecutor,
       subagents: service,
       workspaceManager,
       parent: { id: 'parent' },
@@ -197,7 +198,7 @@ async function providerFixture(root: string, { config = {}, shellEnv = null, pla
   })
   const ctx: any = { subagents, logger: { info() {}, warn() {} } }
   if (shellEnv) ctx.shellEnv = shellEnv
-  const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
+  const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
     ctx,
     config: {
       workerProvider: 'worker',
@@ -827,7 +828,7 @@ describe('R5: worker shell environment injection', () => {
   })
 
   it('filters undeclared keys out of the contributor result', () => {
-    const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
+    const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
       ctx: {
         subagents: fakeSubagents(async () => ({ output: [], stopReason: 'completed' })),
         logger: {},
@@ -860,7 +861,7 @@ describe('R5: worker shell environment injection', () => {
   it('registers its contributor on the real ctx.shellEnv service shape', () => {
     let registered: any = null
     let disposedWith = null
-    const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
+    const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
       ctx: {
         subagents: fakeSubagents(async () => ({ output: [], stopReason: 'completed' })),
         logger: {},
@@ -900,7 +901,7 @@ describe('R5: worker shell environment injection', () => {
         await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
         return { output: [], stopReason: 'completed' }
       })
-      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: {
           subagents,
           logger: { info() {}, warn() {} },
@@ -1086,7 +1087,7 @@ describe('R8: the runner lock precedes every artifact write', () => {
         await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
         return { output: [], stopReason: 'completed' }
       })
-      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents, logger: { info() {}, warn() {} } },
         config: {
           workerProvider: 'worker',
@@ -1372,6 +1373,7 @@ describe('R13: meaningful_gain is validated unconditionally', () => {
     shareContext: false,
     sharingIntervalMinutes: 1,
     workspaceBackend: 'auto',
+    executor: 'auto',
   }
 
   it('rejects a negative gain even without RSI', () => {
@@ -1489,6 +1491,7 @@ describe('R16: the disk check uses the backend estimate', () => {
         workspace,
         output: join(root, 'out'),
         deps: {
+          executor: localExecutor,
           subagents: fakeSubagents(async () => ({ output: [], stopReason: 'completed' })),
           workspaceManager: manager,
           workerProvider: 'worker',
@@ -1852,7 +1855,7 @@ describe('R22: worker environments resolve the assigned checkout, not the copied
           async startActivation() { throw new Error('unused') },
         },
       }
-      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), ctx, config: { workerEnv: { DSH_R22: '1' } } })
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(), ctx, config: { workerEnv: { DSH_R22: '1' } } })
       provider.workerEnvs.register({ id: 'branch-1', checkout, parentSessionId: 'coord', childSessionId: 'child-1' })
       const parent = {
         session: {
@@ -2445,7 +2448,7 @@ describe('R30: evidence must be normalized and present before evaluation', () =>
       await writeWorkspace(workspace)
       const evaluatorPath = join(root, 'evaluator.mjs')
       await writeFile(evaluatorPath, 'process.exit(0)\n')
-      const evaluator = new FrozenEvaluator({ plan: { evaluator: evaluatorPath } as any, output: join(root, 'out') })
+      const evaluator = new FrozenEvaluator({ executor: localExecutor, plan: { evaluator: evaluatorPath } as any, output: join(root, 'out') })
       const before = await inventory(workspace)
       for (const evidence of [
         ['ghost.json'],
@@ -2492,7 +2495,7 @@ describe('R31: provider RESULT.json writes are atomic', () => {
         },
         logger: { info() {}, warn() {} },
       }
-      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(),
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx,
         config: {
           planPath: join(root, 'plan.json'),

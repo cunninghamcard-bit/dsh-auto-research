@@ -8,7 +8,8 @@
  * run, rejects the observation instead of ranking it.
  */
 import { spawn } from 'node:child_process';
-import type { EvaluationResult, Logger, MetricDefinition, SelectionMetric, SubprocessServiceLike } from './types.js';
+import type { EvaluationResult, EvaluatorProcessResult, ExecutorBackend, Logger, MetricDefinition, SelectionMetric, SubprocessServiceLike } from './types.js';
+export type { EvaluatorProcessResult };
 /** Plan fields the evaluator needs; a full {@link ResearchPlan} satisfies it. */
 export interface EvaluatorPlan {
     evaluator: string;
@@ -17,14 +18,6 @@ export interface EvaluatorPlan {
     selection_metrics?: SelectionMetric[];
     evaluator_interpreter?: string | string[];
     [key: string]: unknown;
-}
-export interface EvaluatorProcessResult {
-    code: number | null;
-    timedOut: boolean;
-    aborted: boolean;
-    stdout: string;
-    stderr: string;
-    error?: Error;
 }
 export interface EvaluatorProcessParts {
     argv: string[];
@@ -58,15 +51,14 @@ export declare class FrozenEvaluator {
     readonly plan: EvaluatorPlan;
     hash: string | null;
     script: string | null;
-    private readonly spawnImpl;
-    private readonly subprocess;
+    /** Where the evaluator process runs; integrity checks stay here. */
+    readonly executor: ExecutorBackend;
     private readonly extraEnv;
-    constructor({ plan, output, logger, spawn: spawnImpl, subprocess, env: extraEnv, }: {
+    constructor({ plan, output, executor, logger, env: extraEnv, }: {
         plan: EvaluatorPlan;
         output: string;
+        executor: ExecutorBackend;
         logger?: Logger | null;
-        spawn?: typeof spawn;
-        subprocess?: SubprocessServiceLike | null;
         env?: Record<string, string>;
     });
     /**

@@ -23,6 +23,14 @@
       "types": "./lib/snapshot.d.ts",
       "default": "./lib/snapshot.js"
     },
+    "./local": {
+      "types": "./lib/local.d.ts",
+      "default": "./lib/local.js"
+    },
+    "./colab": {
+      "types": "./lib/colab/index.d.ts",
+      "default": "./lib/colab/index.js"
+    },
     "./package.json": "./package.json",
     "./src/*": "./src/*",
     "./lib/*": "./lib/*",

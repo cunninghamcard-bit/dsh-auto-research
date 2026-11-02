@@ -8,7 +8,7 @@ import {
   runEvaluatorProcess,
   scoreValue,
 } from '../lib/evaluator.js'
-import { withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
+import { withTemp, writeStateEvaluator, writeWorkspace, localExecutor } from './helpers.ts'
 
 async function fixture(root: string, options: any = {}): Promise<any> {
   const evaluatorPath = join(root, 'evaluator.mjs')
@@ -24,7 +24,7 @@ async function fixture(root: string, options: any = {}): Promise<any> {
     selection_metrics: options.selectionMetrics ?? [],
     ...(options.plan ?? {}),
   }
-  const frozen = new FrozenEvaluator({ plan, output })
+  const frozen = new FrozenEvaluator({ executor: localExecutor, plan, output })
   await frozen.freeze()
   return { root, output, workspace, plan, frozen, evaluatorPath }
 }
@@ -180,7 +180,7 @@ describe('FrozenEvaluator', () => {
       const python = join(root, 'evaluator.py')
       await writeFile(python, 'print("{}")\n')
       const plan = { evaluator: python, evaluation_seconds: 1, metrics: [] }
-      const evaluator = new FrozenEvaluator({ plan, output: join(root, 'out') })
+      const evaluator = new FrozenEvaluator({ executor: localExecutor, plan, output: join(root, 'out') })
       await evaluator.freeze()
       assert.deepEqual(evaluator.argv('/w').slice(0, 4), [process.env.DSH_PYTHON ?? 'python3', '-I', '-B', evaluator.script])
       assert.equal(evaluator.argv('/w').at(-1), '/w')
@@ -203,9 +203,9 @@ describe('FrozenEvaluator', () => {
   })
 
   it('validates required constructor inputs and freeze ordering', async () => {
-    assert.throws(() => new FrozenEvaluator({ plan: {} as any, output: '/tmp' }), /evaluator/)
+    assert.throws(() => new FrozenEvaluator({ executor: localExecutor, plan: {} as any, output: '/tmp' }), /evaluator/)
     await withTemp(async root => {
-      const evaluator = createFrozenEvaluator({
+      const evaluator = createFrozenEvaluator({ executor: localExecutor,
         plan: { evaluator: join(root, 'missing.mjs'), evaluation_seconds: 1, metrics: [] },
         output: join(root, 'out'),
       })

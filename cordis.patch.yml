@@ -1,9 +1,11 @@
 # dsh-auto-research. The first row contributes the `auto-research`
-# SubagentProvider, its skills and the `researchWorkspace` registry; the layerfs
-# and snapshot rows register workspace backends (LayerFS first, full-copy
-# snapshot as the fallback); the last row exposes one activation as the
-# `subagent_auto_research` tool. Provider-managed depth keeps the tool visible
-# while each provider enforces its own recursion budget.
+# SubagentProvider, its skills and the `researchWorkspace` / `researchExecutor`
+# registries. The layerfs and snapshot rows register workspace backends
+# (LayerFS first, full-copy snapshot as the fallback); the local row runs the
+# frozen evaluator on this host (insert `dsh-auto-research/colab` for a Colab
+# GPU). The last row exposes one activation as the `subagent_auto_research`
+# tool; provider-managed depth keeps it visible while each provider enforces
+# its own recursion budget.
 - insert:
     - id: subagent-auto-research
       name: 'dsh-auto-research'
@@ -23,6 +25,9 @@
 
     - id: auto-research-snapshot
       name: 'dsh-auto-research/snapshot'
+
+    - id: auto-research-local
+      name: 'dsh-auto-research/local'
 
     - id: tool-subagent-auto-research
       name: '@deepseek-ai/dsh-tool-subagent'
