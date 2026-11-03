@@ -115,21 +115,6 @@ export declare function isSkippableAdoptedFile(error: unknown): boolean;
  */
 export declare function isStaleMountRefusal(error: unknown): boolean;
 /**
- * Whether a refusal means the LayerFS project or its `main` branch does not
- * exist yet, so `project.init(source)` can recover.
- */
-export declare function isMissingProjectOrMain(error: unknown): boolean;
-/**
- * Whether a failed `branch.fork(_, 'main')` may mean the project is not
- * initialized yet.
- *
- * The ported macOS SDK reports a missing Store file as a plain `Failed` OS
- * error instead of `NoSuchProject`, so this is deliberately permissive: only
- * refusals that describe a different problem are excluded, and the caller
- * retries `project.init` + fork for everything else.
- */
-export declare function mayNeedProjectInit(error: unknown): boolean;
-/**
  * Whether a LayerFS call failed for a reason that a short retry can fix.
  *
  * Two families are transient:
@@ -152,15 +137,17 @@ export declare function withBusyRetry<T>(fn: () => Promise<T>, options?: {
     delay?: (milliseconds: number) => Promise<void>;
 }): Promise<T>;
 /**
- * LayerFS copy-on-write branch backend.
+ * LayerFS copy-on-write branch backend (`@layerfs/agent` 1.1).
  *
- * `ownsClient` is false whenever the client was injected by the host (for
- * example `ctx.layerfs.client`), so `close()` never tears down a shared client.
+ * Every Workspace mounts in a Sandbox this backend made with
+ * `sandbox.create()`; a Sandbox that closed itself or holds 16 Workspaces is
+ * replaced on the next mount. `ownsClient` is false whenever the client was
+ * injected by the host (for example `config.layerfs.client`), so `close()`
+ * never tears down a shared client.
  */
 export declare class LayerFSBackend implements WorkspaceBackend {
     readonly name = "layerfs";
     readonly client: LayerFSClient;
-    readonly operator: unknown;
     readonly project: string;
     readonly output: string;
     readonly runId: string;
@@ -168,13 +155,10 @@ export declare class LayerFSBackend implements WorkspaceBackend {
     readonly syncBaseline: boolean;
     readonly ownsClient: boolean;
     readonly retryBaseDelayMs: number;
-    /** Close of the client `loadLayerfs` built, which also restores the environment. */
-    readonly releaseEnvironment: (() => Promise<void> | void) | null;
-    /** Re-assert this backend's LayerFS environment lease before each SDK call. */
-    readonly activateEnvironment: (() => void) | null;
+    /** The Sandbox new Workspaces mount in, shared by concurrent mounts. */
+    private sandbox;
     constructor(options: {
         client: LayerFSClient;
-        operator?: unknown;
         project?: string;
         output: string;
         runId?: string;
@@ -182,12 +166,16 @@ export declare class LayerFSBackend implements WorkspaceBackend {
         syncBaseline?: boolean;
         ownsClient?: boolean;
         retryBaseDelayMs?: number;
-        releaseEnvironment?: (() => Promise<void> | void) | null;
-        activateEnvironment?: (() => void) | null;
     });
     /** @returns a branch name that always fits Docker's 63-character limit. */
     branchName(id: string): string;
     retry<T>(fn: () => Promise<T>): Promise<T>;
+    /**
+     * Mount `branch` in this backend's Sandbox. A Sandbox closes itself two
+     * minutes after its last Workspace, and holds at most 16: either refusal
+     * makes one new Sandbox and one more mount.
+     */
+    private mount;
     /**
      * Unmount a workspace whose preparation failed and remove any host staging
      * copy. Cleanup failures are logged, never allowed to mask the original
@@ -210,32 +198,7 @@ export declare class LayerFSBackend implements WorkspaceBackend {
      * `nextLine` cursor; a single call would truncate a large adopted file.
      */
     private readBranchFile;
-    /**
-     * The LayerFS home a client was built for, when the SDK exposes it.
-     *
-     * `project.init` records the project as a directory directly under the home,
-     * and it refuses a name that is already there, so this is the one
-     * non-mutating existence probe available before any Store call.
-     */
-    private homeDirectory;
-    /** Whether the project entry exists: true/false, or null when it cannot be told. */
-    private projectInitialized;
-    private initializeProject;
-    /**
-     * Create the baseline branch from the project's `main`.
-     *
-     * A LayerFS home may hold no project yet (a new dsh session, or the first
-     * auto-research batch in a checkout). Initializing must come *before* any
-     * Store call: on macOS `@dsh-layerfs/host`'s ported binding treats the
-     * client's Store as already open once any Store call ran, and Init then
-     * tries to open the not-yet-installed Store and refuses `NotFound`. So the
-     * project entry is probed on the home directory first, and `project.init`
-     * runs only when it is absent.
-     *
-     * Without a home to probe the fork itself is the probe; a refusal that may
-     * mean "not initialized" then gets one `project.init` + fork retry. A
-     * project that exists but whose `main` is unusable is reported clearly.
-     */
+    /** Create the baseline branch from the project's `main`. */
     private forkBaseline;
     baseline(source: string, id: string, { sync }?: {
         sync?: boolean;
@@ -247,9 +210,9 @@ export declare class LayerFSBackend implements WorkspaceBackend {
      *
      * The host staging copy is the authoritative writer; the Sandbox mount at
      * `/workspaces/<n>` is for execution. A worker that edits the Sandbox anyway
-     * leaves changes in its overlay. This commits that overlay into the branch
-     * history first, whatever the host did, so it is never dropped, then compares
-     * both sides with the inventory the staging copy started from:
+     * leaves changes in its Workspace. This commits them into the branch
+     * history first, whatever the host did, so they are never dropped, then
+     * compares both sides with the inventory the staging copy started from:
      *
      * - neither changed: `unchanged`
      * - Sandbox only: fold the branch into the host copy, `folded`
@@ -260,12 +223,12 @@ export declare class LayerFSBackend implements WorkspaceBackend {
      */
     reconcile(state: WorkspaceState): Promise<Reconciliation>;
     /**
-     * Commit a dirty Sandbox overlay and report what the branch now holds that
-     * the staging copy did not start from.
+     * Commit a changed Sandbox Workspace and report what the branch now holds
+     * that the staging copy did not start from.
      *
-     * @returns null when the overlay is clean and the branch head has not moved;
-     *   otherwise the changed paths and a materialized copy of the branch (the
-     *   caller removes `directory`).
+     * @returns null when the Sandbox's daemon reports the Workspace unchanged and
+     *   its branch head unmoved; otherwise the changed paths and a materialized
+     *   copy of the branch (the caller removes `directory`).
      */
     private sandboxChanges;
     /**
@@ -306,8 +269,8 @@ export declare class WorkspaceManager implements WorkspaceManagerLike {
     estimateForkBytes(parent: WorkspaceState, count: number): Promise<number>;
     close(): Promise<void>;
 }
-/** Every `DSH_LAYERFS_*` name a `dsh` session may publish. */
-export declare const LAYERFS_ENV_KEYS: readonly ['DSH_LAYERFS_PROJECT', 'DSH_LAYERFS_SDK', 'DSH_LAYERFS_OPERATOR', 'DSH_LAYERFS_CLI', 'DSH_LAYERFS_SKILL', 'DSH_LAYERFS_HOME', 'DSH_LAYERFS_STORE_PATH', 'DSH_LAYERFS_DOCKER', 'DSH_LAYERFS_IMAGE', 'DSH_LAYERFS_VOLUME', 'DSH_LAYERFS_DAEMON', 'DSH_LAYERFS_CONTAINER_PREFIX', 'DSH_LAYERFS_DAEMON_HOST', 'DSH_LAYERFS_STORE_CONTAINER', 'DSH_LAYERFS_BUNDLE', 'DSH_LAYERFS_WSL_ENDPOINT', 'DSH_LAYERFS_TRACE', 'DSH_LAYERFS_TRACE_STEP', 'DSH_LAYERFS_TRACE_START'];
+/** Every `DSH_LAYERFS_*` name `@dsh-layerfs/host` publishes for a session. */
+export declare const LAYERFS_ENV_KEYS: readonly ['DSH_LAYERFS_PROJECT', 'DSH_LAYERFS_SDK', 'DSH_LAYERFS_BACKEND', 'DSH_LAYERFS_CLI', 'DSH_LAYERFS_SKILL', 'DSH_LAYERFS_HOME', 'DSH_LAYERFS_STORE_PATH', 'DSH_LAYERFS_DOCKER', 'DSH_LAYERFS_IMAGE', 'DSH_LAYERFS_VOLUME', 'DSH_LAYERFS_DAEMON', 'DSH_LAYERFS_CONTAINER_PREFIX', 'DSH_LAYERFS_DAEMON_HOST', 'DSH_LAYERFS_WORKER_ENDPOINT', 'DSH_LAYERFS_TRACE', 'DSH_LAYERFS_TRACE_STEP', 'DSH_LAYERFS_TRACE_START'];
 /**
  * Resolve LayerFS deployment settings from explicit config or the session's
  * `DSH_LAYERFS_*` environment (the same names `ctx.shellEnv` exposes).
@@ -348,54 +311,14 @@ export declare function resolveShellEnvironment(shellEnv: ShellEnvService | unde
 /** The synthetic tool-call id used for a session-wide environment snapshot. */
 export declare const SHELL_ENV_CALL_ID = "auto-research-env";
 /**
- * Deployment values as the `DSH_LAYERFS_*` environment `@dsh-layerfs/host`
- * publishes for a session, keyed without the prefix.
- */
-export declare function layerfsDeployment(settings: LayerFSSettings): Record<string, string>;
-/** A published environment patch: call it to release, `.activate()` to re-assert. */
-export type EnvironmentLease = (() => void) & {
-    activate: () => void;
-};
-/**
- * Set `patch` on `target` until the returned lease is released.
+ * Open the session's LayerFS project with the SDK it names.
  *
- * A patch value of `undefined` only *observes* the key: it establishes a lease
- * (so a concurrent release cannot restore over it) without changing the value.
- * `activate()` re-asserts this lease's own values, which lets a caller keep its
- * binding active across another caller's release. Releasing a lease while
- * another one is live makes that other lease's newest value active again, and
- * the true baseline is restored only when the last lease ends.
+ * `LayerFS.open` takes no options: it reads its deployment from `LAYERFS_*`
+ * once, while the client is made. A `dsh` session publishes the binding as
+ * `DSH_LAYERFS_*` through `ctx.shellEnv`, so the names are set on
+ * `process.env` around the open and restored right after it.
  */
-export declare function applyEnvironmentPatch(patch: Array<[string, string | undefined]>, target: NodeJS.ProcessEnv | Record<string, unknown>): EnvironmentLease;
-/**
- * Publish one session's LayerFS binding on `process.env` until the returned
- * lease is released.
- *
- * The SDK constructor, its ported entry (`@dsh-layerfs/host/src/port/sdk.js`,
- * which reads `DSH_LAYERFS_BUNDLE` at import time) and its ported native
- * binding (`.../port/binding.js`, which reads `DSH_LAYERFS_STORE_CONTAINER`
- * and `DSH_LAYERFS_BUNDLE` on every call) all take deployment settings from
- * the process environment. A `dsh` session publishes them through
- * `ctx.shellEnv` instead, so they have to be mirrored here — and kept until
- * the client closes, never only around construction. Both the `DSH_LAYERFS_`
- * and the bare `LAYERFS_` spelling are set, because the SDK prefers the bare
- * one and a stale bare value would otherwise silently win.
- */
-export declare function applyLayerfsEnvironment(settings: LayerFSSettings, target?: NodeJS.ProcessEnv | Record<string, unknown>): EnvironmentLease;
-/**
- * Import the LayerFS SDK and construct its client and optional operator.
- *
- * The resolved binding is published on `process.env` for the whole lifetime
- * of the returned client (release it with `close`), because the ported macOS
- * SDK reads its Store container and bundle from the environment at import
- * time and on every call.
- */
-export declare function loadLayerfs(settings: LayerFSSettings): Promise<{
-    client: LayerFSClient;
-    operator: unknown;
-    close: () => Promise<void>;
-    activate: () => void;
-}>;
+export declare function loadLayerfs(settings: LayerFSSettings): Promise<LayerFSClient>;
 /**
  * Concrete `WorkspaceBackendFactory` for LayerFS copy-on-write branches.
  *

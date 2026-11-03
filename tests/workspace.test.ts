@@ -208,7 +208,7 @@ describe('snapshot backend and completion checkpoints', () => {
   })
 })
 
-function fakeLayerfs(root: string, actions: any[]) {
+function fakeLayerfs(root: string, actions: any[]): any {
   const mounts = join(root, 'mounts')
   return {
     branch: {
@@ -217,15 +217,21 @@ function fakeLayerfs(root: string, actions: any[]) {
         await mkdir(join(mounts, name), { recursive: true })
       },
     },
+    sandbox: {
+      async create() {
+        return { sandbox: '1', image: 'sha256:image' }
+      },
+    },
     workspace: {
-      async mount(name: string) {
-        actions.push(['mount', name])
+      async mount(sandbox: string, name: string) {
+        actions.push(['mount', sandbox, name])
         const path = join(mounts, name)
         await mkdir(path, { recursive: true })
-        return { sandbox: 'sandbox-1', path }
+        return { sandbox, path }
       },
       async commit(handle: any, message: any) {
         actions.push(['commit', handle.sandbox, message])
+        return { kind: 'Committed' }
       },
       async unmount(handle: any, discard: any) {
         actions.push(['unmount', handle.sandbox, discard])
@@ -262,12 +268,12 @@ describe('LayerFS backend', () => {
       await manager.close()
       assert.deepEqual(actions, [
         ['fork', 'ar-run-1-initial', 'main'],
-        ['mount', 'ar-run-1-initial'],
-        ['commit', 'sandbox-1', 'auto-research: baseline initial'],
+        ['mount', '1', 'ar-run-1-initial'],
+        ['commit', '1', 'auto-research: baseline initial'],
         ['fork', 'ar-run-1-round-1-continue-1', 'ar-run-1-initial'],
-        ['mount', 'ar-run-1-round-1-continue-1'],
-        ['commit', 'sandbox-1', 'verified'],
-        ['unmount', 'sandbox-1', true],
+        ['mount', '1', 'ar-run-1-round-1-continue-1'],
+        ['commit', '1', 'verified'],
+        ['unmount', '1', true],
         ['close'],
       ])
     })
@@ -286,7 +292,7 @@ describe('LayerFS backend', () => {
       const adopted = await backend.adopt('ar-run-1-round-1-continue-1', 'initial')
       assert.equal(adopted.branch, 'ar-run-1-round-1-continue-1')
       assert.match(adopted.path, /ar-run-1-round-1-continue-1/)
-      assert.deepEqual(actions, [['mount', 'ar-run-1-round-1-continue-1']])
+      assert.deepEqual(actions, [['mount', '1', 'ar-run-1-round-1-continue-1']])
       const snapshotOutput = join(root, 'snapshot')
       const snapshotManager = new WorkspaceManager(
         new SnapshotBackend({ output: snapshotOutput }),
@@ -296,8 +302,7 @@ describe('LayerFS backend', () => {
     })
   })
 
-  it('rejects incomplete LayerFS clients and parents without a workspace', async () => {
-    assert.throws(() => new LayerFSBackend({ client: {}, output: '/tmp' }), /requires branch.fork/)
+  it('rejects parents without a workspace', async () => {
     const backend = new LayerFSBackend({ client: fakeLayerfs('/tmp', []), output: '/tmp' })
     await assert.rejects(backend.fork({ id: 'x' } as any, 'child'), /parent workspace/)
   })
@@ -308,7 +313,6 @@ describe('LayerFS configuration', () => {
     const config = resolveLayerfsConfig({
       DSH_LAYERFS_PROJECT: 'proj',
       DSH_LAYERFS_SDK: 'file:///sdk/index.js',
-      DSH_LAYERFS_OPERATOR: 'file:///sdk/operator.js',
       DSH_LAYERFS_STORE_PATH: '/store',
     })!
     assert.equal(config.project, 'proj')
@@ -324,26 +328,28 @@ describe('LayerFS configuration', () => {
     })
   })
 
-  it('imports an SDK module and constructs client + operator', async () => {
+  it('opens the project with LAYERFS_* set from the binding, then restores the environment', async () => {
     await withTemp(async root => {
       const sdk = join(root, 'sdk.mjs')
       await writeFile(sdk, `
 export class LayerFS {
-  constructor(project, options) { this.projectName = project; this.options = options }
-  async close() {}
+  static async open(project) {
+    return { project, storePath: process.env.LAYERFS_STORE_PATH, image: process.env.LAYERFS_IMAGE, async close() {} }
+  }
 }
-export class LayerFSOperator { constructor(client) { this.client = client } }
 `)
-      const loaded: any = await loadLayerfs({
-        project: 'proj',
-        sdk,
-        operator: sdk,
-        storePath: '/store',
-        home: '/home',
-      } as any)
-      assert.equal(loaded.client.projectName, 'proj')
-      assert.equal(loaded.client.options.storePath, '/store')
-      assert.equal(loaded.operator.client, loaded.client)
+      process.env.LAYERFS_IMAGE = 'ambient'
+      try {
+        const client: any = await loadLayerfs({ project: 'proj', sdk, storePath: '/store', home: '/home' } as any)
+        assert.equal(client.project, 'proj')
+        assert.equal(client.storePath, '/store')
+        // A name the binding leaves unset is cleared while the client is made.
+        assert.equal(client.image, undefined)
+        assert.equal(process.env.LAYERFS_IMAGE, 'ambient')
+        assert.equal(process.env.LAYERFS_STORE_PATH, undefined)
+      } finally {
+        delete process.env.LAYERFS_IMAGE
+      }
       await assert.rejects(loadLayerfs({ project: 'p', sdk: join(root, 'missing.mjs') } as any))
     })
   })

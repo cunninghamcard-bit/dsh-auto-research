@@ -32,8 +32,6 @@ import {
   LAYERFS_ENV_KEYS,
   LayerFSBackend,
   SnapshotBackend,
-  applyEnvironmentPatch,
-  applyLayerfsEnvironment,
   inventory,
   jsonDigest,
   layerfsEnvironment,
@@ -126,8 +124,9 @@ function hostClient(root: string, actions: any[], { unmount }: any = {}): any {
         await mkdir(join(mounts, name), { recursive: true })
       },
     },
+    sandbox: { async create() { return { sandbox: '1', image: 'sha256:image' } }, async list_workspaces() { return { items: [] } } },
     workspace: {
-      async mount(name: any) {
+      async mount(_sandbox: any, name: any) {
         actions.push(['mount', name])
         const path = join(mounts, name)
         await mkdir(path, { recursive: true })
@@ -135,6 +134,7 @@ function hostClient(root: string, actions: any[], { unmount }: any = {}): any {
       },
       async commit(handle: any, message: any) {
         actions.push(['commit', handle.sandbox, message])
+        return { kind: 'Committed' }
       },
       async unmount(handle: any, discard: any) {
         actions.push(['unmount', handle.sandbox, discard])
@@ -154,13 +154,15 @@ function sandboxClient(actions: any[]): any {
         actions.push(['fork', name, from])
       },
     },
+    sandbox: { async create() { return { sandbox: '1', image: 'sha256:image' } }, async list_workspaces() { return { items: [] } } },
     workspace: {
-      async mount(name: any) {
+      async mount(_sandbox: any, name: any) {
         actions.push(['mount', name])
         return { sandbox: 'sandbox-1', path: SANDBOX_PATH }
       },
       async commit(handle: any, message: any) {
         actions.push(['commit', handle.sandbox, message])
+        return { kind: 'Committed' }
       },
       async unmount(handle: any, discard: any) {
         actions.push(['unmount', handle.sandbox, discard])
@@ -174,10 +176,16 @@ function sandboxClient(actions: any[]): any {
           changes.map((change: any) => ({
             op: change.op,
             path: change.path,
-            content: change.content === undefined ? undefined : Buffer.from(change.content).toString('utf8'),
+            content: change.content ?? (change.bytes === undefined ? undefined : Buffer.from(change.bytes).toString('utf8')),
           })),
           message,
         ])
+      },
+      async list() {
+        return { items: [], hasMore: false }
+      },
+      async read() {
+        throw Object.assign(new Error('missing'), { code: 'NoSuchPath' })
       },
     },
     async close() {
@@ -607,9 +615,8 @@ describe('P1-9: explicit LayerFS fields and precedence', () => {
       daemon: '/explicit/daemon',
       containerPrefix: 'explicit-prefix-',
       daemonHost: 'explicit-host',
-      storeContainer: 'explicit-store',
-      bundle: '/explicit/bundle',
-      wslEndpoint: '/explicit/endpoint',
+      backend: '/explicit/backend.js',
+      workerEndpoint: '/explicit/endpoint.json',
       traceStart: '1',
     }
     const ambient = {
@@ -621,9 +628,8 @@ describe('P1-9: explicit LayerFS fields and precedence', () => {
       DSH_LAYERFS_DAEMON: '/env/daemon',
       DSH_LAYERFS_CONTAINER_PREFIX: 'env-prefix-',
       DSH_LAYERFS_DAEMON_HOST: 'env-host',
-      DSH_LAYERFS_STORE_CONTAINER: 'env-store',
-      DSH_LAYERFS_BUNDLE: '/env/bundle',
-      DSH_LAYERFS_WSL_ENDPOINT: '/env/endpoint',
+      DSH_LAYERFS_BACKEND: '/env/backend.js',
+      DSH_LAYERFS_WORKER_ENDPOINT: '/env/endpoint.json',
       DSH_LAYERFS_TRACE_START: '0',
     }
     const settings = resolveLayerfsConfig(ambient, fields)
@@ -631,9 +637,8 @@ describe('P1-9: explicit LayerFS fields and precedence', () => {
     const environment = layerfsEnvironment(ambient, settings)
     assert.equal(environment.DSH_LAYERFS_DOCKER, '/explicit/docker.sock')
     assert.equal(environment.DSH_LAYERFS_IMAGE, 'explicit-image')
-    assert.equal(environment.DSH_LAYERFS_STORE_CONTAINER, 'explicit-store')
-    assert.equal(environment.DSH_LAYERFS_BUNDLE, '/explicit/bundle')
-    assert.equal(environment.DSH_LAYERFS_WSL_ENDPOINT, '/explicit/endpoint')
+    assert.equal(environment.DSH_LAYERFS_BACKEND, '/explicit/backend.js')
+    assert.equal(environment.DSH_LAYERFS_WORKER_ENDPOINT, '/explicit/endpoint.json')
     assert.equal(environment.DSH_LAYERFS_TRACE_START, '1')
     const cleared = layerfsEnvironment(ambient, settings, { image: null })
     assert.equal('DSH_LAYERFS_IMAGE' in cleared, false, 'explicit null suppresses an ambient value')
@@ -1140,8 +1145,6 @@ describe('R10: transient LayerFS startup failures and stale mounts', () => {
       new Error('Connection refused'),
       new Error('socket hang up'),
       new Error('failed to connect to daemon'),
-      new Error('the Store container layerfs-store worker did not answer'),
-      new Error('the Store container layerfs-store has not started'),
     ]) {
       assert.equal(isTransientLayerfsError(error), true, String(error.message))
     }
@@ -1159,33 +1162,9 @@ describe('R10: transient LayerFS startup failures and stale mounts', () => {
     let recovered = 0
     assert.equal(await withBusyRetry(async () => {
       recovered += 1
-      if (recovered < 3) throw new Error('the Store container store worker did not answer')
+      if (recovered < 3) throw new Error('socket hang up')
       return 'installed'
     }, { baseDelayMs: 0, delay: async () => {} }), 'installed')
-  })
-
-  it('tolerates a stale mount commit after fs.apply published the bytes', async () => {
-    await withTemp(async root => {
-      const source = join(root, 'source')
-      await writeWorkspace(source)
-      const actions: any[] = []
-      const client = sandboxClientWith(actions, {
-        workspace: {
-          async commit(handle: any, message: any) {
-            actions.push(['commit', message])
-            throw Object.assign(new Error('the head moved and 1 file(s) conflict with this Workspace; markers are written and nothing was committed'), { code: 'Conflict' })
-          },
-        },
-      })
-      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-r10', retryBaseDelayMs: 1 })
-      const state = await backend.baseline(source, 'initial')
-      assert.equal(state.staging, true)
-      await writeFile(join(state.path, 'extra.txt'), 'new\n')
-      await backend.commit(state, { message: 'auto-research: verified initial' })
-      assert.ok(actions.some(action => action[0] === 'apply'), 'the bytes were published through fs.apply')
-      assert.ok(actions.some(action => action[0] === 'commit'), 'the mount commit was still attempted')
-      await backend.release(state)
-    })
   })
 
   it('falls back to a discarding unmount for a stale staged overlay', async () => {
@@ -1194,6 +1173,7 @@ describe('R10: transient LayerFS startup failures and stale mounts', () => {
       await writeWorkspace(source)
       const actions: any[] = []
       const client = sandboxClientWith(actions, {
+        sandbox: { async create() { return { sandbox: '1', image: 'sha256:image' } }, async list_workspaces() { return { items: [] } } },
         workspace: {
           async unmount(handle: any, discard: any) {
             actions.push(['unmount', discard])
@@ -1220,6 +1200,7 @@ describe('R10: transient LayerFS startup failures and stale mounts', () => {
       await writeWorkspace(source)
       const actions: any[] = []
       const client = sandboxClientWith(actions, {
+        sandbox: { async create() { return { sandbox: '1', image: 'sha256:image' } }, async list_workspaces() { return { items: [] } } },
         workspace: {
           async unmount(handle: any, discard: any) {
             actions.push(['unmount', discard])
@@ -1272,13 +1253,13 @@ describe('R12: paginated branch reads and listing cursors', () => {
         : { items: [], hasMore: false })
       client.fs.read = async (branch: any, path: any, startLine: any) => {
         pages.push(startLine)
-        if (startLine === undefined) return { text: 'aaa\n', nextLine: 2000 }
+        if (startLine === 1) return { text: 'aaa\n', nextLine: 2000 }
         if (startLine === 2000) return { text: 'bbb\n', nextLine: 4000 }
         return { text: 'ccc\n' }
       }
       const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-r12', retryBaseDelayMs: 1 })
       const state = await backend.adopt('ar-run-r12-leader', 'initial')
-      assert.deepEqual(pages, [undefined, 2000, 4000])
+      assert.deepEqual(pages, [1, 2000, 4000])
       assert.equal(await readFile(join(state.path, 'big.txt'), 'utf8'), 'aaa\nbbb\nccc\n')
     })
   })
@@ -1301,21 +1282,21 @@ describe('R12: paginated branch reads and listing cursors', () => {
     })
   })
 
-  it('follows nextPagePos and never re-reads a page', async () => {
+  it('advances listing pages by pagePos + items.length', async () => {
     await withTemp(async root => {
       const positions: any[] = []
       const client = sandboxClient([])
       client.fs.list = async (branch: any, path: any, pageSize: any, pagePos: any) => {
         positions.push([path, pagePos])
         if (path !== '/') return { items: [], hasMore: false }
-        if (pagePos === 0) return { items: [{ name: 'a.txt', type: 'file' }], hasMore: true, nextPagePos: 5000 }
-        if (pagePos === 5000) return { items: [{ name: 'b.txt', type: 'file' }], hasMore: false }
+        if (pagePos === 0) return { items: [{ name: 'a.txt', type: 'file' }], hasMore: true }
+        if (pagePos === 1) return { items: [{ name: 'b.txt', type: 'file' }], hasMore: false }
         throw new Error('unexpected cursor ' + pagePos)
       }
-      client.fs.read = async (branch: any, path: any) => `content of ${path}\n`
+      client.fs.read = async (branch: any, path: any) => ({ text: `content of ${path}\n`, nextLine: null })
       const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-r12c', retryBaseDelayMs: 1 })
       const state = await backend.adopt('ar-run-r12-leader', 'initial')
-      assert.deepEqual(positions.filter(([path]) => path === '/').map(([, pos]) => pos), [0, 5000])
+      assert.deepEqual(positions.filter(([path]) => path === '/').map(([, pos]) => pos), [0, 1])
       assert.equal(await readFile(join(state.path, 'a.txt'), 'utf8'), 'content of /a.txt\n')
       assert.equal(await readFile(join(state.path, 'b.txt'), 'utf8'), 'content of /b.txt\n')
     })
@@ -1531,32 +1512,20 @@ describe('R18: prototype-safe staging and retained-state edges', () => {
     })
   })
 
-  it('creates parent directories in the fs.write fallback', async () => {
+  it('creates parent directories before writing files in one fs.apply', async () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
       const actions: any[] = []
-      const client = {
-        branch: { async fork(name: any) { actions.push(['fork', name]) } },
-        workspace: {
-          async mount() { return { sandbox: '1', path: SANDBOX_PATH } },
-          async commit() { actions.push(['commit']) },
-          async unmount() {},
-        },
-        fs: {
-          async mkdir(branch: any, path: any) { actions.push(['mkdir', path]) },
-          async write(branch: any, path: any) { actions.push(['write', path]) },
-          async rm(branch: any, path: any) { actions.push(['rm', path]) },
-        },
-      }
-      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-r18b', retryBaseDelayMs: 1 })
+      const backend = new LayerFSBackend({ client: sandboxClient(actions), output: join(root, 'out'), runId: 'run-r18b', retryBaseDelayMs: 1 })
       const state = await backend.baseline(source, 'initial')
       await mkdir(join(state.path, 'nested'), { recursive: true })
       await writeFile(join(state.path, 'nested', 'file.txt'), 'x\n')
       actions.length = 0
       await backend.commit(state, { message: 'nested' })
-      const mkdirIndex = actions.findIndex(action => action[0] === 'mkdir' && action[1] === '/nested')
-      const writeIndex = actions.findIndex(action => action[0] === 'write' && action[1] === '/nested/file.txt')
+      const changes = actions.find(action => action[0] === 'apply')[2]
+      const mkdirIndex = changes.findIndex((change: any) => change.op === 'mkdir' && change.path === '/nested')
+      const writeIndex = changes.findIndex((change: any) => change.op === 'write' && change.path === '/nested/file.txt')
       assert.ok(mkdirIndex >= 0, 'the parent directory was created on the branch first')
       assert.ok(writeIndex > mkdirIndex)
     })
@@ -1690,32 +1659,6 @@ describe('R20: unique atomic JSON temporary files', () => {
 })
 
 describe('R21: resource leaks and configuration validation', () => {
-  it('closes the SDK client when loading its operator fails', async () => {
-    await withTemp(async root => {
-      const marker = join(root, 'closed.txt')
-      const sdk = join(root, 'sdk.mjs')
-      await writeFile(sdk, `
-import { writeFileSync } from 'node:fs'
-export class LayerFS {
-  constructor() {
-    this.branch = { fork: async () => {} }
-    this.workspace = { mount: async () => ({ sandbox: '1', path: '/workspaces/1' }) }
-  }
-  async close() { writeFileSync(${JSON.stringify(marker)}, 'closed\\n') }
-}
-`)
-      const operator = join(root, 'operator.mjs')
-      await writeFile(operator, "throw new Error('operator unavailable')\n")
-      const settings = resolveLayerfsConfig({
-        DSH_LAYERFS_PROJECT: 'p',
-        DSH_LAYERFS_SDK: sdk,
-        DSH_LAYERFS_OPERATOR: operator,
-      })
-      await assert.rejects(loadLayerfs(settings!), /operator unavailable/)
-      assert.equal(existsSync(marker), true, 'the constructed client was closed')
-    })
-  })
-
   it('removes the abort listener when a sleep resolves normally', async () => {
     const controller = new AbortController()
     for (let index = 0; index < 12; index += 1) {
@@ -1847,21 +1790,22 @@ describe('R23: adopted binary and over-48KiB files survive materialization', () 
   ): any {
     return {
       branch: { async fork() {} },
+      sandbox: { async create() { return { sandbox: '1', image: 'sha256:image' } }, async list_workspaces() { return { items: [] } } },
       workspace: {
         async mount() { return { sandbox: 'r23', path: '/workspaces/r23' } },
-        async commit(_handle: any, message: string) { actions.push(['commit', message]) },
+        async commit(_handle: any, message: string) { actions.push(['commit', message]); return { kind: 'Committed' } },
         async unmount() {},
-        ...(exec ? { exec } : {}),
+        exec: exec ?? (async () => { throw new Error('exec unavailable') }),
       },
       fs: {
         async list(_branch: string, path = '/') {
-          if (path !== '/') return []
-          return Object.keys(files).map(name => ({ name: name.replace(/^\/+/, '') }))
+          if (path !== '/') return { items: [], hasMore: false }
+          return { items: Object.keys(files).map(name => ({ name: name.replace(/^\/+/, ''), type: 'file' })), hasMore: false }
         },
         async read(_branch: string, name: string) {
           const value = files[name]
           if (value instanceof Error) throw value
-          return { text: value }
+          return { text: value, nextLine: null }
         },
         async apply(_branch: string, changes: any[], message: string) {
           actions.push(['apply', changes, message])
@@ -1910,7 +1854,7 @@ describe('R23: adopted binary and over-48KiB files survive materialization', () 
     })
   })
 
-  it('fails loud when fs.read truncates a line and workspace.exec is unavailable', async () => {
+  it('fails loud when fs.read truncates a line and workspace.exec cannot copy it', async () => {
     await withTemp(async root => {
       const actions: any[] = []
       const truncated = Object.assign(new Error('line truncated'), { code: 'LineTruncated' })
@@ -1918,7 +1862,7 @@ describe('R23: adopted binary and over-48KiB files survive materialization', () 
       const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'r23c' })
       await assert.rejects(
         backend.adopt('ar-run-r23c', 'adopted'),
-        /truncated a line > 48 KiB .* workspace\.exec is unavailable/,
+        /truncated a line > 48 KiB .* workspace\.exec could not copy it/,
       )
     })
   })
@@ -1933,6 +1877,7 @@ describe('R24: staged Sandbox mounts stay bidirectional', () => {
       let mounts = 0
       const client: any = {
         branch: { async fork() {} },
+        sandbox: { async create() { return { sandbox: '1', image: 'sha256:image' } }, async list_workspaces() { return { items: [] } } },
         workspace: {
           async mount() {
             mounts += 1
@@ -1940,7 +1885,7 @@ describe('R24: staged Sandbox mounts stay bidirectional', () => {
             actions.push(['mount', handle.sandbox])
             return handle
           },
-          async commit() {},
+          async commit() { return { kind: 'Committed' } },
           async unmount(handle: any, discard: boolean) {
             actions.push(['unmount', handle.sandbox, discard])
           },
@@ -1949,6 +1894,7 @@ describe('R24: staged Sandbox mounts stay bidirectional', () => {
           async apply(_branch: string, changes: any[]) {
             actions.push(['apply', changes.map(change => change.path)])
           },
+          async list() { return { items: [], hasMore: false } },
         },
         async close() {},
       }
@@ -1971,22 +1917,26 @@ describe('R24: staged Sandbox mounts stay bidirectional', () => {
       let dirty = false
       const client: any = {
         branch: { async fork() {} },
+        sandbox: {
+          async create() { return { sandbox: '1', image: 'sha256:image' } },
+          async list_workspaces() { return { items: [{ path: '/workspaces/r24-reconcile', changed: dirty, headMovedSinceMount: false }] } },
+        },
         workspace: {
           async mount() { return { sandbox: 'r24', path: '/workspaces/r24-reconcile' } },
           async commit(_handle: any, message: string) {
             actions.push(['commit', message])
             dirty = false
+            return { kind: 'Committed' }
           },
           async unmount() {},
-          async status() { return { overlay: { entries: dirty ? 1 : 0 }, headMovedSinceMount: dirty } },
         },
         fs: {
           async list(_branch: string, path = '/') {
-            if (path !== '/') return []
-            return Object.keys(branchFiles).map(name => ({ name: name.slice(1) }))
+            if (path !== '/') return { items: [], hasMore: false }
+            return { items: Object.keys(branchFiles).map(name => ({ name: name.slice(1), type: 'file' })), hasMore: false }
           },
           async read(_branch: string, name: string) {
-            return { text: branchFiles[name] ?? '' }
+            return { text: branchFiles[name] ?? '', nextLine: null }
           },
           async apply(_branch: string, changes: any[], message: string) {
             actions.push(['apply', changes.filter(change => change.op !== 'mkdir').map(change => `${change.op} ${change.path}`), message])
@@ -2055,15 +2005,19 @@ describe('R24: staged Sandbox mounts stay bidirectional', () => {
       let refuse = false
       const client: any = {
         branch: { async fork() {} },
+        sandbox: {
+          async create() { return { sandbox: '1', image: 'sha256:image' } },
+          async list_workspaces() { return { items: [{ path: '/workspaces/r24c', changed: true, headMovedSinceMount: true }] } },
+        },
         workspace: {
           async mount() { return { sandbox: 'r24c', path: '/workspaces/r24c' } },
           async commit() {
             if (refuse) throw Object.assign(new Error('1 file(s) still contain conflict markers; nothing committed'), { code: 'Conflict' })
+            return { kind: 'Committed' }
           },
           async unmount(_handle: any, discard: boolean) { unmounts.push(discard) },
-          async status() { return { overlay: { entries: 1 }, headMovedSinceMount: true } },
         },
-        fs: { async list() { return [] }, async read() { return { text: '' } }, async apply() {} },
+        fs: { async list() { return { items: [], hasMore: false } }, async read() { return { text: '', nextLine: null } }, async apply() {} },
         async close() {},
       }
       const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'r24c', retryBaseDelayMs: 1 })
@@ -2123,7 +2077,7 @@ describe('R25: a resumed epoch failure keeps its own dirty workspace', () => {
         kind: 'snapshot',
         async baseline() { throw new Error('unused') },
         async fork() { throw new Error('unused') },
-        async commit(_state: any, options: any) { commits.push(options?.message) },
+        async commit(_state: any, options: any) { commits.push(options?.message); return { kind: 'Committed' } },
         async release(_state: any, options: any) { releases.push(options?.discard) },
         async retainCompletedState() { return '' },
         async restoreCompletedState() { throw new Error('unused') },
@@ -2208,59 +2162,6 @@ describe('R26: LayerFS completion checkpoints own a branch', () => {
   })
 })
 
-describe('R27: concurrent LayerFS environment leases stay isolated', () => {
-  it('restores the true baseline only after the last lease ends', () => {
-    const target: Record<string, unknown> = {
-      DSH_LAYERFS_HOME: 'base',
-      LAYERFS_HOME: 'base',
-      LAYERFS_NATIVE: 'native-base',
-    }
-    const settingsA = resolveLayerfsConfig({
-      DSH_LAYERFS_PROJECT: 'a',
-      DSH_LAYERFS_SDK: '/sdk',
-      DSH_LAYERFS_HOME: '/a',
-    })!
-    const settingsB = resolveLayerfsConfig({
-      DSH_LAYERFS_PROJECT: 'b',
-      DSH_LAYERFS_SDK: '/sdk',
-      DSH_LAYERFS_HOME: '/b',
-    })!
-    const leaseA = applyLayerfsEnvironment(settingsA, target)
-    const leaseB = applyLayerfsEnvironment(settingsB, target)
-    assert.equal(target.DSH_LAYERFS_HOME, '/b')
-    leaseA.activate()
-    assert.equal(target.DSH_LAYERFS_HOME, '/a')
-    leaseA()
-    assert.equal(target.DSH_LAYERFS_HOME, '/b')
-    leaseB()
-    assert.equal(target.DSH_LAYERFS_HOME, 'base')
-    assert.equal(target.LAYERFS_HOME, 'base')
-
-    // A value-less lease observes LAYERFS_NATIVE without rewriting it.
-    const nativeLease = applyEnvironmentPatch([['LAYERFS_NATIVE', undefined]], target)
-    assert.equal(target.LAYERFS_NATIVE, 'native-base')
-    nativeLease()
-    assert.equal(target.LAYERFS_NATIVE, 'native-base')
-  })
-
-  it('re-asserts this batch environment before each SDK call', async () => {
-    const target: Record<string, unknown> = { LAYERFS_NATIVE: 'native' }
-    const client: any = {
-      branch: { async fork() {} },
-      workspace: { async mount() { return { sandbox: 's', path: '/workspaces/r27' } } },
-    }
-    const backend = new LayerFSBackend({
-      client,
-      output: '/tmp/r27-output',
-      activateEnvironment: () => {
-        target.LAYERFS_NATIVE = 'native'
-      },
-    })
-    target.LAYERFS_NATIVE = 'other-batch'
-    assert.equal(await backend.retry(async () => target.LAYERFS_NATIVE), 'native')
-  })
-})
-
 describe('R28: worker environment declarations and config validation', () => {
   it('declares configured DSH_* keys except reserved, LayerFS and non-string ones', () => {
     const declared = declaredWorkerEnvKeys({
@@ -2298,117 +2199,6 @@ describe('R28: worker environment declarations and config validation', () => {
       assert.throws(() => resolveConfig({ workerEnv: value }), /workerEnv must be an object/, JSON.stringify(value))
     }
     assert.equal(resolveConfig({ workerEnv: { DSH_GOOD: '1' } }).workerEnv.DSH_GOOD, '1')
-  })
-})
-
-describe('R29: LayerFS project probes handle empty and WSL entries', () => {
-  it('removes an empty project entry and initializes it', async () => {
-    await withTemp(async root => {
-      const home = join(root, 'home')
-      await mkdir(join(home, 'proj'), { recursive: true })
-      const source = join(root, 'source')
-      await writeWorkspace(source)
-      const actions: any[] = []
-      const client: any = {
-        options: { home },
-        project: {
-          async init(path: string) {
-            actions.push(['init', path])
-            await mkdir(join(home, 'proj'), { recursive: true })
-            await writeFile(join(home, 'proj', 'owner'), 'layerfs\n')
-          },
-        },
-        branch: {
-          async fork(name: string) {
-            actions.push(['fork', name])
-            if (!existsSync(join(home, 'proj', 'owner'))) {
-              throw Object.assign(new Error('project proj does not exist'), { code: 'NoSuchProject' })
-            }
-          },
-        },
-        workspace: {
-          async mount() { return { sandbox: '1', path: '/workspaces/r29a' } },
-          async commit() {},
-          async unmount() {},
-        },
-        fs: { async apply() {} },
-      }
-      const backend = new LayerFSBackend({ client, project: 'proj', output: join(root, 'out'), runId: 'r29a' })
-      await backend.baseline(source, 'initial')
-      assert.deepEqual(actions, [
-        ['init', source],
-        ['fork', 'ar-r29a-initial'],
-      ])
-    })
-  })
-
-  it('retries project.init when a present entry still has no usable main', async () => {
-    await withTemp(async root => {
-      const home = join(root, 'home')
-      await mkdir(join(home, 'proj'), { recursive: true })
-      await writeFile(join(home, 'proj', 'owner'), 'layerfs\n')
-      const source = join(root, 'source')
-      await writeWorkspace(source)
-      const actions: any[] = []
-      let forks = 0
-      const client: any = {
-        options: { home },
-        project: {
-          async init(path: string) {
-            actions.push(['init', path])
-            throw Object.assign(new Error('project exists'), { code: 'Exists' })
-          },
-        },
-        branch: {
-          async fork(name: string) {
-            actions.push(['fork', name])
-            forks += 1
-            if (forks === 1) throw Object.assign(new Error('no usable main'), { code: 'NoSuchBranch' })
-          },
-        },
-        workspace: {
-          async mount() { return { sandbox: '1', path: '/workspaces/r29b' } },
-          async commit() {},
-          async unmount() {},
-        },
-        fs: { async apply() {} },
-      }
-      const backend = new LayerFSBackend({ client, project: 'proj', output: join(root, 'out'), runId: 'r29b' })
-      await backend.baseline(source, 'initial')
-      assert.deepEqual(actions.map(action => action[0]), ['fork', 'init', 'fork'])
-    })
-  })
-
-  it('does not probe the home directory for a WSL binding', async () => {
-    await withTemp(async root => {
-      const home = join(root, 'home')
-      await mkdir(join(home, 'proj'), { recursive: true })
-      await writeFile(join(home, 'proj', 'owner'), 'layerfs\n')
-      const source = join(root, 'source')
-      await writeWorkspace(source)
-      const actions: any[] = []
-      let forks = 0
-      const client: any = {
-        options: { home, deploy: { wslEndpoint: '/run/wsl-layerfs.sock' } },
-        project: { async init(path: string) { actions.push(['init', path]) } },
-        branch: {
-          async fork(name: string) {
-            actions.push(['fork', name])
-            forks += 1
-            if (forks === 1) throw Object.assign(new Error('endpoint not ready'), { code: 'NoSuchProject' })
-          },
-        },
-        workspace: {
-          async mount() { return { sandbox: '1', path: '/workspaces/r29c' } },
-          async commit() {},
-          async unmount() {},
-        },
-        fs: { async apply() {} },
-      }
-      const backend = new LayerFSBackend({ client, project: 'proj', output: join(root, 'out'), runId: 'r29c' })
-      await backend.baseline(source, 'initial')
-      assert.deepEqual(actions.map(action => action[0]), ['fork', 'init', 'fork'])
-    })
   })
 })
 
@@ -2521,21 +2311,21 @@ describe('R33: post-re-audit edge cases (NEW-01..NEW-03)', () => {
       }
       let committedInSandbox = false
       const client: any = {
-        project: { async init() {} },
         branch: { async fork() {} },
-        workspace: {
-          async mount(branch: string) {
-            return { branch, path: '/workspaces/1', sandbox: '1' }
+        sandbox: {
+          async create() { return { sandbox: '1', image: 'sha256:image' } },
+          async list_workspaces() {
+            return { items: [{ path: '/workspaces/1', changed: !committedInSandbox, headMovedSinceMount: false }] }
           },
-          async status() {
-            return {
-              overlay: { entries: 0, inodes: committedInSandbox ? 0 : 1, pendingMerge: false },
-              headMovedSinceMount: false,
-            }
+        },
+        workspace: {
+          async mount(_sandbox: string, branch: string) {
+            return { branch, path: '/workspaces/1', sandbox: '1' }
           },
           async commit() {
             committedInSandbox = true
             branchFiles['/state.json'] = JSON.stringify({ score: 9, metrics: { score: 9 }, evidence: ['state.json'] })
+            return { kind: 'Committed' }
           },
           async unmount() {},
         },

@@ -1,33 +1,26 @@
 /**
  * Real end-to-end tests: the installed dsh profile, the real Cordis plugin
- * loader, the real `ctx.subagents` service, and the real LayerFS SDKs
- * (the simulator, and the ported macOS SDK with an OrbStack Store container
- * and Sandboxes).
+ * loader, the real `ctx.subagents` service, and real LayerFS 1.1: a project
+ * made by `@layerfs/runtime`'s Init, the home's worker container, and
+ * Sandboxes on OrbStack Docker.
  *
  * Nothing here fakes the research seam: the plugin is mounted on a Cordis
  * context exactly as `dsh` mounts it, `ctx.subagents.startActivation` is the
  * real service, and every workspace, branch, commit and adoption is made by
- * the real LayerFS binding. The only fixture is the worker agent: a
+ * the real LayerFS SDK. The only fixture is the worker agent: a
  * deterministic provider that raises `state.json`'s score and writes the
  * cooperative artifacts the protocol requires.
  *
- * Each scenario runs two batches: the first is a two-round RSI-top batch with
+ * The scenario runs two batches: the first is a two-round RSI-top batch with
  * explore + continue phases and context sharing; the second deletes the
  * leader's checkout so `LATEST.json`'s saved leader branch is adopted through
  * LayerFS.
- *
- * OrbStack note: a container's loopback-published port only accepts
- * connections about 0.5 s after `docker start`, while the LayerFS daemon
- * binds immediately, so the SDK's first connect is refused. The live scenario
- * therefore starts the daemon through a one-second wrapper (the real daemon
- * is baked into a derived runtime image) — the LayerFS Store container,
- * Sandbox, daemon, branches and Volume are all the real ones.
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -36,10 +29,10 @@ import {
   DSH_ROOT,
   LAYERFS_BUNDLE,
   LAYERFS_DOCKER,
-  LAYERFS_HOST,
+  LAYERFS_ROOT,
   RUNTIME_TAG,
   dshStackAvailable,
-  layerfsHostAvailable,
+  layerfsApiAvailable,
   liveLayerfsAvailable,
 } from './e2e-support.ts'
 
@@ -295,14 +288,13 @@ function readJson(path: string) {
   return JSON.parse(readFileSync(path, 'utf8'))
 }
 
-/** Run one backend's two batches and assert the full batch + adoption contract. */
-async function scenario(backend: string) {
+/** Run two batches on a real LayerFS project and assert the full batch + adoption contract. */
+async function scenario() {
   const modules = await dshModules()
-  const host = await import(pathToFileURL(`${LAYERFS_HOST}/src/box.js`).href)
-  const root = mkdtempSync(join(tmpdir(), `dsh-ar-e2e-${backend}-`))
+  const root = mkdtempSync(join(tmpdir(), 'dsh-ar-e2e-live-'))
   const workspace = makeWorkspace(root)
-  const live = backend === 'live' ? await setUpLive(host, root) : null
-  const env = live ? live.env : simulatedEnv(root, simulatedProjectName())
+  const live = await setUpLive(root, workspace)
+  const env = live.env
   let ctx: any = null
   let harness: any = null
   /** What each worker's own bash call would receive from `ctx.shellEnv`. */
@@ -420,117 +412,64 @@ async function scenario(backend: string) {
     return { root, latest, latest2, worker }
   } finally {
     await ctx.fiber?.dispose?.()
-    if (live) await live.cleanup()
+    await live.cleanup()
     if (process.env.E2E_KEEP) console.error('[e2e] kept', root)
     else rmSync(root, { recursive: true, force: true })
   }
 }
 
-/** A simulated project name (no Docker). */
-let simulatedProject = null
-function simulatedProjectName() {
-  simulatedProject ??= `e2e-sim-${Date.now().toString(36)}`
-  return simulatedProject
-}
-
-function simulatedEnv(root: string, project: string) {
-  const home = join(root, 'home')
-  mkdirSync(home, { recursive: true, mode: 0o700 })
-  return {
-    DSH_LAYERFS_PROJECT: project,
-    DSH_LAYERFS_SDK: pathToFileURL(`${LAYERFS_HOST}/src/sim/sdk.js`).href,
-    DSH_LAYERFS_OPERATOR: pathToFileURL(`${LAYERFS_HOST}/src/sim/operator.js`).href,
-    DSH_LAYERFS_HOME: home,
-    DSH_LAYERFS_DOCKER: 'sim',
-    DSH_LAYERFS_IMAGE: 'sim',
-    DSH_LAYERFS_DAEMON: 'sim',
-    DSH_LAYERFS_VOLUME: `sim-${project}`,
-    DSH_LAYERFS_STORE_PATH: 'sim',
-  }
-}
-
 /**
- * The runtime image with the real daemon baked in, so the delay wrapper can
- * exec it.
- *
- * OrbStack publishes a container's loopback port only about half a second
- * after `docker start`; the SDK's single connect can therefore be refused
- * while the daemon already listens inside the container. The build context is
- * a unique temporary directory and is always removed, whatever the build does.
+ * A LayerFS home, its worker and one project Init made from `workspace`, the
+ * way `@dsh-layerfs/host` makes them, plus the `DSH_LAYERFS_*` binding the
+ * Host would publish for a session on that project.
  */
-let wrappedImage: any = null
-async function wrappedRuntimeImage() {
-  if (wrappedImage) return wrappedImage
-  const docker = (...args: any[]) => execFileSync('docker', ['-H', `unix://${LAYERFS_DOCKER}`, ...args], { encoding: 'utf8' }).trim()
-  const base = docker('image', 'inspect', '--format', '{{.Id}}', RUNTIME_TAG)
-  const context = mkdtempSync(join(tmpdir(), 'dsh-ar-e2e-runtime-'))
-  try {
-    execFileSync('cp', [`${LAYERFS_BUNDLE}/layerfs-daemon`, join(context, 'layerfs-daemon')])
-    writeFileSync(join(context, 'Dockerfile'), `FROM ${RUNTIME_TAG}\nCOPY layerfs-daemon /usr/local/bin/layerfs-daemon.real\nRUN chmod 0755 /usr/local/bin/layerfs-daemon.real\n`)
-    const tag = `dsh-auto-research-e2e:${base.replace('sha256:', '').slice(0, 12)}`
-    docker('build', '--quiet', '-t', tag, context)
-    wrappedImage = docker('image', 'inspect', '--format', '{{.Id}}', tag)
-    return wrappedImage
-  } finally {
-    rmSync(context, { recursive: true, force: true })
-  }
-}
-
-/** A real Store container plus the LayerFS home for one live scenario. */
-async function setUpLive(host: any, root: string) {
+async function setUpLive(root: string, workspace: string) {
   const docker = (...args: any[]) => execFileSync('docker', ['-H', `unix://${LAYERFS_DOCKER}`, ...args], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }).trim()
+  const { LayerFSRuntime } = await import(pathToFileURL(`${LAYERFS_ROOT}/api/runtime/src/index.js`).href)
   const id = Date.now().toString(36)
   const home = join(root, 'home')
   mkdirSync(home, { recursive: true, mode: 0o700 })
   const project = `dshare2e${id}`
-  const volume = `dsh-ar-e2e-${id}`
   const prefix = `dsh-ar-e2e-${id}-`
-  const image = await wrappedRuntimeImage()
-  const box = host.storeName(prefix)
-  docker('volume', 'create', volume)
-  await host.ensureBox({ docker: LAYERFS_DOCKER, home, bundle: LAYERFS_BUNDLE, image, prefix, box })
-  // OrbStack publishes a container's port ~0.5 s after start; give the daemon
-  // that time so the SDK's first connect reaches it. `withBusyRetry` in the
-  // backend covers the remaining window, so the wrapper is only a head start.
-  const daemon = join(home, 'daemon-delay.sh')
-  writeFileSync(daemon, '#!/bin/sh\nsleep 1\nexec /usr/local/bin/layerfs-daemon.real --config /layerfs-local/config/daemon.setup\n')
-  chmodSync(daemon, 0o755)
-  return {
-    env: {
-      DSH_LAYERFS_PROJECT: project,
-      DSH_LAYERFS_SDK: pathToFileURL(`${LAYERFS_HOST}/src/port/sdk.js`).href,
-      DSH_LAYERFS_OPERATOR: pathToFileURL(`${LAYERFS_HOST}/src/port/operator.js`).href,
-      DSH_LAYERFS_HOME: home,
-      DSH_LAYERFS_DOCKER: LAYERFS_DOCKER,
-      DSH_LAYERFS_IMAGE: image,
-      DSH_LAYERFS_VOLUME: volume,
-      DSH_LAYERFS_DAEMON: daemon,
-      DSH_LAYERFS_STORE_PATH: host.storePathOf(volume),
-      DSH_LAYERFS_DAEMON_HOST: 'host.docker.internal',
-      DSH_LAYERFS_CONTAINER_PREFIX: prefix,
-      DSH_LAYERFS_STORE_CONTAINER: box,
-      DSH_LAYERFS_BUNDLE: LAYERFS_BUNDLE,
-    },
-    async cleanup() {
-      // Every container of this run (the Store and its Sandboxes) is named
-      // with the run's prefix or mounts the run's volume; both are removed, so
-      // a failed batch cannot leave a container pinning the volume.
-      for (const filter of [`name=${prefix}`, `volume=${volume}`]) {
-        try {
-          const left = docker('ps', '-aq', '--filter', filter).split('\n').filter(Boolean)
-          if (left.length) docker('rm', '-f', ...left)
-        } catch {}
-      }
-      // Docker releases a volume a moment after its last container is gone.
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        try {
-          docker('volume', 'rm', '-f', volume)
-          return
-        } catch {
-          if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 250))
-        }
-      }
-    },
+  const image = docker('image', 'inspect', '--format', '{{.Id}}', RUNTIME_TAG)
+  const runtime = await LayerFSRuntime.open({ home, image, bundle: LAYERFS_BUNDLE, docker: LAYERFS_DOCKER, containerPrefix: prefix, sweep: false })
+  const cleanup = async () => {
+    try {
+      await runtime.project.remove(project, { confirm: project, stopSandboxes: true })
+    } catch {}
+    await runtime.close()
+    // The worker and every Sandbox of this run carry the run's prefix.
+    try {
+      const left = docker('ps', '-aq', '--filter', `name=${prefix}`).split('\n').filter(Boolean)
+      if (left.length) docker('rm', '-f', ...left)
+    } catch {}
+  }
+  try {
+    let job = await runtime.project.start_init(project, workspace)
+    while (!job.ended) {
+      await new Promise(resolve => setTimeout(resolve, 300))
+      job = await runtime.project.get_init(job.id)
+    }
+    assert.equal(job.step, 'done', `LayerFS Init: ${JSON.stringify(job.error)}`)
+    const volume = job.project.volume
+    return {
+      env: {
+        DSH_LAYERFS_PROJECT: project,
+        DSH_LAYERFS_SDK: pathToFileURL(`${LAYERFS_ROOT}/api/agent/src/index.js`).href,
+        DSH_LAYERFS_HOME: home,
+        DSH_LAYERFS_DOCKER: LAYERFS_DOCKER,
+        DSH_LAYERFS_IMAGE: image,
+        DSH_LAYERFS_VOLUME: volume,
+        DSH_LAYERFS_DAEMON: join(LAYERFS_BUNDLE, 'layerfs-daemon'),
+        DSH_LAYERFS_STORE_PATH: `/var/lib/docker/volumes/${volume}/_data/global/store.sqlite`,
+        DSH_LAYERFS_CONTAINER_PREFIX: prefix,
+        DSH_LAYERFS_WORKER_ENDPOINT: join(home, 'worker', 'endpoint.json'),
+      },
+      cleanup,
+    }
+  } catch (error) {
+    await cleanup()
+    throw error
   }
 }
 
@@ -548,7 +487,8 @@ describe('real end-to-end', () => {
     })
     assert.match(tree, /# == dsh-layerfs/)
     assert.match(tree, /# == dsh-auto-research/)
-    assert.match(tree, /providerName: auto-research/)
+    // A user patch may replace the plugin config; the tool binding names the provider either way.
+    assert.match(tree, /provider: auto-research/)
     assert.match(tree, /toolName: subagent_auto_research/)
     const profile = readJson(join(DSH_HOME, 'profiles/web/package.json'))
     assert.ok(profile.dsh.profile.bundles.includes('dsh-layerfs'))
@@ -558,23 +498,16 @@ describe('real end-to-end', () => {
     assert.match(patch, /docker:\s+\S+docker\.sock/)
   })
 
-  it('runs two real batches with the LayerFS simulator and adopts the leader branch', async (t) => {
-    if (!dshStackAvailable()) return t.skip('deepseek-harness build is not available')
-    if (!layerfsHostAvailable()) return t.skip('@dsh-layerfs/host is not available')
-    const result = await scenario('sim')
-    assert.ok(result.worker.starts.length >= 12, `worker activations: ${result.worker.starts.length}`)
-  })
-
   it('runs two real batches against OrbStack Docker LayerFS and adopts the leader branch', async (t) => {
     if (!dshStackAvailable()) return t.skip('deepseek-harness build is not available')
-    if (!layerfsHostAvailable()) return t.skip('@dsh-layerfs/host is not available')
-    if (!liveLayerfsAvailable()) return t.skip('OrbStack Docker or the LayerFS bundle is not available')
+    if (!layerfsApiAvailable()) return t.skip('the LayerFS checkout\'s api packages are not linked')
+    if (!liveLayerfsAvailable()) return t.skip('OrbStack Docker or the sealed LayerFS bundle is not available')
     try {
       execFileSync('docker', ['-H', `unix://${LAYERFS_DOCKER}`, 'image', 'inspect', '--format', '{{.Id}}', RUNTIME_TAG], { encoding: 'utf8' })
     } catch {
       return t.skip(`runtime image ${RUNTIME_TAG} is not built`)
     }
-    const result = await scenario('live')
+    const result = await scenario()
     assert.ok(result.worker.starts.length >= 12, `worker activations: ${result.worker.starts.length}`)
   })
 })

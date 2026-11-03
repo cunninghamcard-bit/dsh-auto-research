@@ -91,16 +91,19 @@ function sdkModule(path: string): string {
 import { join } from 'node:path'
 const mounts = ${JSON.stringify(path)}
 export class LayerFS {
-  constructor(project, options) {
-    this.projectName = project
-    this.options = options
+  static async open(project) {
+    const client = new LayerFS()
+    client.projectName = project
+    return client
+  }
+  constructor() {
     this.branch = { fork: async (name, from) => { this.lastFork = [name, from] } }
+    this.sandbox = { create: async () => ({ sandbox: '1', image: 'sha256:image' }), list_workspaces: async () => ({ items: [] }) }
     this.workspace = {
-      mount: async name => { await mkdir(join(mounts, name), { recursive: true }); return { sandbox: name, path: join(mounts, name) } },
-      commit: async () => {},
+      mount: async (_sandbox, name) => { await mkdir(join(mounts, name), { recursive: true }); return { sandbox: name, path: join(mounts, name) } },
+      commit: async () => ({ kind: 'Committed' }),
       unmount: async () => {},
     }
-    this.fs = {}
   }
   async close() {}
 }

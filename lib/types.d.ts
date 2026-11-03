@@ -352,10 +352,9 @@ export interface Logger {
  */
 export interface LayerFSBinding {
     client?: LayerFSClient;
-    operator?: unknown;
     project?: string | null;
     sdk?: string | null;
-    operatorPath?: string;
+    backend?: string | null;
     cli?: string | null;
     skill?: string | null;
     storePath?: string | null;
@@ -369,9 +368,7 @@ export interface LayerFSBinding {
     daemon?: string | null;
     containerPrefix?: string | null;
     daemonHost?: string | null;
-    storeContainer?: string | null;
-    bundle?: string | null;
-    wslEndpoint?: string | null;
+    workerEndpoint?: string | null;
     syncBaseline?: boolean;
     [key: string]: unknown;
 }
@@ -427,71 +424,93 @@ export interface ResolvedConfig {
     plan?: ResearchPlanInput;
     [key: string]: unknown;
 }
-/** A LayerFS Workspace as returned by `workspace.mount`. */
+/** A LayerFS Workspace: its Sandbox's number and its path in that Sandbox. */
 export interface LayerFSMount {
     sandbox: string;
     path: string;
-    image?: string;
-    workspace?: {
-        path?: string;
-    };
-    [key: string]: unknown;
 }
-/** Structural LayerFS SDK client (the real `@layerfs/sdk` satisfies this). */
+/** One `fs.list` entry. */
+export interface LayerFSListItem {
+    name: string;
+    path?: string;
+    type: string;
+}
+/**
+ * The `@layerfs/agent` client surface this bundle uses (LayerFS 1.1:
+ * `LayerFS.open(project)`, positional calls, Sandboxes made explicitly).
+ */
 export interface LayerFSClient {
-    project?: {
-        init?: (sourcePath: string) => Promise<unknown>;
-        [key: string]: unknown;
+    branch: {
+        fork: (name: string, fromRef?: string) => Promise<unknown>;
     };
-    branch?: {
-        fork?: (name: string, from?: string) => Promise<unknown>;
-        [key: string]: unknown;
+    sandbox: {
+        create: (options?: {
+            image?: string;
+        }) => Promise<{
+            sandbox: string;
+            image: string;
+        }>;
+        /** Each Workspace's `changed` and `headMovedSinceMount` are null when its daemon could not tell. */
+        list_workspaces: (sandbox: string, pageSize?: number, pagePos?: number) => Promise<{
+            items: Array<{
+                path: string;
+                changed: boolean | null;
+                headMovedSinceMount: boolean | null;
+            }>;
+        }>;
     };
-    workspace?: {
-        mount?: (branch: string) => Promise<LayerFSMount>;
-        commit?: (workspace: LayerFSMount, message?: string, force?: boolean) => Promise<unknown>;
-        unmount?: (workspace: LayerFSMount, discard?: boolean) => Promise<unknown>;
-        status?: (workspace: LayerFSMount) => Promise<unknown>;
-        exec?: (...args: unknown[]) => Promise<unknown>;
-        [key: string]: unknown;
+    workspace: {
+        mount: (sandbox: string, branch: string) => Promise<LayerFSMount & {
+            image?: string;
+        }>;
+        exec: (workspace: LayerFSMount, command: string) => Promise<{
+            exitCode: number | null;
+            stdout: string | null;
+        }>;
+        /** `kind` is `Committed`, or `UpToDate` when the Workspace held no change. */
+        commit: (workspace: LayerFSMount, message?: string, force?: boolean) => Promise<{
+            kind: string;
+        }>;
+        unmount: (workspace: LayerFSMount, discard?: boolean, force?: boolean) => Promise<unknown>;
     };
-    fs?: {
-        apply?: (branch: string, changes: unknown[], message?: string) => Promise<unknown>;
-        write?: (branch: string, path: string, content: string | Uint8Array, message?: string) => Promise<unknown>;
-        rm?: (branch: string, path: string, message?: string) => Promise<unknown>;
-        list?: (branch: string, path?: string, pageSize?: number, pagePos?: number) => Promise<unknown>;
-        read?: (branch: string, path: string, startLine?: number, endLine?: number) => Promise<unknown>;
-        [key: string]: unknown;
+    fs: {
+        apply: (branch: string, changes: unknown[], message?: string) => Promise<unknown>;
+        list: (ref: string, path?: string, pageSize?: number, pagePos?: number) => Promise<{
+            items: LayerFSListItem[];
+            hasMore?: boolean;
+        }>;
+        read: (ref: string, path: string, startLine?: number, endLine?: number) => Promise<{
+            text: string;
+            nextLine?: number | null;
+            lineTruncated?: boolean;
+        }>;
     };
-    close?: () => Promise<unknown>;
-    [key: string]: unknown;
+    close: () => Promise<unknown>;
 }
 /** Resolved `DSH_LAYERFS_*` deployment settings. */
 export interface LayerFSSettings {
     project: string;
+    /** File URL of `@layerfs/agent`. */
     sdk: string;
-    operator: string | null;
+    /** File URL of `@layerfs/backend`, handed to workers only. */
+    backend: string | null;
     cli: string | null;
     skill: string | null;
     storePath: string | null;
     home: string | null;
     trace: string | null;
     traceStep: string | null;
+    /** `1` when the SDK also writes a trace line as each call starts. */
+    traceStart: string | null;
     syncBaseline: boolean;
     docker: string | null;
     image: string | null;
     volume: string | null;
     daemon: string | null;
     containerPrefix: string | null;
-    /** macOS/Live: the Linux Store container every ported SDK call runs in. */
-    storeContainer: string | null;
-    /** macOS/Live: the sealed Linux LayerFS build whose SDK `sdk` loads. */
-    bundle: string | null;
-    /** Windows: private endpoint file of the WSL LayerFS worker. */
-    wslEndpoint: string | null;
-    /** `1` when the SDK also writes a trace line as each call starts. */
-    traceStart: string | null;
     daemonHost: string | null;
+    /** macOS and Windows: the endpoint file of the LayerFS home's worker. */
+    workerEndpoint: string | null;
 }
 /** Clock seam used by tests and deterministic runs. */
 export interface Clock {

@@ -512,39 +512,6 @@ export function isStaleMountRefusal(error: unknown): boolean {
 }
 
 /**
- * Whether a refusal means the LayerFS project or its `main` branch does not
- * exist yet, so `project.init(source)` can recover.
- */
-export function isMissingProjectOrMain(error: unknown): boolean {
-  return ['NoSuchProject', 'NoSuchBranch', 'NoSuchCommit'].includes(refusalCode(error))
-}
-
-/** Whether `project.init` refused because the project already exists. */
-function isExistingProject(error: unknown): boolean {
-  return refusalCode(error) === 'Exists'
-}
-
-/**
- * Whether a failed `branch.fork(_, 'main')` may mean the project is not
- * initialized yet.
- *
- * The ported macOS SDK reports a missing Store file as a plain `Failed` OS
- * error instead of `NoSuchProject`, so this is deliberately permissive: only
- * refusals that describe a different problem are excluded, and the caller
- * retries `project.init` + fork for everything else.
- */
-export function mayNeedProjectInit(error: unknown): boolean {
-  if (isMissingProjectOrMain(error)) return true
-  const code = refusalCode(error)
-  if (['Busy', 'InvalidInput', 'Unsupported', 'ReadOnly'].includes(code)) return false
-  const message = error === null || typeof error !== 'object'
-    ? ''
-    : String((error as { message?: unknown }).message ?? '')
-  if (/invalid.*branch name|not a valid name/i.test(message)) return false
-  return true
-}
-
-/**
  * Whether a LayerFS call failed for a reason that a short retry can fix.
  *
  * Two families are transient:
@@ -579,8 +546,6 @@ const TRANSIENT_MESSAGE = new RegExp([
   'Connection refused',
   'socket hang up',
   'failed to connect to daemon',
-  'the Store container .* worker did not answer',
-  'the Store container .* has not started',
   'connect ENOENT',
 ].join('|'), 'i')
 
@@ -628,15 +593,17 @@ interface MountedWorkspace {
 }
 
 /**
- * LayerFS copy-on-write branch backend.
+ * LayerFS copy-on-write branch backend (`@layerfs/agent` 1.1).
  *
- * `ownsClient` is false whenever the client was injected by the host (for
- * example `ctx.layerfs.client`), so `close()` never tears down a shared client.
+ * Every Workspace mounts in a Sandbox this backend made with
+ * `sandbox.create()`; a Sandbox that closed itself or holds 16 Workspaces is
+ * replaced on the next mount. `ownsClient` is false whenever the client was
+ * injected by the host (for example `config.layerfs.client`), so `close()`
+ * never tears down a shared client.
  */
 export class LayerFSBackend implements WorkspaceBackend {
   readonly name = 'layerfs'
   readonly client: LayerFSClient
-  readonly operator: unknown
   readonly project: string
   readonly output: string
   readonly runId: string
@@ -644,14 +611,11 @@ export class LayerFSBackend implements WorkspaceBackend {
   readonly syncBaseline: boolean
   readonly ownsClient: boolean
   readonly retryBaseDelayMs: number
-  /** Close of the client `loadLayerfs` built, which also restores the environment. */
-  readonly releaseEnvironment: (() => Promise<void> | void) | null
-  /** Re-assert this backend's LayerFS environment lease before each SDK call. */
-  readonly activateEnvironment: (() => void) | null
+  /** The Sandbox new Workspaces mount in, shared by concurrent mounts. */
+  private sandbox: Promise<string> | null = null
 
   constructor(options: {
     client: LayerFSClient
-    operator?: unknown
     project?: string
     output: string
     runId?: string
@@ -659,15 +623,8 @@ export class LayerFSBackend implements WorkspaceBackend {
     syncBaseline?: boolean
     ownsClient?: boolean
     retryBaseDelayMs?: number
-    releaseEnvironment?: (() => Promise<void> | void) | null
-    activateEnvironment?: (() => void) | null
   }) {
-    const { client } = options
-    if (typeof client?.branch?.fork !== 'function' || typeof client?.workspace?.mount !== 'function') {
-      throw new Error('LayerFS backend requires branch.fork and workspace.mount')
-    }
-    this.client = client
-    this.operator = options.operator ?? null
+    this.client = options.client
     this.project = options.project ?? 'auto-research'
     this.output = options.output
     this.runId = options.runId ?? 'run'
@@ -675,8 +632,6 @@ export class LayerFSBackend implements WorkspaceBackend {
     this.syncBaseline = options.syncBaseline ?? true
     this.ownsClient = options.ownsClient ?? false
     this.retryBaseDelayMs = options.retryBaseDelayMs ?? 150
-    this.releaseEnvironment = options.releaseEnvironment ?? null
-    this.activateEnvironment = options.activateEnvironment ?? null
   }
 
   /** @returns a branch name that always fits Docker's 63-character limit. */
@@ -685,13 +640,33 @@ export class LayerFSBackend implements WorkspaceBackend {
   }
 
   retry<T>(fn: () => Promise<T>): Promise<T> {
-    return withBusyRetry(() => {
-      // Another batch in this process may have released (or replaced) the
-      // LayerFS environment since the previous call; this batch's SDK calls
-      // must still see its own binding.
-      this.activateEnvironment?.()
-      return fn()
-    }, { retries: 6, baseDelayMs: this.retryBaseDelayMs })
+    return withBusyRetry(fn, { retries: 6, baseDelayMs: this.retryBaseDelayMs })
+  }
+
+  /**
+   * Mount `branch` in this backend's Sandbox. A Sandbox closes itself two
+   * minutes after its last Workspace, and holds at most 16: either refusal
+   * makes one new Sandbox and one more mount.
+   */
+  private async mount(branch: string): Promise<LayerFSMount> {
+    for (let attempt = 0; ; attempt += 1) {
+      const current = this.sandbox ??= this.retry(() => this.client.sandbox.create()).then(made => made.sandbox)
+      let sandbox: string
+      try {
+        sandbox = await current
+      } catch (error) {
+        if (this.sandbox === current) this.sandbox = null
+        throw error
+      }
+      try {
+        const mounted = await this.retry(() => this.client.workspace.mount(sandbox, branch))
+        return { sandbox: mounted.sandbox, path: mounted.path }
+      } catch (error) {
+        const code = refusalCode(error)
+        if (attempt > 0 || (code !== 'NoSuchSandbox' && code !== 'Capacity')) throw error
+        if (this.sandbox === current) this.sandbox = null
+      }
+    }
   }
 
   /**
@@ -701,10 +676,7 @@ export class LayerFSBackend implements WorkspaceBackend {
    */
   private async discardMount(mount: LayerFSMount | null | undefined, stagingPath: string | null): Promise<void> {
     try {
-      const unmount = this.client.workspace?.unmount
-      if (mount && typeof unmount === 'function') {
-        await this.retry(() => unmount.call(this.client.workspace, mount, true))
-      }
+      if (mount) await this.retry(() => this.client.workspace.unmount(mount, true))
     } catch (error) {
       this.logger?.warn?.(`[auto-research] failed to unmount a partially prepared workspace: ${(error as Error).message}`)
     }
@@ -725,45 +697,18 @@ export class LayerFSBackend implements WorkspaceBackend {
     const handle = state.handle
     const branch = state.branch
     if (!handle || !branch) return
-    const unmount = this.client.workspace?.unmount
-    if (typeof unmount === 'function') {
-      await this.retry(() => unmount.call(this.client.workspace, handle, true))
-    }
+    await this.retry(() => this.client.workspace.unmount(handle, true))
     state.handle = null
-    const mount = await this.retry(() => {
-      const method = this.client.workspace?.mount
-      if (typeof method !== 'function') throw new Error('LayerFS client has no workspace.mount')
-      return method.call(this.client.workspace, branch)
-    })
-    const raw = mount?.path ?? mount?.workspace?.path
-    if (typeof raw !== 'string' || raw.length === 0) {
-      await this.discardMount(mount, null)
-      throw new Error('LayerFS workspace.mount returned no path')
-    }
+    const mount = await this.mount(branch)
     state.handle = mount
-    state.sandboxPath = raw
+    state.sandboxPath = mount.path
   }
 
   private async mountBranch(branch: string, id: string, sourcePath: string | null): Promise<MountedWorkspace> {
-    const mount = await this.retry(() => {
-      const method = this.client.workspace?.mount
-      if (typeof method !== 'function') throw new Error('LayerFS client has no workspace.mount')
-      return method.call(this.client.workspace, branch)
-    })
-    const raw = mount?.path ?? mount?.workspace?.path
-    if (typeof raw !== 'string' || raw.length === 0) {
-      await this.discardMount(mount, null)
-      throw new Error('LayerFS workspace.mount returned no path')
-    }
-    const host = await hostDirectory(raw)
+    const mount = await this.mount(branch)
+    const host = await hostDirectory(mount.path)
     if (host) {
-      return {
-        branch,
-        mount,
-        path: host,
-        sandboxPath: typeof mount.sandbox === 'string' ? raw : null,
-        staging: false,
-      }
+      return { branch, mount, path: host, sandboxPath: mount.path, staging: false }
     }
     // A Sandbox-internal mount (/workspaces/N) is not visible on the host.
     // Stage a host copy so evaluation, evidence checks and one-shot CLI
@@ -776,13 +721,7 @@ export class LayerFSBackend implements WorkspaceBackend {
       await this.discardMount(mount, staging)
       throw error
     }
-    return {
-      branch,
-      mount,
-      path: staging,
-      sandboxPath: raw,
-      staging: true,
-    }
+    return { branch, mount, path: staging, sandboxPath: mount.path, staging: true }
   }
 
   private async syncStaging(state: WorkspaceState, message: string): Promise<void> {
@@ -791,36 +730,29 @@ export class LayerFSBackend implements WorkspaceBackend {
     if (!handle || !branch) return
     const after = await inventory(state.path)
     const before = state.stagingInventory ?? {}
-    const writes: unknown[] = []
-    // A fresh LayerFS branch holds no directories, and a write refuses when its
-    // parent is missing, so create every parent of a new file first.
+    const changes: unknown[] = []
+    // `mkdir` makes every missing parent and leaves an existing folder alone.
     const directories = new Set<string>()
     for (const name of Object.keys(after).sort()) {
       if (after[name] === before[name]) continue
       if (isLinkEntry(after[name])) {
-        // The SDK has no call that writes a symlink: keep it on the host copy
-        // and never treat its absence on the branch as a deletion.
+        // `fs.apply` writes no symlink: keep it on the host copy and never
+        // treat its absence on the branch as a deletion.
         if (!(state.skippedFiles ?? []).includes(name)) {
           state.skippedFiles = [...(state.skippedFiles ?? []), name]
           this.logger?.warn?.(`[auto-research] symlink ${name} stays in the host staging copy; LayerFS fs.apply cannot write links`)
         }
         continue
       }
-      const parts = name.split('/')
-      for (let depth = 1; depth < parts.length; depth += 1) {
-        directories.add(parts.slice(0, depth).join('/'))
-      }
+      if (name.includes('/')) directories.add(name.slice(0, name.lastIndexOf('/')))
+      // Text travels as text (the simulator stores strings), anything else as bytes.
       const bytes = await fsp.readFile(join(state.path, name))
-      // Text travels as text: the simulator's model stores strings, while the
-      // live binding accepts both text and bytes.
       const text = bytes.toString('utf8')
-      const content = Buffer.from(text, 'utf8').equals(bytes) ? text : bytes
-      writes.push({ op: 'write', path: '/' + name, content })
+      changes.push(Buffer.from(text, 'utf8').equals(bytes)
+        ? { op: 'write', path: '/' + name, content: text }
+        : { op: 'write', path: '/' + name, bytes })
     }
-    const mkdirs = [...directories]
-      .sort((a, b) => a.split('/').length - b.split('/').length || (a < b ? -1 : a > b ? 1 : 0))
-      .map(name => ({ op: 'mkdir', path: '/' + name }))
-    writes.unshift(...mkdirs)
+    changes.unshift(...[...directories].sort().map(name => ({ op: 'mkdir', path: '/' + name })))
     for (const name of Object.keys(before).sort()) {
       // `Object.hasOwn` so a file literally named `constructor` or `toString`
       // is compared as data, not as an inherited prototype member.
@@ -830,47 +762,10 @@ export class LayerFSBackend implements WorkspaceBackend {
       if ((state.skippedFiles ?? []).includes(name)) continue
       // A link was never published, so there is nothing to remove.
       if (isLinkEntry(before[name])) continue
-      writes.push({ op: 'rm', path: '/' + name })
+      changes.push({ op: 'rm', path: '/' + name })
     }
-    const fs = this.client.fs
-    let published = false
-    if (writes.length > 0) {
-      if (typeof fs?.apply === 'function') {
-        await this.retry(() => fs.apply!(branch, writes, message))
-        // `fs.apply` already created a commit on `branch`, which moves the
-        // branch HEAD ahead of this mount's handle.
-        published = true
-      } else if (typeof fs?.write === 'function' || typeof fs?.rm === 'function') {
-        for (const change of writes as Array<{ op: string; path: string; content?: Uint8Array }>) {
-          if (change.op === 'mkdir' && typeof (fs as { mkdir?: unknown }).mkdir === 'function') {
-            await this.retry(() => (fs as { mkdir: (branch: string, path: string) => Promise<unknown> })
-              .mkdir(branch, change.path))
-          } else if (change.op === 'write' && typeof fs.write === 'function') {
-            await this.retry(() => fs.write!(branch, change.path, change.content ?? new Uint8Array()))
-            published = true
-          } else if (change.op === 'rm' && typeof fs.rm === 'function') {
-            await this.retry(() => fs.rm!(branch, change.path))
-            published = true
-          }
-        }
-      } else {
-        this.logger?.warn?.(
-          '[auto-research] LayerFS mount is Sandbox-internal and the client exposes no fs.apply/fs.write; changes stay staged on the host',
-        )
-      }
-    }
-    if (typeof this.client.workspace?.commit === 'function') {
-      try {
-        await this.retry(() => this.client.workspace!.commit!(handle, message))
-      } catch (error) {
-        // When `fs.apply`/`fs.write` already published the exact bytes, the
-        // mount's own overlay is behind the branch HEAD (or the mount is dirty
-        // by construction). That refusal is not a lost write.
-        if (!published || !isStaleMountRefusal(error)) throw error
-        this.logger?.info?.(
-          `[auto-research] branch ${branch} already holds the published bytes; skipping the stale mount commit (${refusalCode(error)})`,
-        )
-      }
+    if (changes.length > 0) {
+      await this.retry(() => this.client.fs.apply(branch, changes, message))
     }
     state.stagingInventory = after
   }
@@ -879,56 +774,29 @@ export class LayerFSBackend implements WorkspaceBackend {
     branch: string,
     destination: string,
     mount: LayerFSMount | null = null,
-    sandboxPath: string | null = null,
   ): Promise<string[]> {
     const skipped: string[] = []
-    const fs = this.client.fs
-    // An empty listing would read as "the branch deleted every file".
-    if (typeof fs?.list !== 'function' || typeof fs?.read !== 'function') {
-      throw new Error(`cannot materialize LayerFS branch ${branch}: the client has no fs.list/fs.read`)
-    }
-    const files = await listBranchFiles(fs, branch)
-    for (const name of files) {
+    for (const name of await listBranchFiles(this.client, branch)) {
       const relative = name.replace(/^\/+/, '')
       const target = join(destination, relative)
       try {
-        const text = await this.readBranchFile(fs, branch, name)
-        if (typeof text !== 'string') continue
+        const text = await this.readBranchFile(branch, name)
         await fsp.mkdir(dirname(target), { recursive: true })
         await fsp.writeFile(target, text)
       } catch (error) {
         const truncated = refusalCode(error) === 'LineTruncated'
-        if (!truncated && !isSkippableAdoptedFile(error)) {
-          this.logger?.warn?.(`[auto-research] skipped non-text adopted file ${name}: ${(error as Error).message}`)
-          continue
-        }
-        const exec = this.client.workspace?.exec
-        if (mount && sandboxPath && typeof exec === 'function') {
+        if (!truncated && !isSkippableAdoptedFile(error)) throw error
+        if (mount) {
           try {
             // `fs.read` cannot represent a binary file (or a line over 48 KiB),
             // but the exact bytes are still inside the mounted Sandbox.
-            const source = `${sandboxPath.replace(/\/+$/, '')}/${relative}`
+            const source = `${mount.path.replace(/\/+$/, '')}/${relative}`
             const command = `sh -c 'base64 < "$1"' -- ${shellQuote(source)}`
-            const result = await this.retry(() => exec.call(this.client.workspace, mount, command)) as
-              | { stdout?: unknown; exitCode?: unknown }
-              | string
-              | null
-              | undefined
-            const stdout = typeof result === 'string'
-              ? result
-              : (result as { stdout?: unknown } | null | undefined)?.stdout
-            const exitCode = typeof result === 'object' && result !== null
-              ? (result as { exitCode?: unknown }).exitCode
-              : undefined
-            if (typeof exitCode === 'number' && exitCode !== 0) {
-              throw new Error(`workspace.exec exited ${exitCode}`)
-            }
-            let bytes: Buffer
-            if (typeof stdout === 'string') bytes = Buffer.from(stdout, 'base64')
-            else if (stdout instanceof Uint8Array) bytes = Buffer.from(stdout)
-            else throw new Error('workspace.exec returned no stdout')
+            const result = await this.retry(() => this.client.workspace.exec(mount, command))
+            if (result.exitCode !== 0) throw new Error(`workspace.exec exited ${String(result.exitCode)}`)
+            if (typeof result.stdout !== 'string') throw new Error('workspace.exec returned no stdout')
             await fsp.mkdir(dirname(target), { recursive: true })
-            await fsp.writeFile(target, bytes)
+            await fsp.writeFile(target, Buffer.from(result.stdout, 'base64'))
             continue
           } catch (execError) {
             this.logger?.warn?.(
@@ -938,7 +806,7 @@ export class LayerFSBackend implements WorkspaceBackend {
         }
         if (truncated) {
           throw codedError(
-            `LayerFS fs.read truncated a line > 48 KiB in ${name} and workspace.exec is unavailable`,
+            `LayerFS fs.read truncated a line > 48 KiB in ${name} and workspace.exec could not copy it`,
             'LineTruncated',
           )
         }
@@ -956,159 +824,30 @@ export class LayerFSBackend implements WorkspaceBackend {
    * `fs.read` returns at most 2000 lines / 48 KiB per call and reports the next
    * `nextLine` cursor; a single call would truncate a large adopted file.
    */
-  private async readBranchFile(
-    fs: NonNullable<LayerFSClient['fs']>,
-    branch: string,
-    name: string,
-  ): Promise<string | null> {
-    const read = fs.read as unknown as (
-      branch: string,
-      path: string,
-      startLine?: number,
-    ) => Promise<unknown>
-    let line: number | undefined
+  private async readBranchFile(branch: string, name: string): Promise<string> {
+    let line = 1
     let text = ''
-    let chunks = 0
-    while (chunks < 10_000) {
-      chunks += 1
-      const value = line === undefined ? await read.call(fs, branch, name) : await read.call(fs, branch, name, line)
-      if (value !== null && typeof value === 'object'
-        && (value as { lineTruncated?: unknown }).lineTruncated === true) {
+    while (true) {
+      const value = await this.retry(() => this.client.fs.read(branch, name, line))
+      if (value.lineTruncated === true) {
         throw codedError(`LayerFS fs.read truncated a line > 48 KiB in ${name}`, 'LineTruncated')
       }
-      const chunk = typeof value === 'string'
-        ? value
-        : (value as { text?: unknown; content?: unknown } | null | undefined)?.text
-          ?? (value as { content?: unknown } | null | undefined)?.content
-      if (typeof chunk !== 'string') return text === '' ? null : text
-      text += chunk
-      const next = value !== null && typeof value === 'object'
-        ? (value as { nextLine?: unknown }).nextLine
-        : undefined
-      if (typeof next !== 'number' || !Number.isFinite(next)) return text
-      // Guard against a non-advancing cursor so a stuck SDK cannot loop forever.
-      if (line !== undefined && next <= line) return text
-      if (line === undefined && next <= 0) return text
+      text += value.text
+      const next = value.nextLine
+      if (typeof next !== 'number' || next <= line) return text
       line = next
     }
-    return text
   }
 
-  /**
-   * The LayerFS home a client was built for, when the SDK exposes it.
-   *
-   * `project.init` records the project as a directory directly under the home,
-   * and it refuses a name that is already there, so this is the one
-   * non-mutating existence probe available before any Store call.
-   */
-  private homeDirectory(): string | null {
-    const options = (this.client as { options?: { home?: unknown } }).options
-    const home = options?.home
-    return typeof home === 'string' && home.length > 0 ? home : null
-  }
-
-  /** Whether the project entry exists: true/false, or null when it cannot be told. */
-  private async projectInitialized(): Promise<boolean | null> {
-    // A Windows/WSL binding resolves its Store through the worker endpoint,
-    // not this macOS home directory; probing it would be a false negative.
-    const endpoint = (this.client as {
-      options?: { deploy?: { wslEndpoint?: unknown } }
-    }).options?.deploy?.wslEndpoint
-    if (endpoint) return null
-    const home = this.homeDirectory()
-    if (!home) return null
-    const entry = join(home, this.project)
+  /** Create the baseline branch from the project's `main`. */
+  private async forkBaseline(branch: string): Promise<void> {
     try {
-      const stat = await fsp.stat(entry)
-      if (!stat.isDirectory()) return false
-      // `project.init` refuses an existing name, and an interrupted init can
-      // leave an empty directory that is not a project.
-      const entries = await fsp.readdir(entry)
-      if (entries.length === 0) {
-        await fsp.rmdir(entry).catch(() => {})
-        return false
-      }
-      return true
+      await this.retry(() => this.client.branch.fork(branch, 'main'))
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
-      return null
-    }
-  }
-
-  private async initializeProject(source: string): Promise<void> {
-    const project = this.client.project
-    if (typeof project?.init !== 'function') {
+      if (refusalCode(error) !== 'NoSuchProject') throw error
       throw new Error(
-        `LayerFS project ${this.project} is not initialized and the SDK exposes no project.init; initialize it from ${source} first`,
+        `LayerFS project ${this.project} does not exist; import the checkout in dsh (project chip → Import project…) first`,
       )
-    }
-    await this.retry(() => project.init!(source))
-    this.logger?.info?.(`[auto-research] initialized LayerFS project ${this.project} from ${source}`)
-  }
-
-  /**
-   * Create the baseline branch from the project's `main`.
-   *
-   * A LayerFS home may hold no project yet (a new dsh session, or the first
-   * auto-research batch in a checkout). Initializing must come *before* any
-   * Store call: on macOS `@dsh-layerfs/host`'s ported binding treats the
-   * client's Store as already open once any Store call ran, and Init then
-   * tries to open the not-yet-installed Store and refuses `NotFound`. So the
-   * project entry is probed on the home directory first, and `project.init`
-   * runs only when it is absent.
-   *
-   * Without a home to probe the fork itself is the probe; a refusal that may
-   * mean "not initialized" then gets one `project.init` + fork retry. A
-   * project that exists but whose `main` is unusable is reported clearly.
-   */
-  private async forkBaseline(branch: string, source: string): Promise<void> {
-    const fork = (): Promise<unknown> => {
-      const method = this.client.branch?.fork
-      if (typeof method !== 'function') throw new Error('LayerFS client has no branch.fork')
-      return this.retry(() => method.call(this.client.branch, branch, 'main'))
-    }
-    const initialized = await this.projectInitialized()
-    if (initialized === false) {
-      // Another process may have initialized it between the probe and init.
-      try {
-        await this.initializeProject(source)
-      } catch (initError) {
-        if (!isExistingProject(initError)) throw initError
-      }
-    }
-    try {
-      await fork()
-      return
-    } catch (error) {
-      if (!mayNeedProjectInit(error)) {
-        if (initialized !== null) {
-          throw new Error(
-            `LayerFS project ${this.project} has no usable main branch: ${(error as Error).message}`,
-          )
-        }
-        throw error
-      }
-      // A `true`/`null` probe is not proof that `main` is usable (an
-      // interrupted init leaves an empty project entry), so always try one
-      // `project.init` + fork retry for a refusal that may mean "not ready".
-      try {
-        await this.initializeProject(source)
-      } catch (initError) {
-        // Another process may have initialized it between the probe and init;
-        // anything else leaves `main` unusable, so report both failures.
-        if (!isExistingProject(initError)) {
-          throw new Error(
-            `LayerFS project ${this.project} has no usable main branch: ${(error as Error).message}; project.init(${source}) failed: ${(initError as Error).message}`,
-          )
-        }
-      }
-      try {
-        await fork()
-      } catch (retryError) {
-        throw new Error(
-          `LayerFS project ${this.project} still has no usable main branch after project.init(${source}): ${(retryError as Error).message}`,
-        )
-      }
     }
   }
 
@@ -1118,7 +857,7 @@ export class LayerFSBackend implements WorkspaceBackend {
     { sync = this.syncBaseline }: { sync?: boolean } = {},
   ): Promise<WorkspaceState> {
     const branch = this.branchName(id)
-    await this.forkBaseline(branch, source)
+    await this.forkBaseline(branch)
     const mounted = await this.mountBranch(branch, id, source)
     const state: WorkspaceState = {
       id,
@@ -1137,26 +876,19 @@ export class LayerFSBackend implements WorkspaceBackend {
         // A fresh LayerFS branch starts from `main`, so its files are the
         // baseline the staged host copy must reconcile against: a file present
         // on `main` and deleted in `source` has to become an explicit `rm`.
-        if (sync && this.client.fs) {
-          const existing = await listBranchFiles(this.client.fs, branch)
-          state.stagingInventory = Object.fromEntries(
-            existing.map(name => [name.replace(/^\/+/, ''), '']),
-          )
-        } else {
-          state.stagingInventory = {}
-        }
+        state.stagingInventory = sync
+          ? Object.fromEntries((await listBranchFiles(this.client, branch)).map(name => [name.replace(/^\/+/, ''), '']))
+          : {}
         await this.syncStaging(state, `auto-research: baseline ${id}`)
         // Publishing moved the branch HEAD past this mount, so the Sandbox
         // view at `/workspaces/<n>` would still show the pre-baseline files.
-        // Remount the branch so both views agree and a later Sandbox commit
-        // is not refused as `headMovedSinceMount`.
         await this.remountStaging(state)
       } else if (sync) {
-        await this.retry(() => this.client.workspace!.commit!(mounted.mount, `auto-research: baseline ${id}`))
+        await this.retry(() => this.client.workspace.commit(mounted.mount, `auto-research: baseline ${id}`))
       }
       return state
     } catch (error) {
-      await this.discardMount((state.handle as LayerFSMount | null) ?? null, mounted.staging ? mounted.path : null)
+      await this.discardMount(state.handle ?? null, mounted.staging ? mounted.path : null)
       throw error
     }
   }
@@ -1177,7 +909,7 @@ export class LayerFSBackend implements WorkspaceBackend {
     if (parent.staging) {
       await this.commit(parent, { message: `auto-research: publish staged parent before fork ${id}` })
     }
-    await this.retry(() => this.client.branch!.fork!(branch, parent.branch!))
+    await this.retry(() => this.client.branch.fork(branch, parent.branch!))
     const mounted = await this.mountBranch(branch, id, parent.path)
     try {
       return {
@@ -1210,7 +942,7 @@ export class LayerFSBackend implements WorkspaceBackend {
     })
     try {
       const skipped = mounted.staging
-        ? await this.materializeBranch(branch, mounted.path, mounted.mount, mounted.sandboxPath)
+        ? await this.materializeBranch(branch, mounted.path, mounted.mount)
         : []
       return {
         id,
@@ -1234,9 +966,9 @@ export class LayerFSBackend implements WorkspaceBackend {
    *
    * The host staging copy is the authoritative writer; the Sandbox mount at
    * `/workspaces/<n>` is for execution. A worker that edits the Sandbox anyway
-   * leaves changes in its overlay. This commits that overlay into the branch
-   * history first, whatever the host did, so it is never dropped, then compares
-   * both sides with the inventory the staging copy started from:
+   * leaves changes in its Workspace. This commits them into the branch
+   * history first, whatever the host did, so they are never dropped, then
+   * compares both sides with the inventory the staging copy started from:
    *
    * - neither changed: `unchanged`
    * - Sandbox only: fold the branch into the host copy, `folded`
@@ -1278,12 +1010,12 @@ export class LayerFSBackend implements WorkspaceBackend {
   }
 
   /**
-   * Commit a dirty Sandbox overlay and report what the branch now holds that
-   * the staging copy did not start from.
+   * Commit a changed Sandbox Workspace and report what the branch now holds
+   * that the staging copy did not start from.
    *
-   * @returns null when the overlay is clean and the branch head has not moved;
-   *   otherwise the changed paths and a materialized copy of the branch (the
-   *   caller removes `directory`).
+   * @returns null when the Sandbox's daemon reports the Workspace unchanged and
+   *   its branch head unmoved; otherwise the changed paths and a materialized
+   *   copy of the branch (the caller removes `directory`).
    */
   private async sandboxChanges(state: WorkspaceState): Promise<{
     changed: string[]
@@ -1291,50 +1023,20 @@ export class LayerFSBackend implements WorkspaceBackend {
     directory: string
   } | null> {
     const handle = state.handle as LayerFSMount
-    const status = this.client.workspace?.status
-    if (typeof status === 'function') {
-      let current: unknown = null
-      try {
-        current = await this.retry(() => status.call(this.client.workspace, handle))
-      } catch (error) {
-        this.logger?.warn?.(`[auto-research] workspace.status unavailable for ${state.id}: ${(error as Error).message}`)
-      }
-      if (current !== null && typeof current === 'object') {
-        // `sandbox.status`: `overlay` is null when the mount has no local state.
-        const record = current as {
-          overlay: { entries: number; inodes: number; pendingMerge: boolean } | null
-          headMovedSinceMount: boolean | null
-          branchHead: string | null
-          base: string | null
-        }
-        const overlay = record.overlay
-        const dirtyOverlay = overlay !== null && (overlay.entries > 0 || overlay.inodes > 0 || overlay.pendingMerge)
-        const initialBase = (handle as { base?: unknown } | null)?.base
-        const headKnownUnchanged = !dirtyOverlay
-          && !record.headMovedSinceMount
-          && typeof initialBase === 'string'
-          && typeof record.branchHead === 'string'
-          && record.branchHead === initialBase
-          && record.base === initialBase
-        if (headKnownUnchanged) return null
-        if (dirtyOverlay && typeof this.client.workspace?.commit === 'function') {
-          // A refused commit throws: the overlay is not in the branch history
-          // yet, and the remount below would discard it.
-          await this.retry(() => this.client.workspace!.commit!(handle, `auto-research: sandbox ${state.id}`))
-          // The branch head moved; the later `commit()` needs a current mount.
-          await this.remountStaging(state)
-        }
-      }
+    const page = await this.retry(() => this.client.sandbox.list_workspaces(handle.sandbox))
+    const record = page.items.find(item => item.path === handle.path)
+    if (record?.changed === false && record.headMovedSinceMount === false) return null
+    if (record?.changed !== false) {
+      // A refused commit throws: the changes are not in the branch history
+      // yet, and the remount below would discard them.
+      const result = await this.retry(() => this.client.workspace.commit(handle, `auto-research: sandbox ${state.id}`))
+      // The branch head moved; the later `commit()` needs a current mount.
+      if (result.kind === 'Committed') await this.remountStaging(state)
     }
     const directory = join(this.output, `${state.id}-reconcile-${randomUUID()}`)
     try {
       await fsp.mkdir(directory, { recursive: true })
-      const skipped = await this.materializeBranch(
-        state.branch as string,
-        directory,
-        state.handle as LayerFSMount,
-        state.sandboxPath ?? null,
-      )
+      const skipped = await this.materializeBranch(state.branch as string, directory, state.handle ?? null)
       if (skipped.length > 0) {
         state.skippedFiles = [...new Set([...(state.skippedFiles ?? []), ...skipped])]
       }
@@ -1367,43 +1069,29 @@ export class LayerFSBackend implements WorkspaceBackend {
       await this.syncStaging(state, message)
       return
     }
-    await this.retry(() => {
-      const method = this.client.workspace?.commit
-      if (typeof method !== 'function') return Promise.resolve()
-      return method.call(this.client.workspace, state.handle as LayerFSMount, message)
-    })
+    const handle = state.handle
+    await this.retry(() => this.client.workspace.commit(handle, message))
   }
 
   async release(state: WorkspaceState, { discard = false }: { discard?: boolean } = {}): Promise<void> {
     if (!state?.handle) return
-    const unmount = (drop: boolean): Promise<unknown> => this.retry(() => {
-      const method = this.client.workspace?.unmount
-      if (typeof method !== 'function') return Promise.resolve()
-      return method.call(this.client.workspace, state.handle as LayerFSMount, drop)
-    })
+    const handle = state.handle
+    const unmount = (drop: boolean): Promise<unknown> => this.retry(() => this.client.workspace.unmount(handle, drop))
     try {
       await unmount(discard)
     } catch (error) {
-      // A staged (Sandbox-internal) workspace gets its files through
-      // `fs.apply`, so its own overlay always differs from its mount base —
-      // and the branch HEAD has moved past the handle — even after the branch
-      // holds exactly those bytes. The branch is the record; the sandbox
-      // overlay is dropped rather than refusing to unmount.
+      // A staged workspace gets its files through `fs.apply`, so the branch
+      // HEAD has moved past its mount even when the branch holds exactly
+      // those bytes. The branch is the record; the Sandbox view is dropped
+      // rather than refusing to unmount.
       if (discard || !state.staging || !isStaleMountRefusal(error)) throw error
-      this.logger?.info?.('[auto-research] staged workspace overlay differs from its published branch; unmounting with discard')
+      this.logger?.info?.('[auto-research] staged workspace differs from its published branch; unmounting with discard')
       await unmount(true)
     }
   }
 
   async close(): Promise<void> {
-    if (!this.ownsClient) return
-    // `loadLayerfs` returns a close that releases the SDK client and the
-    // environment patch it published, in one place.
-    if (this.releaseEnvironment) {
-      await this.releaseEnvironment()
-      return
-    }
-    await this.client.close?.()
+    if (this.ownsClient) await this.client.close()
   }
 
   async retainCompletedState(row: TrajectoryRow): Promise<string> {
@@ -1440,37 +1128,19 @@ async function hostDirectory(path: string): Promise<string | null> {
 }
 
 /** List every file path (absolute, `/`-rooted) in a LayerFS branch. */
-async function listBranchFiles(
-  fs: NonNullable<LayerFSClient['fs']>,
-  branch: string,
-): Promise<string[]> {
+async function listBranchFiles(client: LayerFSClient, branch: string): Promise<string[]> {
   const files: string[] = []
-  const list = fs.list
-  if (typeof list !== 'function') return files
   const walk = async (path: string): Promise<void> => {
     let pagePos = 0
     while (true) {
-      const page = await list(branch, path, 1000, pagePos)
-      const items = Array.isArray(page)
-        ? page
-        : (page as { items?: unknown })?.items
-      if (!Array.isArray(items) || items.length === 0) return
-      for (const raw of items as Array<Record<string, unknown>>) {
-        const name = typeof raw.name === 'string' ? raw.name : typeof raw.path === 'string' ? raw.path : null
-        if (!name) continue
-        const full = path === '/' ? `/${name.replace(/^\/+/, '')}` : `${path}/${name.replace(/^\/+/, '')}`
-        const type = String(raw.type ?? raw.kind ?? '')
-        const directory = raw.isDirectory === true || type === 'directory' || type === 'dir'
-        if (directory) await walk(full)
-        else files.push(full)
+      const page = await client.fs.list(branch, path, 1000, pagePos)
+      for (const item of page.items) {
+        const full = path === '/' ? `/${item.name}` : `${path}/${item.name}`
+        if (item.type === 'dir' || item.type === 'directory') await walk(full)
+        else if (item.type === 'file') files.push(full)
       }
-      if (!(page as { hasMore?: unknown })?.hasMore) return
-      const nextPagePos = (page as { nextPagePos?: unknown })?.nextPagePos
-      // An explicit cursor wins; otherwise advance by the page we just read,
-      // and never let a non-advancing cursor loop forever.
-      pagePos = typeof nextPagePos === 'number' && nextPagePos > pagePos
-        ? nextPagePos
-        : pagePos + items.length
+      if (!page.hasMore || page.items.length === 0) return
+      pagePos += page.items.length
     }
   }
   await walk('/')
@@ -1539,11 +1209,11 @@ export class WorkspaceManager implements WorkspaceManagerLike {
   }
 }
 
-/** Every `DSH_LAYERFS_*` name a `dsh` session may publish. */
+/** Every `DSH_LAYERFS_*` name `@dsh-layerfs/host` publishes for a session. */
 export const LAYERFS_ENV_KEYS = [
   'DSH_LAYERFS_PROJECT',
   'DSH_LAYERFS_SDK',
-  'DSH_LAYERFS_OPERATOR',
+  'DSH_LAYERFS_BACKEND',
   'DSH_LAYERFS_CLI',
   'DSH_LAYERFS_SKILL',
   'DSH_LAYERFS_HOME',
@@ -1554,41 +1224,17 @@ export const LAYERFS_ENV_KEYS = [
   'DSH_LAYERFS_DAEMON',
   'DSH_LAYERFS_CONTAINER_PREFIX',
   'DSH_LAYERFS_DAEMON_HOST',
-  'DSH_LAYERFS_STORE_CONTAINER',
-  'DSH_LAYERFS_BUNDLE',
-  'DSH_LAYERFS_WSL_ENDPOINT',
+  'DSH_LAYERFS_WORKER_ENDPOINT',
   'DSH_LAYERFS_TRACE',
   'DSH_LAYERFS_TRACE_STEP',
   'DSH_LAYERFS_TRACE_START',
-] as const
-
-/**
- * Names the SDK reads either bare (`LAYERFS_<NAME>`, preferred) or with the
- * `DSH_` prefix. A session publication must win over a stale bare value, so
- * `loadLayerfs` mirrors both names while a client is alive.
- */
-const SDK_DEPLOYMENT_NAMES = [
-  'HOME',
-  'STORE_PATH',
-  'DOCKER',
-  'IMAGE',
-  'VOLUME',
-  'DAEMON',
-  'CONTAINER_PREFIX',
-  'DAEMON_HOST',
-  'STORE_CONTAINER',
-  'BUNDLE',
-  'WSL_ENDPOINT',
-  'TRACE',
-  'TRACE_STEP',
-  'TRACE_START',
 ] as const
 
 /** Setting field -> `DSH_LAYERFS_*` name, shared by resolution and publication. */
 const LAYERFS_SETTING_KEYS = [
   ['project', 'DSH_LAYERFS_PROJECT'],
   ['sdk', 'DSH_LAYERFS_SDK'],
-  ['operator', 'DSH_LAYERFS_OPERATOR'],
+  ['backend', 'DSH_LAYERFS_BACKEND'],
   ['cli', 'DSH_LAYERFS_CLI'],
   ['skill', 'DSH_LAYERFS_SKILL'],
   ['home', 'DSH_LAYERFS_HOME'],
@@ -1599,13 +1245,11 @@ const LAYERFS_SETTING_KEYS = [
   ['daemon', 'DSH_LAYERFS_DAEMON'],
   ['containerPrefix', 'DSH_LAYERFS_CONTAINER_PREFIX'],
   ['daemonHost', 'DSH_LAYERFS_DAEMON_HOST'],
-  ['storeContainer', 'DSH_LAYERFS_STORE_CONTAINER'],
-  ['bundle', 'DSH_LAYERFS_BUNDLE'],
-  ['wslEndpoint', 'DSH_LAYERFS_WSL_ENDPOINT'],
+  ['workerEndpoint', 'DSH_LAYERFS_WORKER_ENDPOINT'],
   ['trace', 'DSH_LAYERFS_TRACE'],
   ['traceStep', 'DSH_LAYERFS_TRACE_STEP'],
   ['traceStart', 'DSH_LAYERFS_TRACE_START'],
-] as const satisfies ReadonlyArray<readonly [keyof LayerFSSettings, string]>
+] as const satisfies ReadonlyArray<readonly [Exclude<keyof LayerFSSettings, 'syncBaseline'>, string]>
 
 /**
  * Resolve LayerFS deployment settings from explicit config or the session's
@@ -1621,41 +1265,15 @@ export function resolveLayerfsConfig(
 ): LayerFSSettings | null {
   if (explicit === false) return null
   const extra: LayerFSBinding = explicit && typeof explicit === 'object' ? explicit : {}
-  const read = (key: string): string | undefined => {
-    const value = env[key]
-    return typeof value === 'string' && value.length > 0 ? value : undefined
-  }
   const pick = (field: keyof LayerFSBinding, envKey: string): string | null => {
-    const value = extra[field]
-    if (value !== undefined) return typeof value === 'string' && value.length > 0 ? value : null
-    return read(envKey) ?? null
+    const value = extra[field] !== undefined ? extra[field] : env[envKey]
+    return typeof value === 'string' && value.length > 0 ? value : null
   }
-  const project = pick('project', 'DSH_LAYERFS_PROJECT')
-  const sdk = pick('sdk', 'DSH_LAYERFS_SDK')
-  if (!project || !sdk) return null
-  const settings: LayerFSSettings = {
-    project,
-    sdk,
-    operator: pick('operator', 'DSH_LAYERFS_OPERATOR'),
-    cli: pick('cli', 'DSH_LAYERFS_CLI'),
-    skill: pick('skill', 'DSH_LAYERFS_SKILL'),
-    storePath: pick('storePath', 'DSH_LAYERFS_STORE_PATH'),
-    home: pick('home', 'DSH_LAYERFS_HOME'),
-    trace: pick('trace', 'DSH_LAYERFS_TRACE'),
-    traceStep: pick('traceStep', 'DSH_LAYERFS_TRACE_STEP'),
-    docker: pick('docker', 'DSH_LAYERFS_DOCKER'),
-    image: pick('image', 'DSH_LAYERFS_IMAGE'),
-    volume: pick('volume', 'DSH_LAYERFS_VOLUME'),
-    daemon: pick('daemon', 'DSH_LAYERFS_DAEMON'),
-    containerPrefix: pick('containerPrefix', 'DSH_LAYERFS_CONTAINER_PREFIX'),
-    daemonHost: pick('daemonHost', 'DSH_LAYERFS_DAEMON_HOST'),
-    storeContainer: pick('storeContainer', 'DSH_LAYERFS_STORE_CONTAINER'),
-    bundle: pick('bundle', 'DSH_LAYERFS_BUNDLE'),
-    wslEndpoint: pick('wslEndpoint', 'DSH_LAYERFS_WSL_ENDPOINT'),
-    traceStart: pick('traceStart', 'DSH_LAYERFS_TRACE_START'),
-    syncBaseline: extra.syncBaseline ?? true,
-  }
-  return settings
+  const settings = Object.fromEntries(
+    LAYERFS_SETTING_KEYS.map(([field, key]) => [field, pick(field, key)]),
+  ) as Omit<LayerFSSettings, 'syncBaseline'>
+  if (!settings.project || !settings.sdk) return null
+  return { ...settings, syncBaseline: extra.syncBaseline ?? true }
 }
 
 /**
@@ -1740,255 +1358,56 @@ function moduleUrl(specifier: string): string {
   return specifier
 }
 
-/**
- * Deployment values as the `DSH_LAYERFS_*` environment `@dsh-layerfs/host`
- * publishes for a session, keyed without the prefix.
- */
-export function layerfsDeployment(settings: LayerFSSettings): Record<string, string> {
-  const values: Record<string, string | null | undefined> = {
-    PROJECT: settings.project,
-    SDK: settings.sdk,
-    OPERATOR: settings.operator,
-    CLI: settings.cli,
-    SKILL: settings.skill,
-    HOME: settings.home,
-    STORE_PATH: settings.storePath,
-    DOCKER: settings.docker,
-    IMAGE: settings.image,
-    VOLUME: settings.volume,
-    DAEMON: settings.daemon,
-    CONTAINER_PREFIX: settings.containerPrefix,
-    DAEMON_HOST: settings.daemonHost,
-    STORE_CONTAINER: settings.storeContainer,
-    BUNDLE: settings.bundle,
-    WSL_ENDPOINT: settings.wslEndpoint,
-    TRACE: settings.trace,
-    TRACE_STEP: settings.traceStep,
-    TRACE_START: settings.traceStart,
-  }
-  const result: Record<string, string> = {}
-  for (const [name, value] of Object.entries(values)) {
-    if (typeof value === 'string' && value.length > 0) result[name] = value
-  }
-  return result
-}
+/** The `LAYERFS_*` names `LayerFS.open` reads, and the settings that fill them. */
+const SDK_ENVIRONMENT = [
+  ['LAYERFS_HOME', 'home'],
+  ['LAYERFS_STORE_PATH', 'storePath'],
+  ['LAYERFS_DOCKER', 'docker'],
+  ['LAYERFS_IMAGE', 'image'],
+  ['LAYERFS_VOLUME', 'volume'],
+  ['LAYERFS_DAEMON', 'daemon'],
+  ['LAYERFS_CONTAINER_PREFIX', 'containerPrefix'],
+  ['LAYERFS_DAEMON_HOST', 'daemonHost'],
+  ['LAYERFS_WORKER_ENDPOINT', 'workerEndpoint'],
+  ['LAYERFS_TRACE', 'trace'],
+] as const satisfies ReadonlyArray<readonly [string, keyof LayerFSSettings]>
 
-/** A published environment patch: call it to release, `.activate()` to re-assert. */
-export type EnvironmentLease = (() => void) & { activate: () => void }
-
-interface EnvironmentLeaseEntry {
-  /** The true value before the first lease for this key. */
-  baseline: string | undefined
-  /** Live leases, oldest first; the newest wins. */
-  stack: Array<{ id: symbol; value: string | undefined }>
-}
+/** Opens run one at a time: each one owns `process.env`'s `LAYERFS_*` names while it reads them. */
+let opening: Promise<unknown> = Promise.resolve()
 
 /**
- * Per-target lease stacks.
+ * Open the session's LayerFS project with the SDK it names.
  *
- * Two research batches may run in one process with different LayerFS
- * bindings. A naive save/restore map lets the first batch's release clobber
- * the second batch's variables. A stack keeps each key correct for every live
- * lease and restores the true baseline only when the last lease ends.
+ * `LayerFS.open` takes no options: it reads its deployment from `LAYERFS_*`
+ * once, while the client is made. A `dsh` session publishes the binding as
+ * `DSH_LAYERFS_*` through `ctx.shellEnv`, so the names are set on
+ * `process.env` around the open and restored right after it.
  */
-const ENVIRONMENT_LEASES = new WeakMap<object, Map<string, EnvironmentLeaseEntry>>()
-
-function environmentMap(target: object): Map<string, EnvironmentLeaseEntry> {
-  let map = ENVIRONMENT_LEASES.get(target)
-  if (!map) {
-    map = new Map()
-    ENVIRONMENT_LEASES.set(target, map)
-  }
-  return map
-}
-
-/**
- * Set `patch` on `target` until the returned lease is released.
- *
- * A patch value of `undefined` only *observes* the key: it establishes a lease
- * (so a concurrent release cannot restore over it) without changing the value.
- * `activate()` re-asserts this lease's own values, which lets a caller keep its
- * binding active across another caller's release. Releasing a lease while
- * another one is live makes that other lease's newest value active again, and
- * the true baseline is restored only when the last lease ends.
- */
-export function applyEnvironmentPatch(
-  patch: Array<[string, string | undefined]>,
-  target: NodeJS.ProcessEnv | Record<string, unknown>,
-): EnvironmentLease {
-  const id = Symbol('environment-lease')
-  const leases = environmentMap(target)
-  const touched: string[] = []
-  const values = new Map<string, string>()
-  for (const [key, value] of patch) {
-    let entry = leases.get(key)
-    if (!entry) {
-      entry = { baseline: typeof target[key] === 'string' ? target[key] as string : undefined, stack: [] }
-      leases.set(key, entry)
+export async function loadLayerfs(settings: LayerFSSettings): Promise<LayerFSClient> {
+  const open = opening.then(async () => {
+    const saved = SDK_ENVIRONMENT.map(([name]) => [name, process.env[name]] as const)
+    for (const [name, field] of SDK_ENVIRONMENT) {
+      const value = settings[field]
+      if (typeof value === 'string' && value.length > 0) process.env[name] = value
+      else delete process.env[name]
     }
-    if (!touched.includes(key)) touched.push(key)
-    if (value !== undefined) {
-      const top = entry.stack.at(-1)
-      if (top?.id === id) top.value = value
-      else entry.stack.push({ id, value })
-      values.set(key, value)
-      target[key] = value
-    } else {
-      // Observe-only lease: keep the current effective value visible to the
-      // stack so a concurrent release cannot restore the baseline over it.
-      const top = entry.stack.at(-1)
-      if (top?.id !== id) {
-        entry.stack.push({ id, value: typeof target[key] === 'string' ? target[key] as string : undefined })
-      }
-    }
-  }
-  const activate = (): void => {
-    // Re-assert *this* lease's values: another batch may have changed the
-    // process environment while this one was between SDK calls.
-    for (const [key, value] of values) target[key] = value
-  }
-  const release = ((): void => {
-    for (const key of touched) {
-      const entry = leases.get(key)
-      if (!entry) continue
-      const index = entry.stack.findIndex(lease => lease.id === id)
-      if (index >= 0) entry.stack.splice(index, 1)
-      if (entry.stack.length > 0) {
-        // Another batch is still running: its newest value becomes active.
-        const top = entry.stack.at(-1) as { value: string | undefined }
-        if (top.value === undefined) delete target[key]
-        else target[key] = top.value
-        continue
-      }
-      if (entry.baseline === undefined) delete target[key]
-      else target[key] = entry.baseline
-      leases.delete(key)
-    }
-  }) as EnvironmentLease
-  release.activate = activate
-  return release
-}
-
-function layerfsEnvironmentPatch(settings: LayerFSSettings): Array<[string, string]> {
-  const deployment = layerfsDeployment(settings)
-  const patch: Array<[string, string]> = []
-  for (const [name, value] of Object.entries(deployment)) {
-    patch.push([`DSH_LAYERFS_${name}`, value])
-    if ((SDK_DEPLOYMENT_NAMES as readonly string[]).includes(name)) patch.push([`LAYERFS_${name}`, value])
-  }
-  return patch
-}
-
-/**
- * Publish one session's LayerFS binding on `process.env` until the returned
- * lease is released.
- *
- * The SDK constructor, its ported entry (`@dsh-layerfs/host/src/port/sdk.js`,
- * which reads `DSH_LAYERFS_BUNDLE` at import time) and its ported native
- * binding (`.../port/binding.js`, which reads `DSH_LAYERFS_STORE_CONTAINER`
- * and `DSH_LAYERFS_BUNDLE` on every call) all take deployment settings from
- * the process environment. A `dsh` session publishes them through
- * `ctx.shellEnv` instead, so they have to be mirrored here — and kept until
- * the client closes, never only around construction. Both the `DSH_LAYERFS_`
- * and the bare `LAYERFS_` spelling are set, because the SDK prefers the bare
- * one and a stale bare value would otherwise silently win.
- */
-export function applyLayerfsEnvironment(
-  settings: LayerFSSettings,
-  target: NodeJS.ProcessEnv | Record<string, unknown> = process.env,
-): EnvironmentLease {
-  return applyEnvironmentPatch(layerfsEnvironmentPatch(settings), target)
-}
-
-/**
- * Import the LayerFS SDK and construct its client and optional operator.
- *
- * The resolved binding is published on `process.env` for the whole lifetime
- * of the returned client (release it with `close`), because the ported macOS
- * SDK reads its Store container and bundle from the environment at import
- * time and on every call.
- */
-export async function loadLayerfs(
-  settings: LayerFSSettings,
-): Promise<{ client: LayerFSClient; operator: unknown; close: () => Promise<void>; activate: () => void }> {
-  // The SDK entry chooses its own native binding at import time; `LAYERFS_NATIVE`
-  // is leased (not written) so closing one client cannot restore a stale value
-  // over a concurrent client.
-  const releaseSettings = applyEnvironmentPatch([
-    ...layerfsEnvironmentPatch(settings),
-    ['LAYERFS_NATIVE', process.env.LAYERFS_NATIVE],
-  ], process.env)
-  const release = (): void => {
-    releaseSettings()
-  }
-  let client: LayerFSClient | undefined
-  try {
-    const sdk = await import(moduleUrl(settings.sdk)) as Record<string, unknown> & {
-      default?: Record<string, unknown>
-    }
-    const LayerFS = (sdk.LayerFS ?? sdk.default?.LayerFS) as
-      | (new (project: string, options?: Record<string, unknown>) => LayerFSClient)
-      | undefined
-    if (typeof LayerFS !== 'function') {
-      throw new Error('LayerFS SDK does not export LayerFS: ' + settings.sdk)
-    }
-    const options: Record<string, unknown> = {}
-    if (settings.storePath) options.storePath = settings.storePath
-    if (settings.home) options.home = settings.home
-    if (settings.trace) options.trace = settings.trace
-    if (settings.traceStep) options.traceStep = settings.traceStep
-    client = new LayerFS(settings.project, options)
-    // The SDK snapshots deployment from the environment when constructed; the
-    // client's own options stay authoritative for later calls, so normalise
-    // them as well (a host-injected client has none).
-    const clientOptions = (client as { options?: Record<string, unknown> }).options
-    if (clientOptions) {
-      const deploy = { ...((clientOptions.deploy as Record<string, unknown> | undefined) ?? {}) }
-      const deployment: Record<string, string | null> = {
-        docker: settings.docker,
-        image: settings.image,
-        volume: settings.volume,
-        daemon: settings.daemon,
-        containerPrefix: settings.containerPrefix,
-        daemonHost: settings.daemonHost,
-        storeContainer: settings.storeContainer,
-        bundle: settings.bundle,
-        wslEndpoint: settings.wslEndpoint,
-      }
-      for (const [key, value] of Object.entries(deployment)) {
-        if (typeof value === 'string' && value.length > 0) deploy[key] = value
-      }
-      clientOptions.deploy = deploy
-    }
-    let operator: unknown = null
-    if (settings.operator) {
-      const module = await import(moduleUrl(settings.operator)) as Record<string, unknown> & {
-        default?: Record<string, unknown>
-      }
-      const LayerFSOperator = (module.LayerFSOperator ?? module.default?.LayerFSOperator) as
-        | (new (client: LayerFSClient) => unknown)
-        | undefined
-      if (typeof LayerFSOperator === 'function') operator = new LayerFSOperator(client)
-    }
-    const close = async (): Promise<void> => {
-      try {
-        await client?.close?.()
-      } finally {
-        release()
-      }
-    }
-    return { client, operator, close, activate: releaseSettings.activate }
-  } catch (error) {
-    // A client constructed before the operator failed to load still owns a
-    // Store/native handle: close it before the environment is released.
     try {
-      await client?.close?.()
-    } catch {
-      // The original failure is the one worth reporting.
+      const sdk = await import(moduleUrl(settings.sdk)) as {
+        LayerFS?: { open?: (project: string) => Promise<LayerFSClient> }
+      }
+      if (typeof sdk.LayerFS?.open !== 'function') {
+        throw new Error('LayerFS SDK does not export LayerFS.open: ' + settings.sdk)
+      }
+      return await sdk.LayerFS.open(settings.project)
+    } finally {
+      for (const [name, value] of saved) {
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
     }
-    release()
-    throw error
-  }
+  })
+  opening = open.catch(() => {})
+  return open
 }
 
 /**
@@ -2013,7 +1432,6 @@ export class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
     if (layerfs?.client) {
       return new LayerFSBackend({
         client: layerfs.client,
-        ...(layerfs.operator !== undefined ? { operator: layerfs.operator } : {}),
         project: layerfs.project ?? configured?.project ?? 'auto-research',
         output,
         runId,
@@ -2022,21 +1440,15 @@ export class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
       })
     }
     const settings = resolveLayerfsConfig(env, configured ?? undefined)
-    if (settings) {
-      const loaded = await loadLayerfs(settings)
-      return new LayerFSBackend({
-        client: loaded.client,
-        operator: loaded.operator,
-        project: settings.project,
-        output,
-        runId,
-        syncBaseline: settings.syncBaseline,
-        ownsClient: true,
-        releaseEnvironment: loaded.close,
-        activateEnvironment: loaded.activate,
-      })
-    }
-    return null
+    if (!settings) return null
+    return new LayerFSBackend({
+      client: await loadLayerfs(settings),
+      project: settings.project,
+      output,
+      runId,
+      syncBaseline: settings.syncBaseline,
+      ownsClient: true,
+    })
   }
 }
 

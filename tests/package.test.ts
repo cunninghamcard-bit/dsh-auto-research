@@ -219,15 +219,10 @@ describe('package metadata', () => {
     assert.match(e2e, /ctx\.shellEnv\.collect\(/)
     assert.match(e2e, /\.register\(contributor\)/)
     assert.match(e2e, /callId: 'bash-1'|callId,/)
-    // The daemon wrapper's build context is unique and always removed.
-    assert.match(e2e, /mkdtempSync\(join\(tmpdir\(\), 'dsh-ar-e2e-runtime-'\)\)/)
-    assert.match(e2e, /rmSync\(context, \{ recursive: true, force: true \}\)/)
-    assert.doesNotMatch(e2e, /mkdirSync\(join\(tmpdir\(\), 'dsh-ar-e2e-runtime'\)/)
-    // Cleanup removes containers by prefix AND by volume, then retries the
-    // volume removal.
+    // Cleanup removes the project through the runtime (its volume and
+    // Sandboxes), then every container left with the run's prefix.
+    assert.match(e2e, /runtime\.project\.remove\(project, \{ confirm: project, stopSandboxes: true \}\)/)
     assert.match(e2e, /`name=\$\{prefix\}`/)
-    assert.match(e2e, /`volume=\$\{volume\}`/)
-    assert.match(e2e, /for \(let attempt = 0; attempt < 3; attempt \+= 1\)/)
     const support = await readFile(join(root, 'tests/e2e-support.ts'), 'utf8')
     assert.match(support, /execFileSync\('docker', \['-H', `unix:\/\/\$\{LAYERFS_DOCKER\}`, 'version'/)
   })

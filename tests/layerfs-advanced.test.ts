@@ -16,32 +16,39 @@ const SANDBOX_PATH = `/workspaces/auto-research-${process.pid}`
 
 function sandboxClient(
   actions: any[],
-  { path = SANDBOX_PATH, apply = true }: { path?: string; apply?: boolean } = {},
+  { path = SANDBOX_PATH }: { path?: string } = {},
 ): any {
-  const client: any = {
+  return {
     branch: {
       async fork(name: any, from: any) {
         actions.push(['fork', name, from])
       },
     },
+    sandbox: {
+      async create() {
+        return { sandbox: 'sandbox-1', image: 'sha256:image' }
+      },
+      async list_workspaces() {
+        return { items: [{ path, changed: false, headMovedSinceMount: false }] }
+      },
+    },
     workspace: {
-      async mount(name: any) {
+      async mount(sandbox: any, name: any) {
         actions.push(['mount', name])
-        return { sandbox: 'sandbox-1', path }
+        return { sandbox, path }
       },
       async commit(handle: any, message: any) {
         actions.push(['commit', handle.sandbox, message])
+        return { kind: 'Committed' }
       },
       async unmount(handle: any, discard: any) {
         actions.push(['unmount', handle.sandbox, discard])
       },
+      async exec() {
+        return { exitCode: 1, stdout: null }
+      },
     },
-    async close() {
-      actions.push(['close'])
-    },
-  }
-  if (apply) {
-    client.fs = {
+    fs: {
       async apply(branch: any, changes: any[], message: any) {
         actions.push([
           'apply',
@@ -49,23 +56,22 @@ function sandboxClient(
           changes.map((change: any) => ({
             op: change.op,
             path: change.path,
-            content: change.content === undefined ? undefined : Buffer.from(change.content).toString('utf8'),
+            content: change.content ?? (change.bytes === undefined ? undefined : Buffer.from(change.bytes).toString('utf8')),
           })),
           message,
         ])
       },
-    }
-  } else {
-    client.fs = {
-      async write(branch: any, path: any, content: any) {
-        actions.push(['write', branch, path, Buffer.from(content).toString('utf8')])
+      async list() {
+        return { items: [], hasMore: false }
       },
-      async rm(branch: any, path: any) {
-        actions.push(['rm', branch, path])
+      async read() {
+        throw Object.assign(new Error('missing'), { code: 'NoSuchPath' })
       },
-    }
+    },
+    async close() {
+      actions.push(['close'])
+    },
   }
-  return client
 }
 
 describe('withBusyRetry', () => {
@@ -133,7 +139,7 @@ describe('LayerFS branch names and adoption', () => {
 })
 
 describe('Sandbox-internal mounting bridge', () => {
-  it('stages a host copy and publishes writes/deletes with fs.apply plus workspace.commit', async () => {
+  it('stages a host copy and publishes writes/deletes with fs.apply', async () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
@@ -153,7 +159,6 @@ describe('Sandbox-internal mounting bridge', () => {
       const baselineApply = actions.find(action => action[0] === 'apply')
       assert.ok(baselineApply)
       assert.deepEqual(baselineApply[2].map((change: any) => change.path).sort(), ['/notes.md', '/state.json'])
-      assert.ok(actions.some(action => action[0] === 'commit' && action[2] === 'auto-research: baseline initial'))
 
       await setState(state.path, { score: 9, metrics: { score: 9 } })
       await writeFile(join(state.path, 'extra.txt'), 'new evidence\n')
@@ -167,29 +172,9 @@ describe('Sandbox-internal mounting bridge', () => {
       assert.deepEqual(apply[2].filter((change: any) => change.op === 'rm').map((change: any) => change.path), ['/notes.md'])
       const stateWrite = apply[2].find((change: any) => change.path === '/state.json')
       assert.match(stateWrite.content, /"score": 9/)
-      assert.ok(actions.some(action => action[0] === 'commit'))
 
       await backend.release(state)
       assert.deepEqual(actions.at(-1), ['unmount', 'sandbox-1', false])
-    })
-  })
-
-  it('falls back to fs.write/fs.rm when fs.apply is unavailable', async () => {
-    await withTemp(async root => {
-      const source = join(root, 'source')
-      await writeWorkspace(source)
-      const actions: any[] = []
-      const backend = new LayerFSBackend({
-        client: sandboxClient(actions, { apply: false }),
-        output: join(root, 'out'),
-        runId: 'run-2',
-        retryBaseDelayMs: 1,
-      })
-      const state = await backend.baseline(source, 'initial')
-      const writes = actions.filter(action => action[0] === 'write').map(action => action[2]).sort()
-      assert.deepEqual(writes, ['/notes.md', '/state.json'])
-      await backend.commit(state, { message: 'second' })
-      assert.ok(actions.some(action => action[0] === 'commit'))
     })
   })
 
@@ -199,7 +184,7 @@ describe('Sandbox-internal mounting bridge', () => {
       const client = sandboxClient(actions)
       client.fs.list = async (branch: string, path: string) => {
         if (path === '/') {
-          return { items: [{ name: 'state.json', type: 'file' }, { name: 'RESEARCH_CONTEXT', type: 'directory' }], hasMore: false }
+          return { items: [{ name: 'state.json', type: 'file' }, { name: 'RESEARCH_CONTEXT', type: 'dir' }], hasMore: false }
         }
         if (path === '/RESEARCH_CONTEXT') {
           return { items: [{ name: 'topic__m__r__verified.md', type: 'file' }], hasMore: false }
@@ -207,8 +192,8 @@ describe('Sandbox-internal mounting bridge', () => {
         return { items: [], hasMore: false }
       }
       client.fs.read = async (branch: string, path: string) => {
-        if (path === '/state.json') return '{"score":4}\n'
-        if (path.endsWith('.md')) return '# topic\n'
+        if (path === '/state.json') return { text: '{"score":4}\n', nextLine: null }
+        if (path.endsWith('.md')) return { text: '# topic\n', nextLine: null }
         throw new Error('missing')
       }
       const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-3', retryBaseDelayMs: 1 })
@@ -216,15 +201,6 @@ describe('Sandbox-internal mounting bridge', () => {
       assert.equal(state.staging, true)
       assert.equal(await readFile(join(state.path, 'state.json'), 'utf8'), '{"score":4}\n')
       assert.equal(await readFile(join(state.path, 'RESEARCH_CONTEXT', 'topic__m__r__verified.md'), 'utf8'), '# topic\n')
-    })
-  })
-
-  it('refuses to adopt a Sandbox branch it cannot list', async () => {
-    await withTemp(async root => {
-      const client = sandboxClient([])
-      delete client.fs.list
-      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-4', retryBaseDelayMs: 1 })
-      await assert.rejects(backend.adopt('ar-run-1-leader', 'initial'), /has no fs\.list\/fs\.read/)
     })
   })
 
@@ -255,189 +231,38 @@ describe('Sandbox-internal mounting bridge', () => {
   })
 })
 
-describe('loadLayerfs deployment binding', () => {
-  it('mirrors ctx.shellEnv deployment settings onto the SDK client options', async () => {
+describe('LayerFS project binding', () => {
+  it('names the missing project instead of forking from nothing', async () => {
     await withTemp(async root => {
-      const sdk = join(root, 'sdk.mjs')
-      await writeFile(sdk, `
-export class LayerFS {
-  constructor(project, options) {
-    this.projectName = project
-    this.options = { ...options, deploy: {} }
-  }
-  async close() {}
-}
-`)
-      const settings = resolveLayerfsConfig({
-        DSH_LAYERFS_PROJECT: 'proj',
-        DSH_LAYERFS_SDK: sdk,
-        DSH_LAYERFS_STORE_PATH: '/store',
-        DSH_LAYERFS_HOME: '/home',
-        DSH_LAYERFS_DOCKER: '/docker.sock',
-        DSH_LAYERFS_IMAGE: 'image:test',
-        DSH_LAYERFS_VOLUME: 'volume',
-        DSH_LAYERFS_DAEMON: 'daemon',
-        DSH_LAYERFS_CONTAINER_PREFIX: 'prefix',
-        DSH_LAYERFS_DAEMON_HOST: 'host.docker.internal',
-      })!
-      const { loadLayerfs } = await import('../lib/layerfs-workspace.js')
-      const loaded: any = await loadLayerfs(settings)
-      assert.equal(loaded.client.projectName, 'proj')
-      assert.equal(loaded.client.options.storePath, '/store')
-      assert.equal(loaded.client.options.home, '/home')
-      assert.deepEqual(loaded.client.options.deploy, {
-        docker: '/docker.sock',
-        image: 'image:test',
-        volume: 'volume',
-        daemon: 'daemon',
-        containerPrefix: 'prefix',
-        daemonHost: 'host.docker.internal',
-      })
+      const source = join(root, 'source')
+      await writeWorkspace(source)
+      const client = sandboxClient([])
+      client.branch.fork = async () => { throw Object.assign(new Error('no project'), { code: 'NoSuchProject' }) }
+      const backend = new LayerFSBackend({ client, project: 'demo', output: join(root, 'out'), retryBaseDelayMs: 1 })
+      await assert.rejects(backend.baseline(source, 'initial'), /LayerFS project demo does not exist; import the checkout in dsh/)
     })
   })
-})
 
-describe('ported SDK environment forwarding', () => {
-  it('publishes every DSH_LAYERFS_* setting while a client is alive and restores the process after', async () => {
+  it('makes a new Sandbox when the current one closed itself', async () => {
     await withTemp(async root => {
-      const sdk = join(root, 'port-sdk.mjs')
-      await writeFile(sdk, `
-// A stand-in for @dsh-layerfs/host/src/port/sdk.js: it reads the bundle at
-// import time and the Store container on every call.
-const bundleAtImport = process.env.DSH_LAYERFS_BUNDLE ?? null
-export class LayerFS {
-  constructor(project, options) {
-    this.projectName = project
-    this.options = { ...options, deploy: {} }
-    this.bundleAtImport = bundleAtImport
-    this.lastCall = null
-  }
-  async call() {
-    this.lastCall = {
-      storeContainer: process.env.DSH_LAYERFS_STORE_CONTAINER ?? null,
-      bareStoreContainer: process.env.LAYERFS_STORE_CONTAINER ?? null,
-      bundle: process.env.DSH_LAYERFS_BUNDLE ?? null,
-      daemonHost: process.env.DSH_LAYERFS_DAEMON_HOST ?? null,
-    }
-    return this.lastCall
-  }
-  async close() {}
-}
-`)
-      const settings = resolveLayerfsConfig({
-        DSH_LAYERFS_PROJECT: 'proj',
-        DSH_LAYERFS_SDK: sdk,
-        DSH_LAYERFS_HOME: '/home',
-        DSH_LAYERFS_DOCKER: '/orbstack/docker.sock',
-        DSH_LAYERFS_IMAGE: 'sha256:abc',
-        DSH_LAYERFS_VOLUME: 'volume',
-        DSH_LAYERFS_DAEMON: '/bundle/layerfs-daemon',
-        DSH_LAYERFS_CONTAINER_PREFIX: 'prefix-',
-        DSH_LAYERFS_DAEMON_HOST: 'host.docker.internal',
-        DSH_LAYERFS_STORE_CONTAINER: 'prefix-store',
-        DSH_LAYERFS_BUNDLE: '/bundle',
-        DSH_LAYERFS_TRACE_START: '1',
-      })!
-      assert.equal(settings.storeContainer, 'prefix-store')
-      assert.equal(settings.bundle, '/bundle')
-      assert.equal(settings.traceStart, '1')
-      const env = layerfsEnvironment({}, settings)
-      assert.equal(env.DSH_LAYERFS_STORE_CONTAINER, 'prefix-store')
-      assert.equal(env.DSH_LAYERFS_BUNDLE, '/bundle')
-
-      const previous = {
-        DSH_LAYERFS_STORE_CONTAINER: process.env.DSH_LAYERFS_STORE_CONTAINER,
-        LAYERFS_STORE_CONTAINER: process.env.LAYERFS_STORE_CONTAINER,
-        DSH_LAYERFS_BUNDLE: process.env.DSH_LAYERFS_BUNDLE,
-        LAYERFS_NATIVE: process.env.LAYERFS_NATIVE,
-      }
-      delete process.env.DSH_LAYERFS_STORE_CONTAINER
-      delete process.env.LAYERFS_STORE_CONTAINER
-      delete process.env.DSH_LAYERFS_BUNDLE
-      const { loadLayerfs } = await import('../lib/layerfs-workspace.js')
-      const loaded: any = await loadLayerfs(settings)
-      assert.equal(loaded.client.bundleAtImport, '/bundle', 'the bundle is visible at import time')
-      assert.deepEqual(await loaded.client.call(), {
-        storeContainer: 'prefix-store',
-        bareStoreContainer: 'prefix-store',
-        bundle: '/bundle',
-        daemonHost: 'host.docker.internal',
-      })
-      await loaded.close()
-      assert.equal(process.env.DSH_LAYERFS_STORE_CONTAINER, undefined)
-      assert.equal(process.env.LAYERFS_STORE_CONTAINER, undefined)
-      assert.equal(process.env.DSH_LAYERFS_BUNDLE, undefined)
-      for (const [name, value] of Object.entries(previous)) {
-        if (value === undefined) delete process.env[name]
-        else process.env[name] = value
-      }
-    })
-  })
-})
-
-describe('LayerFS project initialization', () => {
-  it('initializes a missing project before forking its main branch', async () => {
-    await withTemp(async root => {
-      const home = join(root, 'home')
       const source = join(root, 'source')
       await writeWorkspace(source)
       const actions: any[] = []
-      const client = {
-        options: { home, deploy: {} },
-        project: {
-          async init(path: string) {
-            actions.push(['init', path])
-            // project.init records the project as a directory under the home
-            await mkdir(join(home, 'proj'), { recursive: true })
-            return { kind: 'Initialized' }
-          },
-        },
-        branch: {
-          async fork(name: string, from: string | undefined) {
-            actions.push(['fork', name, from])
-            if (!existsSync(join(home, 'proj'))) throw Object.assign(new Error('project proj does not exist'), { code: 'NoSuchProject' })
-          },
-        },
-        workspace: {
-          async mount(branch: string) { return { sandbox: '1', path: `/workspaces/${branch}` } },
-          async commit() {},
-          async unmount() {},
-        },
-        fs: { async apply() {} },
+      const client = sandboxClient(actions)
+      let made = 0
+      client.sandbox.create = async () => ({ sandbox: String(++made), image: 'sha256:image' })
+      const mount = client.workspace.mount
+      client.workspace.mount = async (sandbox: string, name: string) => {
+        if (sandbox === '1' && name.endsWith('child')) {
+          throw Object.assign(new Error('Sandbox 1 is not running'), { code: 'NoSuchSandbox' })
+        }
+        return mount(sandbox, name)
       }
-      const backend = new LayerFSBackend({ client, project: 'proj', output: join(root, 'out'), runId: 'run-9' })
-      const state = await backend.baseline(source, 'initial')
-      assert.equal(state.branch, 'ar-run-9-initial')
-      assert.deepEqual(actions, [
-        ['init', source],
-        ['fork', 'ar-run-9-initial', 'main'],
-      ])
-    })
-  })
-
-  it('does not initialize a project whose home entry already exists', async () => {
-    await withTemp(async root => {
-      const home = join(root, 'home')
-      await mkdir(join(home, 'proj'), { recursive: true })
-      // A non-empty entry is a real project; only an empty leftover is removed.
-      await writeFile(join(home, 'proj', 'owner'), 'layerfs\n')
-      const source = join(root, 'source')
-      await writeWorkspace(source)
-      const actions: any[] = []
-      const client = {
-        options: { home },
-        project: { async init() { actions.push('init') } },
-        branch: { async fork(name: string) { actions.push(['fork', name]) } },
-        workspace: {
-          async mount() { return { sandbox: '1', path: '/workspaces/1' } },
-          async commit() {},
-          async unmount() {},
-        },
-        fs: { async apply() {} },
-      }
-      const backend = new LayerFSBackend({ client, project: 'proj', output: join(root, 'out'), runId: 'run-10' })
-      await backend.baseline(source, 'initial')
-      assert.deepEqual(actions, [['fork', 'ar-run-10-initial']])
+      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-6', retryBaseDelayMs: 1 })
+      const base = await backend.baseline(source, 'initial')
+      const child = await backend.fork(base, 'child')
+      assert.equal(made, 2)
+      assert.equal((child.handle as any).sandbox, '2')
     })
   })
 })

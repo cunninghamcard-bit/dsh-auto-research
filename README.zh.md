@@ -177,9 +177,9 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
 
 ## LayerFS 集成
 
-存在 `DSH_LAYERFS_PROJECT` 与 `DSH_LAYERFS_SDK`（或 `config.layerfs` 提供）时，分支使用 `branch.fork`、`workspace.mount`、`workspace.commit` 与 `workspace.unmount`。`Busy` 拒绝会以指数退避重试；分支名保持在 63 字符以内；被采用的分支名会先校验。验证通过的状态会提交，并以其 LayerFS 分支作为检查点；已完成的科学拒绝分支会以 `rejected` 提交并以 `discard: false` 卸载，保留在 LayerFS 历史中；provider 失败与超时的工作会作为未验证状态提交并保留以供审阅。没有绑定项目时 `layerfs` 工厂返回 null，`auto` 选择落到 `snapshot` 后端（全量拷贝与内容寻址检查点对象）。核心自身不注册任何后端：没有可用后端时批次失败，错误信息列出已注册的后端。第三方后端从 `dsh-auto-research/api` 引入类型与共享工具，inject `researchWorkspace`，并调用 `ctx.researchWorkspace.register({ name, priority, create })`。
+存在 `DSH_LAYERFS_PROJECT` 与 `DSH_LAYERFS_SDK`（或 `config.layerfs` 提供）时，分支使用 `branch.fork`、`sandbox.create`、`workspace.mount(sandbox, branch)`、`workspace.commit` 与 `workspace.unmount`。每个批次按需创建一个 Sandbox；该 Sandbox 已自行关闭（`NoSuchSandbox`）或已满（`Capacity`，16 个挂载）时，在新 Sandbox 中重试一次挂载。`Busy` 拒绝会以指数退避重试；分支名保持在 63 字符以内；被采用的分支名会先校验。验证通过的状态会提交，并以其 LayerFS 分支作为检查点；已完成的科学拒绝分支会以 `rejected` 提交并以 `discard: false` 卸载，保留在 LayerFS 历史中；provider 失败与超时的工作会作为未验证状态提交并保留以供审阅。没有绑定项目时 `layerfs` 工厂返回 null，`auto` 选择落到 `snapshot` 后端（全量拷贝与内容寻址检查点对象）。核心自身不注册任何后端：没有可用后端时批次失败，错误信息列出已注册的后端。第三方后端从 `dsh-auto-research/api` 引入类型与共享工具，inject `researchWorkspace`，并调用 `ctx.researchWorkspace.register({ name, priority, create })`。
 
-真实 LayerFS 挂载返回 Sandbox 内部路径（如 `/workspaces/1`）。当该路径在宿主上不可访问时，后端在 `<run>/<branch>/workspace` 暂存宿主副本，并在该副本上执行评估与 worker，同时在提交时用 `client.fs.apply`（或 `fs.write`/`fs.rm`）发布新增/修改/删除的文件，再调用 `workspace.commit`。冻结基线后会重新挂载分支，使 Sandbox 内的 `/workspaces/<n>` 与宿主暂存副本一致；worker 轮次结束后会把已提交的 Sandbox 覆盖层同步回宿主副本再评估。`fs.read` 无法表示的二进制文件通过 `workspace.exec` + `base64` 原样复制，无法复制时标记为跳过且绝不会被误删。worker 还会收到 `DSH_AUTO_RESEARCH_BRANCH` 与 `DSH_AUTO_RESEARCH_SANDBOX_PATH`。
+真实 LayerFS 挂载返回 Sandbox 内部路径（如 `/workspaces/1`）。当该路径在宿主上不可访问时，后端在 `<run>/<branch>/workspace` 暂存宿主副本，并在该副本上执行评估与 worker，同时在提交时用一次 `client.fs.apply`（先建父目录，再写入，最后删除）发布新增/修改/删除的文件，再调用 `workspace.commit`。冻结基线后会重新挂载分支，使 Sandbox 内的 `/workspaces/<n>` 与宿主暂存副本一致；worker 轮次结束后会把已提交的 Sandbox 覆盖层同步回宿主副本再评估。`fs.read` 无法表示的二进制文件通过 `workspace.exec` + `base64` 原样复制，无法复制时标记为跳过且绝不会被误删。worker 还会收到 `DSH_AUTO_RESEARCH_BRANCH` 与 `DSH_AUTO_RESEARCH_SANDBOX_PATH`。
 
 宿主暂存副本是唯一写入方，Sandbox 挂载只用于执行。worker 返回后，`reconcile` 先把 Sandbox overlay 的改动提交进分支历史，再把两边与暂存副本的初始清单比较：只有 Sandbox 改动时合并回宿主副本；只有宿主改动时由提交发布；两边都改动时分支判为无效（`workspace conflict: host and sandbox both modified: <路径>`），不评估，并以 `rejected` 提交，两边的改动都留在分支历史中。
 
@@ -187,7 +187,7 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
 
 符号链接在清单中记为 `symlink:<链接文本>`，不跟随。snapshot 复制时原样重建；已完成状态的检查点记在 `links` 中；暂存的 LayerFS 分支只在宿主副本保留链接（SDK 不能写入链接），并列入 `skippedFiles`。
 
-provider 从 `config.layerfs`、`process.env` 与会话的 `ctx.shellEnv` contributor 解析 `DSH_LAYERFS_PROJECT`、`DSH_LAYERFS_SDK`、`DSH_LAYERFS_OPERATOR`、`DSH_LAYERFS_CLI`、`DSH_LAYERFS_SKILL`、`DSH_LAYERFS_HOME`、`DSH_LAYERFS_STORE_PATH`、`DSH_LAYERFS_DOCKER`、`DSH_LAYERFS_IMAGE`、`DSH_LAYERFS_VOLUME`、`DSH_LAYERFS_DAEMON`、`DSH_LAYERFS_CONTAINER_PREFIX`、`DSH_LAYERFS_DAEMON_HOST`、`DSH_LAYERFS_STORE_CONTAINER`、`DSH_LAYERFS_BUNDLE`、`DSH_LAYERFS_WSL_ENDPOINT`、`DSH_LAYERFS_TRACE`、`DSH_LAYERFS_TRACE_STEP` 与 `DSH_LAYERFS_TRACE_START`。显式 `config.layerfs` 优先；宿主注入的 `layerfs.client` 从不由本插件关闭。
+provider 从 `config.layerfs`、`process.env` 与会话的 `ctx.shellEnv` contributor（由 dsh-layerfs 的 `@dsh-layerfs/host` 发布）解析 `DSH_LAYERFS_PROJECT`、`DSH_LAYERFS_SDK`、`DSH_LAYERFS_BACKEND`、`DSH_LAYERFS_CLI`、`DSH_LAYERFS_SKILL`、`DSH_LAYERFS_HOME`、`DSH_LAYERFS_STORE_PATH`、`DSH_LAYERFS_DOCKER`、`DSH_LAYERFS_IMAGE`、`DSH_LAYERFS_VOLUME`、`DSH_LAYERFS_DAEMON`、`DSH_LAYERFS_CONTAINER_PREFIX`、`DSH_LAYERFS_DAEMON_HOST`、`DSH_LAYERFS_WORKER_ENDPOINT`、`DSH_LAYERFS_TRACE`、`DSH_LAYERFS_TRACE_STEP` 与 `DSH_LAYERFS_TRACE_START`。显式 `config.layerfs` 优先；宿主注入的 `layerfs.client` 从不由本插件关闭。LayerFS 1.1 的 `LayerFS.open(project)` 不接受参数，只在打开时读取一次 `LAYERFS_*`，因此插件在打开期间把对应的 `LAYERFS_*` 写入 `process.env`，打开后恢复。macOS 上 `DSH_LAYERFS_WORKER_ENDPOINT` 指向 `@layerfs/runtime` 启动的 worker 容器。项目必须事先存在：在 dsh 中导入该 checkout（项目标签 → Import project…）或调用 `POST /layerfs/init`；项目不存在时批次失败并给出这条指引。
 
 ## Colab GPU 评估
 

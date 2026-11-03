@@ -129,8 +129,13 @@ function hostLayerfs(root: string, actions: any[]): any {
         await mkdir(join(mounts, name), { recursive: true })
       },
     },
+    sandbox: {
+      async create() {
+        return { sandbox: '1', image: 'sha256:image' }
+      },
+    },
     workspace: {
-      async mount(name: string) {
+      async mount(_sandbox: string, name: string) {
         actions.push(['mount', name])
         const path = join(mounts, name)
         await mkdir(path, { recursive: true })
@@ -138,6 +143,7 @@ function hostLayerfs(root: string, actions: any[]): any {
       },
       async commit(handle: any, message: string) {
         actions.push(['commit', handle.sandbox, message])
+        return { kind: 'Committed' }
       },
       async unmount(handle: any, discard: boolean) {
         actions.push(['unmount', handle.sandbox, discard])
