@@ -8,6 +8,7 @@
  */
 import { AutoResearchProvider } from './provider.js';
 import { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js';
+import { RUN_ENV_VARIABLES } from './run-server.js';
 import { registerSkills } from './skills.js';
 export const name = 'dsh-auto-research';
 export const inject = ['subagents', 'skills'];
@@ -36,13 +37,22 @@ export function apply(ctx, config = {}) {
         subagents: ctx.subagents,
         ...(ctx.logger ? { logger: ctx.logger } : {}),
     };
+    const provider = new AutoResearchProvider(host, config, workspaces, executors);
+    // Running workers' bash calls get the research-run CLI, endpoint and token.
+    ctx.inject(['shellEnv'], inner => {
+        const shellEnv = inner.shellEnv;
+        inner.effect(() => shellEnv.register({
+            name: 'auto-research',
+            variables: { ...RUN_ENV_VARIABLES },
+            resolve: execution => provider.runs.environment(typeof execution.agent?.id === 'string' ? execution.agent.id : null),
+        }));
+    });
     for (const service of ['llm', 'shellEnv']) {
         ctx.inject([service], inner => {
             host[service] = inner[service];
             inner.effect(() => () => { delete host[service]; });
         });
     }
-    const provider = new AutoResearchProvider(host, config, workspaces, executors);
     const skills = registerSkills(ctx.skills, cwd => provider.workers.ownsCwd(cwd));
     provider.workers.onChange = skills.invalidate;
     ctx.effect(() => host.subagents.registerProvider(provider));

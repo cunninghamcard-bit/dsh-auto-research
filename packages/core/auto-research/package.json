@@ -15,7 +15,15 @@
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./locale/*.json": "./locale/*.json"
   },
-  "files": ["lib", "src", "icon.svg", "cordis.patch.yml", "locale", "skills"],
+  "files": [
+    "lib",
+    "bin",
+    "src",
+    "icon.svg",
+    "cordis.patch.yml",
+    "locale",
+    "skills"
+  ],
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit"
@@ -26,7 +34,17 @@
     "dsh-auto-research-executor-local": "workspace:*",
     "dsh-auto-research-executor-colab": "workspace:*"
   },
-  "keywords": ["dsh", "deepseek-harness", "cordis", "subagent", "research", "rsi-top", "fork-and-flush", "layerfs", "auto-research"],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "subagent",
+    "research",
+    "rsi-top",
+    "fork-and-flush",
+    "layerfs",
+    "auto-research"
+  ],
   "license": "MIT",
   "engines": {
     "node": ">=22.19.0",

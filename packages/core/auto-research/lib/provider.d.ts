@@ -6,6 +6,7 @@
  */
 import type { Config } from './plan.js';
 import type { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js';
+import { WorkerRunServer } from './run-server.js';
 import { ActiveWorkers } from './runner.js';
 import type { ProviderContext, ResearchPlanInput, SubagentProvider, SubagentRun, SubagentStartRequest } from './types.js';
 /** The plugin configuration. */
@@ -29,6 +30,7 @@ export declare class AutoResearchProvider implements SubagentProvider {
     }>;
     readonly inheritsParentContext = false;
     readonly workers: ActiveWorkers;
+    readonly runs: WorkerRunServer;
     constructor(ctx: ProviderContext, config: ProviderConfig, workspaces: ResearchWorkspaceRegistry, executors: ResearchExecutorRegistry);
     /**
      * The worker provider: one whose children can be continued (an in-process

@@ -222,6 +222,8 @@ export interface SubagentsService {
   startActivation: (spec: {
     provider: string
     label: string
+    /** A reserved session id, for a local (continuable) provider. */
+    childId?: string
     request: { cwd: string; prompt: ContentBlock[]; parent: unknown; agentOptions?: WorkerAgentOptions }
     signal: AbortSignal
     delivery: 'caller'

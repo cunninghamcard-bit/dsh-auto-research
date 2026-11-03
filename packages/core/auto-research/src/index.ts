@@ -11,6 +11,7 @@ import type { PluginContext } from 'dsh-auto-research-api'
 import { AutoResearchProvider } from './provider.js'
 import type { ProviderConfig } from './provider.js'
 import { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js'
+import { RUN_ENV_VARIABLES } from './run-server.js'
 import { registerSkills } from './skills.js'
 import type { ProviderContext } from './types.js'
 
@@ -41,13 +42,28 @@ export function apply(ctx: PluginContext, config: ProviderConfig = {}): void {
     subagents: ctx.subagents as ProviderContext['subagents'],
     ...(ctx.logger ? { logger: ctx.logger } : {}),
   }
+  const provider = new AutoResearchProvider(host, config, workspaces, executors)
+  // Running workers' bash calls get the research-run CLI, endpoint and token.
+  ctx.inject(['shellEnv'], inner => {
+    const shellEnv = inner.shellEnv as {
+      register: (contributor: {
+        name: string
+        variables: Record<string, { description: string }>
+        resolve: (execution: { agent?: { id?: unknown } }) => Record<string, string>
+      }) => () => void
+    }
+    inner.effect(() => shellEnv.register({
+      name: 'auto-research',
+      variables: { ...RUN_ENV_VARIABLES },
+      resolve: execution => provider.runs.environment(typeof execution.agent?.id === 'string' ? execution.agent.id : null),
+    }))
+  })
   for (const service of ['llm', 'shellEnv'] as const) {
     ctx.inject([service], inner => {
       host[service] = inner[service] as never
       inner.effect(() => () => { delete host[service] })
     })
   }
-  const provider = new AutoResearchProvider(host, config, workspaces, executors)
   const skills = registerSkills(ctx.skills!, cwd => provider.workers.ownsCwd(cwd))
   provider.workers.onChange = skills.invalidate
   ctx.effect(() => host.subagents.registerProvider(provider))

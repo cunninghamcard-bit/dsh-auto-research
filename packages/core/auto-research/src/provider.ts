@@ -12,6 +12,7 @@ import type { ExecutorBackend, WorkspaceBackend } from 'dsh-auto-research-api'
 import { normalizeOptions, resolveWorkerAgentOptions, validatePlan } from './plan.js'
 import type { Config } from './plan.js'
 import type { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js'
+import { WorkerRunServer } from './run-server.js'
 import { ActiveWorkers, ResearchStoppedError, Runner } from './runner.js'
 import type {
   ContentBlock,
@@ -74,6 +75,7 @@ export class AutoResearchProvider implements SubagentProvider {
   readonly capabilities = Object.freeze({ agentOptions: true, agentPreset: false, outputSchema: false, depthLimit: false })
   readonly inheritsParentContext = false
   readonly workers = new ActiveWorkers()
+  readonly runs = new WorkerRunServer()
 
   constructor(
     readonly ctx: ProviderContext,
@@ -181,6 +183,7 @@ export class AutoResearchProvider implements SubagentProvider {
       workerProvider,
       workerAgentOptions,
       workers: this.workers,
+      runs: this.runs,
       ...(request.signal ? { signal: request.signal } : {}),
       ...(this.ctx.logger ? { logger: this.ctx.logger } : {}),
     })

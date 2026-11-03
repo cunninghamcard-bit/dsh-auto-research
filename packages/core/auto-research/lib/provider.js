@@ -8,6 +8,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fsp from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { normalizeOptions, resolveWorkerAgentOptions, validatePlan } from './plan.js';
+import { WorkerRunServer } from './run-server.js';
 import { ActiveWorkers, ResearchStoppedError, Runner } from './runner.js';
 /** Where the coordinator's runs and `LATEST.json` live, relative to its cwd. */
 const RUNTIME_DIR = '.auto-research-methods';
@@ -51,6 +52,7 @@ export class AutoResearchProvider {
     capabilities = Object.freeze({ agentOptions: true, agentPreset: false, outputSchema: false, depthLimit: false });
     inheritsParentContext = false;
     workers = new ActiveWorkers();
+    runs = new WorkerRunServer();
     constructor(ctx, config, workspaces, executors) {
         this.ctx = ctx;
         this.config = config;
@@ -156,6 +158,7 @@ export class AutoResearchProvider {
             workerProvider,
             workerAgentOptions,
             workers: this.workers,
+            runs: this.runs,
             ...(request.signal ? { signal: request.signal } : {}),
             ...(this.ctx.logger ? { logger: this.ctx.logger } : {}),
         });

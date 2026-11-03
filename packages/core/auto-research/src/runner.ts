@@ -8,6 +8,7 @@
  * batch executor.
  */
 
+import { randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
 import { basename, join } from 'node:path'
 import type {
@@ -17,6 +18,7 @@ import type {
   WorkspaceBackend,
 } from 'dsh-auto-research-api'
 import { scoreValue } from './plan.js'
+import type { WorkerRunServer } from './run-server.js'
 import { sampleMetricViews, validatePortfolio } from './protocols.js'
 import { branchFile, buildContinueMessage, buildWorkerPrompt } from './skills.js'
 import type {
@@ -91,6 +93,8 @@ export interface RunnerDeps {
   workerProvider: string
   workerAgentOptions: WorkerAgentOptions | null
   workers: ActiveWorkers
+  /** Serves `research-run` requests of running workers. */
+  runs: WorkerRunServer
   signal?: AbortSignal
   logger?: Logger
   rng?: () => number
@@ -299,9 +303,13 @@ export class Runner {
     })
     const passOptions = this.deps.workerAgentOptions
       && this.deps.subagents.getProvider(this.deps.workerProvider)?.capabilities.agentOptions === true
+    // A reserved session id lets the worker's very first bash call reach research-run.
+    const childId = randomUUID()
+    const unregister = await this.deps.runs.register(childId, this.workerRun(ref.branch, folder, seconds))
     const activation = await this.deps.subagents.startActivation({
       provider: this.deps.workerProvider,
       label: `${this.deps.runId.slice(0, 8)}:${id}`,
+      childId,
       request: {
         cwd: scratch,
         prompt: [{ type: 'text', text: prompt }],
@@ -310,8 +318,11 @@ export class Runner {
       },
       signal: this.abort.signal,
       delivery: 'caller',
+    }).catch((error: unknown) => {
+      unregister()
+      throw error
     })
-    return this.settle({ activation, parent, id, phase, ref, scratch, folder, seconds, portfolio: rsiTop })
+    return this.settle({ activation, unregister, parent, id, phase, ref, scratch, folder, seconds, portfolio: rsiTop })
   }
 
   private async resumeWorker(leader: TrajectoryRow, id: string, seconds: number): Promise<TrajectoryRow> {
@@ -321,14 +332,18 @@ export class Runner {
     const folder = join(this.deps.output, id)
     await fsp.mkdir(folder, { recursive: true })
     await this.writeBranchFile(scratch, { id, phase: 'continue', ref, seconds, view: null })
+    const unregister = await this.deps.runs.register(leader.session!, this.workerRun(ref.branch, folder, seconds))
     const activation = await this.deps.subagents.continueActivation({
       parent: this.deps.parent,
       childId: leader.session!,
       content: [{ type: 'text', text: buildContinueMessage({ plan: this.plan, leader, head: ref, seconds }) }],
       signal: this.abort.signal,
       delivery: 'caller',
+    }).catch((error: unknown) => {
+      unregister()
+      throw error
     })
-    return this.settle({ activation, parent: leader, id, phase: 'continue', ref, scratch, folder, seconds, portfolio: false })
+    return this.settle({ activation, unregister, parent: leader, id, phase: 'continue', ref, scratch, folder, seconds, portfolio: false })
   }
 
   private async writeBranchFile(
@@ -355,6 +370,7 @@ export class Runner {
    */
   private async settle(turn: {
     activation: SubagentActivation
+    unregister: () => void
     parent: TrajectoryRow
     id: string
     phase: Phase
@@ -372,6 +388,7 @@ export class Runner {
     try {
       result = await this.awaitSettled(activation, turn.seconds * 1000, () => { timedOut = true })
     } finally {
+      turn.unregister()
       this.live.delete(activation)
       this.deps.workers.remove(turn.scratch, activation.childId)
     }
@@ -436,6 +453,39 @@ export class Runner {
     } finally {
       clearTimeout(deadline)
       clearTimeout(grace)
+    }
+  }
+
+  /**
+   * A worker's `research-run` handler: run argv on its branch head through the
+   * batch executor, no longer than the turn has left. Every request is
+   * appended to the branch's `research-runs.jsonl`.
+   */
+  private workerRun(branch: string, folder: string, seconds: number): (argv: string[], timeoutSeconds: number) => Promise<unknown> {
+    const deadline = Date.now() + seconds * 1000
+    return async (argv, timeoutSeconds) => {
+      this.checkStopped()
+      const left = Math.floor((deadline - Date.now()) / 1000)
+      if (left < 5) throw new Error('the turn has no time left for another run')
+      const ref = await this.deps.workspace.head(branch)
+      const started = Date.now()
+      const result = await this.deps.executor.run({
+        ref,
+        workspace: this.deps.workspace,
+        argv,
+        timeoutMs: Math.min(timeoutSeconds, left) * 1000,
+        signal: this.abort.signal,
+      })
+      await fsp.appendFile(join(folder, 'research-runs.jsonl'), JSON.stringify({
+        at: new Date(started).toISOString(),
+        seconds: (Date.now() - started) / 1000,
+        commit: ref.commit,
+        argv,
+        code: result.code,
+        timed_out: result.timedOut,
+        environment: result.environment,
+      }) + '\n')
+      return { ...result, commit: ref.commit }
     }
   }
 

@@ -19,6 +19,16 @@ You run experiments on one LayerFS branch of a research batch. A coordinator own
 - **The project** is your LayerFS branch, `layerfs_branch` in project `layerfs_project`. Read and change it with the `layerfs` command or the SDK, as the LayerFS instructions in your system prompt describe: mount a Workspace in your own Sandbox, run commands there, commit, unmount.
 - **Your current directory** is a scratch folder on the host for notes, scripts and logs. It is not part of the project and is not evaluated.
 
+## Running on the evaluation hardware
+
+Your own Sandbox has no GPU. To run a command where the evaluator runs (a Colab GPU when the batch uses one, else a LayerFS Sandbox), commit first, then:
+
+```bash
+node "$DSH_AUTO_RESEARCH_RUN" --timeout 600 -- python3 bench.py --size 4096
+```
+
+It runs the command from the root of your branch's newest commit, in a fresh copy, and prints its stdout and stderr; the exit code is the command's (124 on timeout). Only committed files are there; nothing it writes is kept. Your runs wait in one queue with every other branch's runs and evaluations, so keep them short and purposeful. The first stderr line names the environment and commit.
+
 ## Rules
 
 - Change only your own branch. Never fork, merge into or publish to another branch or `main`.

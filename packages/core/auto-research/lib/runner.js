@@ -7,6 +7,7 @@
  * branch. Every state is a commit, scored by the plan's evaluator through the
  * batch executor.
  */
+import { randomUUID } from 'node:crypto';
 import * as fsp from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { scoreValue } from './plan.js';
@@ -234,9 +235,13 @@ export class Runner {
         });
         const passOptions = this.deps.workerAgentOptions
             && this.deps.subagents.getProvider(this.deps.workerProvider)?.capabilities.agentOptions === true;
+        // A reserved session id lets the worker's very first bash call reach research-run.
+        const childId = randomUUID();
+        const unregister = await this.deps.runs.register(childId, this.workerRun(ref.branch, folder, seconds));
         const activation = await this.deps.subagents.startActivation({
             provider: this.deps.workerProvider,
             label: `${this.deps.runId.slice(0, 8)}:${id}`,
+            childId,
             request: {
                 cwd: scratch,
                 prompt: [{ type: 'text', text: prompt }],
@@ -245,8 +250,11 @@ export class Runner {
             },
             signal: this.abort.signal,
             delivery: 'caller',
+        }).catch((error) => {
+            unregister();
+            throw error;
         });
-        return this.settle({ activation, parent, id, phase, ref, scratch, folder, seconds, portfolio: rsiTop });
+        return this.settle({ activation, unregister, parent, id, phase, ref, scratch, folder, seconds, portfolio: rsiTop });
     }
     async resumeWorker(leader, id, seconds) {
         this.checkStopped();
@@ -255,14 +263,18 @@ export class Runner {
         const folder = join(this.deps.output, id);
         await fsp.mkdir(folder, { recursive: true });
         await this.writeBranchFile(scratch, { id, phase: 'continue', ref, seconds, view: null });
+        const unregister = await this.deps.runs.register(leader.session, this.workerRun(ref.branch, folder, seconds));
         const activation = await this.deps.subagents.continueActivation({
             parent: this.deps.parent,
             childId: leader.session,
             content: [{ type: 'text', text: buildContinueMessage({ plan: this.plan, leader, head: ref, seconds }) }],
             signal: this.abort.signal,
             delivery: 'caller',
+        }).catch((error) => {
+            unregister();
+            throw error;
         });
-        return this.settle({ activation, parent: leader, id, phase: 'continue', ref, scratch, folder, seconds, portfolio: false });
+        return this.settle({ activation, unregister, parent: leader, id, phase: 'continue', ref, scratch, folder, seconds, portfolio: false });
     }
     async writeBranchFile(scratch, branch) {
         await writeJson(branchFile(scratch), {
@@ -292,6 +304,7 @@ export class Runner {
             result = await this.awaitSettled(activation, turn.seconds * 1000, () => { timedOut = true; });
         }
         finally {
+            turn.unregister();
             this.live.delete(activation);
             this.deps.workers.remove(turn.scratch, activation.childId);
         }
@@ -359,6 +372,39 @@ export class Runner {
             clearTimeout(deadline);
             clearTimeout(grace);
         }
+    }
+    /**
+     * A worker's `research-run` handler: run argv on its branch head through the
+     * batch executor, no longer than the turn has left. Every request is
+     * appended to the branch's `research-runs.jsonl`.
+     */
+    workerRun(branch, folder, seconds) {
+        const deadline = Date.now() + seconds * 1000;
+        return async (argv, timeoutSeconds) => {
+            this.checkStopped();
+            const left = Math.floor((deadline - Date.now()) / 1000);
+            if (left < 5)
+                throw new Error('the turn has no time left for another run');
+            const ref = await this.deps.workspace.head(branch);
+            const started = Date.now();
+            const result = await this.deps.executor.run({
+                ref,
+                workspace: this.deps.workspace,
+                argv,
+                timeoutMs: Math.min(timeoutSeconds, left) * 1000,
+                signal: this.abort.signal,
+            });
+            await fsp.appendFile(join(folder, 'research-runs.jsonl'), JSON.stringify({
+                at: new Date(started).toISOString(),
+                seconds: (Date.now() - started) / 1000,
+                commit: ref.commit,
+                argv,
+                code: result.code,
+                timed_out: result.timedOut,
+                environment: result.environment,
+            }) + '\n');
+            return { ...result, commit: ref.commit };
+        };
     }
     /** Score one commit with the plan's evaluator, through the batch executor. */
     async evaluate(ref, folder) {

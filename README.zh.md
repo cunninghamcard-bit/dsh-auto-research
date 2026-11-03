@@ -118,6 +118,9 @@ AutoResearchProvider.start
 
 - worker 的 cwd 是宿主机上的草稿目录 `runs/<run>/<branch>/scratch`，里面放 `BRANCH.json`、worker 的笔记，RSI-top 分支还有 `PORTFOLIO.json`。
 - 项目本身是 worker 的 LayerFS 分支，worker 用 `layerfs` 命令修改它。
+- worker 在自己的回合里想在评估硬件上试跑（例如在 Colab GPU 上测 kernel），先提交，再执行 `node "$DSH_AUTO_RESEARCH_RUN" -- <命令>`。命令会在分支 head 上通过本批次的执行器运行，和评估排在同一个队列里。
+- `ctx.shellEnv` 只给正在运行的 worker 会话的 bash 调用提供三样东西：CLI 路径、本地接口地址，以及该 worker 自己的 token。
+- 每次调用都会记录到该分支目录的 `research-runs.jsonl`。
 
 ## 产物
 
