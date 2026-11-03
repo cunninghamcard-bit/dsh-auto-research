@@ -43,8 +43,7 @@ Link `packages/core/auto-research` into a dsh profile and list `dsh-auto-researc
 Requirements:
 
 - [dsh-layerfs](https://github.com/layerfs/dsh-layerfs) with the conversation bound to a LayerFS project. Workers use its `layerfs` command.
-- A dsh with `ctx.subagents.continueActivation` (deepseek-harness `feat/subagent-continue-activation`).
-- Session persistence. Continue cold-resumes the worker session.
+- Session persistence. The continue worker is a new session seeded with the leader worker's persisted session, read through `ctx.sessionQuery`. It runs on unmodified dsh.
 
 ## Configuration
 
@@ -108,7 +107,8 @@ AutoResearchProvider.start
  ④ each round
     ├ explore: fork the leader's commit into `branches` branches; startActivation(spawn, cwd = a scratch folder)
     │          interrupt at the deadline; evaluate each branch head; choose
-    ├ continue: continueActivation(leader session) on the leader's branch; interrupt at the deadline; evaluate; choose
+    ├ continue: startActivation(auto-research-continue, seed = the leader worker's completed turns) on the leader's branch;
+    │          interrupt at the deadline; evaluate; choose
     └ stall clock: reset on a gain above meaningful_gain
  ⑤ write DASHBOARD.json, LEADER.json, RESULT.json, LATEST.json
 ```

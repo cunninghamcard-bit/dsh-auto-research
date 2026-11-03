@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import * as fsp from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { normalizeOptions, resolveWorkerAgentOptions, validatePlan } from './plan.js';
+import { ContinueProvider } from './continuation.js';
 import { Workers } from './research-run.js';
 import { ResearchStoppedError, Runner } from './runner.js';
 /** Where the coordinator's runs and `LATEST.json` live, relative to its cwd. */
@@ -23,6 +24,8 @@ export class AutoResearchProvider {
     capabilities = Object.freeze({ agentOptions: true, agentPreset: false, outputSchema: false, depthLimit: false });
     inheritsParentContext = false;
     workers = new Workers();
+    /** The `auto-research-continue` provider continue workers start through. */
+    continuation = new ContinueProvider(() => this.ctx.sessionQuery);
     constructor(ctx, config, executors) {
         this.ctx = ctx;
         this.config = config;
@@ -75,6 +78,7 @@ export class AutoResearchProvider {
             workerProvider,
             workerAgentOptions,
             workers: this.workers,
+            continuation: this.continuation,
             ...(request.signal ? { signal: request.signal } : {}),
             ...(this.ctx.logger ? { logger: this.ctx.logger } : {}),
         });

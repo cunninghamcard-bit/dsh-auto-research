@@ -3,13 +3,14 @@
  *
  * A port of ara's `Runner` onto LayerFS branches and dsh continuable
  * subagents: explore forks the leader's commit into fresh branches, each with
- * a new worker; continue resumes the leader's own worker session on its own
- * branch. Every state is a commit, scored by the plan's evaluator through the
+ * a new worker; continue gives the leader's branch a worker seeded with the
+ * leader worker's own session. Every state is a commit, scored by the plan's evaluator through the
  * batch executor.
  */
 import { randomUUID } from 'node:crypto';
 import * as fsp from 'node:fs/promises';
 import { basename, join } from 'node:path';
+import { CONTINUE_PROVIDER } from './continuation.js';
 import { sampleMetricViews, validatePortfolio } from './protocols.js';
 import { branchFile, buildContinueMessage, buildWorkerPrompt } from './prompts.js';
 /** Raised when the caller stops a batch; branches and sessions are kept. */
@@ -163,9 +164,9 @@ export class Runner {
         return rows;
     }
     /**
-     * Continue the leader's own worker session on the leader's branch. A leader
-     * without a session (the baseline), or one whose session cannot resume (a
-     * different coordinator conversation), gets a fresh worker on a fork instead.
+     * Continue the leader's worker on the leader's branch. A leader without a
+     * session (the baseline), or one whose session cannot be read, gets a fresh
+     * worker on a fork instead.
      */
     async continueLeader(leader, round) {
         const id = `round-${round}-continue`;
@@ -221,6 +222,7 @@ export class Runner {
         });
         return this.settle({ activation, unregister, parent, id, phase, ref, scratch, folder, seconds, portfolio: rsiTop });
     }
+    /** A new worker session seeded with the leader worker's completed turns, on the leader's branch. */
     async resumeWorker(leader, id, seconds) {
         this.checkStopped();
         const scratch = leader.scratch;
@@ -228,17 +230,25 @@ export class Runner {
         const folder = join(this.deps.output, id);
         await fsp.mkdir(folder, { recursive: true });
         await this.writeBranchFile(scratch, { id, phase: 'continue', ref, seconds, view: null });
-        const unregister = this.deps.workers.register(leader.session, this, this.workerRun(ref.branch, folder, seconds));
-        const activation = await this.deps.subagents.continueActivation({
-            parent: this.deps.parent,
-            childId: leader.session,
-            content: [{ type: 'text', text: buildContinueMessage({ plan: this.plan, leader, head: ref, seconds }) }],
+        const childId = randomUUID();
+        const release = await this.deps.continuation.prepare(childId, leader.session, this.abort.signal);
+        const unregister = this.deps.workers.register(childId, this, this.workerRun(ref.branch, folder, seconds));
+        const activation = await this.deps.subagents.startActivation({
+            provider: CONTINUE_PROVIDER,
+            label: `${this.deps.runId.slice(0, 8)}:${id}`,
+            childId,
+            request: {
+                cwd: scratch,
+                prompt: [{ type: 'text', text: buildContinueMessage({ plan: this.plan, leader, head: ref, seconds }) }],
+                parent: this.deps.parent,
+                ...(this.deps.workerAgentOptions ? { agentOptions: this.deps.workerAgentOptions } : {}),
+            },
             signal: this.abort.signal,
             delivery: 'caller',
         }).catch((error) => {
             unregister();
             throw error;
-        });
+        }).finally(release);
         return this.settle({ activation, unregister, parent: leader, id, phase: 'continue', ref, scratch, folder, seconds, portfolio: false });
     }
     async writeBranchFile(scratch, branch) {

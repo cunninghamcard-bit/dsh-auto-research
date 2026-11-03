@@ -6,6 +6,7 @@
  */
 import type { Config } from './plan.js';
 import type { ResearchExecutorRegistry } from './registry.js';
+import { ContinueProvider } from './continuation.js';
 import { Workers } from './research-run.js';
 import type { ProviderContext, ResearchPlanInput, SubagentProvider, SubagentRun, SubagentStartRequest } from './types.js';
 /** The plugin configuration. */
@@ -28,6 +29,8 @@ export declare class AutoResearchProvider implements SubagentProvider {
     }>;
     readonly inheritsParentContext = false;
     readonly workers: Workers;
+    /** The `auto-research-continue` provider continue workers start through. */
+    readonly continuation: ContinueProvider;
     constructor(ctx: ProviderContext, config: ProviderConfig, executors: ResearchExecutorRegistry);
     start(request: SubagentStartRequest): Promise<SubagentRun>;
 }

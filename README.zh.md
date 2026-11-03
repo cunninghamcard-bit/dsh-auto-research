@@ -45,8 +45,7 @@ pnpm run build
 依赖：
 
 - [dsh-layerfs](https://github.com/layerfs/dsh-layerfs)，且对话绑定了 LayerFS 项目。worker 通过它提供的 `layerfs` 命令操作分支。
-- 带 `ctx.subagents.continueActivation` 的 dsh（deepseek-harness 分支 `feat/subagent-continue-activation`）。
-- 会话持久化。continue 阶段要从持久化记录冷恢复 worker 会话。
+- 会话持久化。continue 阶段新建一个 worker 会话，用 `ctx.sessionQuery` 读出 leader worker 的持久化记录作为种子。不需要改 dsh。
 
 ## 配置
 
@@ -112,7 +111,8 @@ AutoResearchProvider.start
  ④ 每一轮
     ├ explore：从 leader 的提交 fork 出 branches 个分支；startActivation(spawn, cwd = 草稿目录)
     │          到时 interrupt；评估各分支 head；选择
-    ├ continue：在 leader 的分支上 continueActivation(leader 会话)；到时 interrupt；评估；选择
+    ├ continue：在 leader 的分支上 startActivation(auto-research-continue，种子 = leader worker 已完成的回合)；
+    │          到时 interrupt；评估；选择
     └ 停滞计时：增益超过 meaningful_gain 时清零
  ⑤ 写 DASHBOARD.json、LEADER.json、RESULT.json、LATEST.json
 ```

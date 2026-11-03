@@ -2,7 +2,8 @@
  * Cordis entry of the `dsh-auto-research` bundle.
  *
  * Provides the `ctx.researchExecutor` registry and `ctx.researchWorkers`, and
- * registers the `auto-research` SubagentProvider and the workers' `research_run` tool;
+ * registers the `auto-research` SubagentProvider, the `auto-research-continue`
+ * provider continue workers start through, and the workers' `research_run` tool;
  * workers' agents do not get the `subagent_auto_research` tool. The
  * workspace (`ctx.researchWorkspace`), the executors and the prompts are other
  * packages of the bundle; the `subagent_auto_research` tool comes from
@@ -15,7 +16,7 @@ import type { ProviderConfig } from './provider.js'
 import { ResearchExecutorRegistry } from './registry.js'
 import { researchRunTool } from './research-run.js'
 import type { ResearchRunTool } from './research-run.js'
-import type { ProviderContext } from './types.js'
+import type { ProviderContext, SessionQuery } from './types.js'
 
 export const name = 'dsh-auto-research'
 
@@ -65,11 +66,16 @@ export function apply(ctx: PluginContext, config: ProviderConfig = {}): void {
       if (provider.workers.has(agent.id) && tools.get(BATCH_TOOL)) (agent.ctx.tools as Tools).restrict({ deny: [BATCH_TOOL] })
     })
   })
+  ctx.inject(['sessionQuery'], inner => {
+    host.sessionQuery = inner.sessionQuery as SessionQuery
+    inner.effect(() => () => { delete host.sessionQuery })
+  })
   ctx.inject(['researchWorkspace'], inner => {
     host.researchWorkspace = inner.researchWorkspace as WorkspaceService
     inner.effect(() => () => { delete host.researchWorkspace })
   })
   ctx.effect(() => host.subagents.registerProvider(provider))
+  ctx.effect(() => host.subagents.registerProvider(provider.continuation))
 }
 
 export { AutoResearchProvider, ResearchExecutorRegistry }

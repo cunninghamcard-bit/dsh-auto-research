@@ -156,7 +156,7 @@ export interface SubagentResult {
     diagnostic?: string;
     [key: string]: unknown;
 }
-/** One activation from `startActivation` or `continueActivation`. */
+/** One activation from `startActivation`. */
 export interface SubagentActivation {
     childId: string;
     result: Promise<SubagentResult>;
@@ -172,8 +172,10 @@ export interface SubagentProvider {
     name: string;
     capabilities: Record<string, unknown>;
     inheritsParentContext: boolean;
-    start: (request: SubagentStartRequest) => Promise<SubagentRun>;
-    prepareContinuable?: (request: unknown) => Promise<unknown>;
+    start?: (request: SubagentStartRequest) => Promise<SubagentRun>;
+    prepareContinuable?: (request: {
+        sessionId: string;
+    }) => Promise<unknown>;
 }
 /** Request received by `AutoResearchProvider.start`. */
 export interface SubagentStartRequest {
@@ -202,21 +204,26 @@ export interface SubagentsService {
         signal: AbortSignal;
         delivery: 'caller';
     }) => Promise<SubagentActivation>;
-    continueActivation: (spec: {
-        parent: unknown;
-        childId: string;
-        content: ContentBlock[];
-        signal: AbortSignal;
-        delivery: 'caller';
-    }) => Promise<SubagentActivation>;
     interrupt: (childId: string, authority: {
         kind: 'ancestor';
         agent: unknown;
     }) => void;
 }
+/** `ctx.sessionQuery`: persisted sessions, read without resuming them. */
+export interface SessionQuery {
+    observeSession: (session: string, options: {
+        signal: AbortSignal;
+    }) => Promise<{
+        events: Array<{
+            type: string;
+        }>;
+        [Symbol.dispose]: () => void;
+    }>;
+}
 /** Host services the provider reads; optional ones exist while their plugin does. */
 export interface ProviderContext {
     subagents: SubagentsService;
+    sessionQuery?: SessionQuery;
     researchWorkspace?: WorkspaceService;
     logger?: Logger;
 }

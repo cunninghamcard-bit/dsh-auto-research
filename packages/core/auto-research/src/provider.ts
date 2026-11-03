@@ -11,6 +11,7 @@ import { isAbsolute, join, resolve } from 'node:path'
 import { normalizeOptions, resolveWorkerAgentOptions, validatePlan } from './plan.js'
 import type { Config } from './plan.js'
 import type { ResearchExecutorRegistry } from './registry.js'
+import { ContinueProvider } from './continuation.js'
 import { Workers } from './research-run.js'
 import { ResearchStoppedError, Runner } from './runner.js'
 import type {
@@ -44,6 +45,8 @@ export class AutoResearchProvider implements SubagentProvider {
   readonly capabilities = Object.freeze({ agentOptions: true, agentPreset: false, outputSchema: false, depthLimit: false })
   readonly inheritsParentContext = false
   readonly workers = new Workers()
+  /** The `auto-research-continue` provider continue workers start through. */
+  readonly continuation = new ContinueProvider(() => this.ctx.sessionQuery)
 
   constructor(
     readonly ctx: ProviderContext,
@@ -97,6 +100,7 @@ export class AutoResearchProvider implements SubagentProvider {
       workerProvider,
       workerAgentOptions,
       workers: this.workers,
+      continuation: this.continuation,
       ...(request.signal ? { signal: request.signal } : {}),
       ...(this.ctx.logger ? { logger: this.ctx.logger } : {}),
     })

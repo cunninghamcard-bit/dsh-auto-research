@@ -2,7 +2,8 @@
  * Cordis entry of the `dsh-auto-research` bundle.
  *
  * Provides the `ctx.researchExecutor` registry and `ctx.researchWorkers`, and
- * registers the `auto-research` SubagentProvider and the workers' `research_run` tool;
+ * registers the `auto-research` SubagentProvider, the `auto-research-continue`
+ * provider continue workers start through, and the workers' `research_run` tool;
  * workers' agents do not get the `subagent_auto_research` tool. The
  * workspace (`ctx.researchWorkspace`), the executors and the prompts are other
  * packages of the bundle; the `subagent_auto_research` tool comes from

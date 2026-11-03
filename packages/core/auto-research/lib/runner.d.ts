@@ -3,11 +3,12 @@
  *
  * A port of ara's `Runner` onto LayerFS branches and dsh continuable
  * subagents: explore forks the leader's commit into fresh branches, each with
- * a new worker; continue resumes the leader's own worker session on its own
- * branch. Every state is a commit, scored by the plan's evaluator through the
+ * a new worker; continue gives the leader's branch a worker seeded with the
+ * leader worker's own session. Every state is a commit, scored by the plan's evaluator through the
  * batch executor.
  */
 import type { BranchRef, ExecutorBackend, Logger, Workspace } from 'dsh-auto-research-api';
+import type { ContinueProvider } from './continuation.js';
 import type { Workers } from './research-run.js';
 import type { BatchResult, EvaluationResult, Latest, MetricDiagnostic, ResearchOptions, ResearchPlan, SubagentsService, TrajectoryRow, WorkerAgentOptions } from './types.js';
 /** Raised when the caller stops a batch; branches and sessions are kept. */
@@ -33,6 +34,8 @@ export interface RunnerDeps {
     workerAgentOptions: WorkerAgentOptions | null;
     /** Running workers of every batch: `research_run` handlers and activations. */
     workers: Workers;
+    /** Seeds continue workers with the leader worker's session. */
+    continuation: ContinueProvider;
     signal?: AbortSignal;
     logger?: Logger;
     rng?: () => number;
@@ -62,12 +65,13 @@ export declare class Runner {
     /** Fork the leader's commit into `branches` fresh branches, one new worker each. */
     private explore;
     /**
-     * Continue the leader's own worker session on the leader's branch. A leader
-     * without a session (the baseline), or one whose session cannot resume (a
-     * different coordinator conversation), gets a fresh worker on a fork instead.
+     * Continue the leader's worker on the leader's branch. A leader without a
+     * session (the baseline), or one whose session cannot be read, gets a fresh
+     * worker on a fork instead.
      */
     private continueLeader;
     private freshWorker;
+    /** A new worker session seeded with the leader worker's completed turns, on the leader's branch. */
     private resumeWorker;
     private writeBranchFile;
     /**
