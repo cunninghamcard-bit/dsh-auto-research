@@ -2,16 +2,17 @@
  * Cordis entry of the `dsh-auto-research` bundle.
  *
  * Provides the `ctx.researchWorkspace` and `ctx.researchExecutor` registries,
- * registers the `auto-research` SubagentProvider and the packaged skills. The
- * `subagent_auto_research` tool comes from `@deepseek-ai/dsh-tool-subagent`
- * through `cordis.patch.yml`.
+ * registers the `auto-research` SubagentProvider, the workers' `research_run`
+ * tool and the packaged skills. The `subagent_auto_research` tool comes from
+ * `@deepseek-ai/dsh-tool-subagent` through `cordis.patch.yml`.
  */
 
 import type { PluginContext } from 'dsh-auto-research-api'
 import { AutoResearchProvider } from './provider.js'
 import type { ProviderConfig } from './provider.js'
 import { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js'
-import { RUN_ENV_VARIABLES } from './run-server.js'
+import { researchRunTool } from './research-run.js'
+import type { ResearchRunTool } from './research-run.js'
 import { registerSkills } from './skills.js'
 import type { ProviderContext } from './types.js'
 
@@ -43,20 +44,12 @@ export function apply(ctx: PluginContext, config: ProviderConfig = {}): void {
     ...(ctx.logger ? { logger: ctx.logger } : {}),
   }
   const provider = new AutoResearchProvider(host, config, workspaces, executors)
-  // Running workers' bash calls get the research-run CLI, endpoint and token.
-  ctx.inject(['shellEnv'], inner => {
-    const shellEnv = inner.shellEnv as {
-      register: (contributor: {
-        name: string
-        variables: Record<string, { description: string }>
-        resolve: (execution: { agent?: { id?: unknown } }) => Record<string, string>
-      }) => () => void
+  // Only running workers' steps see `research_run`.
+  ctx.inject(['tools'], inner => {
+    const tools = inner.tools as {
+      register: (definition: ResearchRunTool, options: { when: (context: { agent: { id: string } }) => boolean }) => () => void
     }
-    inner.effect(() => shellEnv.register({
-      name: 'auto-research',
-      variables: { ...RUN_ENV_VARIABLES },
-      resolve: execution => provider.runs.environment(typeof execution.agent?.id === 'string' ? execution.agent.id : null),
-    }))
+    inner.effect(() => tools.register(researchRunTool(provider.runs), { when: ({ agent }) => provider.runs.has(agent.id) }))
   })
   for (const service of ['llm', 'shellEnv'] as const) {
     ctx.inject([service], inner => {

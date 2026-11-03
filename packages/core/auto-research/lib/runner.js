@@ -235,9 +235,9 @@ export class Runner {
         });
         const passOptions = this.deps.workerAgentOptions
             && this.deps.subagents.getProvider(this.deps.workerProvider)?.capabilities.agentOptions === true;
-        // A reserved session id lets the worker's very first bash call reach research-run.
+        // A reserved session id gives the worker research_run from its first step.
         const childId = randomUUID();
-        const unregister = await this.deps.runs.register(childId, this.workerRun(ref.branch, folder, seconds));
+        const unregister = this.deps.runs.register(childId, this.workerRun(ref.branch, folder, seconds));
         const activation = await this.deps.subagents.startActivation({
             provider: this.deps.workerProvider,
             label: `${this.deps.runId.slice(0, 8)}:${id}`,
@@ -263,7 +263,7 @@ export class Runner {
         const folder = join(this.deps.output, id);
         await fsp.mkdir(folder, { recursive: true });
         await this.writeBranchFile(scratch, { id, phase: 'continue', ref, seconds, view: null });
-        const unregister = await this.deps.runs.register(leader.session, this.workerRun(ref.branch, folder, seconds));
+        const unregister = this.deps.runs.register(leader.session, this.workerRun(ref.branch, folder, seconds));
         const activation = await this.deps.subagents.continueActivation({
             parent: this.deps.parent,
             childId: leader.session,
@@ -374,13 +374,13 @@ export class Runner {
         }
     }
     /**
-     * A worker's `research-run` handler: run argv on its branch head through the
+     * A worker's `research_run` handler: run a bash command on its branch head through the
      * batch executor, no longer than the turn has left. Every request is
      * appended to the branch's `research-runs.jsonl`.
      */
     workerRun(branch, folder, seconds) {
         const deadline = Date.now() + seconds * 1000;
-        return async (argv, timeoutSeconds) => {
+        return async (command, timeoutSeconds, signal) => {
             this.checkStopped();
             const left = Math.floor((deadline - Date.now()) / 1000);
             if (left < 5)
@@ -390,15 +390,15 @@ export class Runner {
             const result = await this.deps.executor.run({
                 ref,
                 workspace: this.deps.workspace,
-                argv,
+                argv: ['bash', '-c', command],
                 timeoutMs: Math.min(timeoutSeconds, left) * 1000,
-                signal: this.abort.signal,
+                signal: AbortSignal.any([this.abort.signal, signal]),
             });
             await fsp.appendFile(join(folder, 'research-runs.jsonl'), JSON.stringify({
                 at: new Date(started).toISOString(),
                 seconds: (Date.now() - started) / 1000,
                 commit: ref.commit,
-                argv,
+                command,
                 code: result.code,
                 timed_out: result.timedOut,
                 environment: result.environment,

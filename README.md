@@ -114,7 +114,7 @@ AutoResearchProvider.start
 
 A worker's cwd is a scratch folder on the host, `runs/<run>/<branch>/scratch`. It holds `BRANCH.json`, the worker's notes and, on RSI-top branches, `PORTFOLIO.json`. The project itself is the worker's LayerFS branch, which it changes with the `layerfs` command.
 
-To try something on the evaluation hardware during its turn, for example a kernel on the Colab GPU, a worker commits and runs `node "$DSH_AUTO_RESEARCH_RUN" -- <command>`. The command runs on the branch head through the batch executor, in the same queue as evaluations. `ctx.shellEnv` gives each running worker session's bash calls the CLI path, a local endpoint and the worker's own token. Every request is logged in the branch's `research-runs.jsonl`.
+To try something on the evaluation hardware during its turn, for example a kernel on the Colab GPU, a worker commits and calls the `research_run` tool (`{ command, timeout_seconds }`). The command runs on the branch head through the batch executor, in the same queue as evaluations. The tool is registered with a `when` condition, so only a running worker session of a batch sees it; the coordinator and other sessions do not. Every request is logged in the branch's `research-runs.jsonl`.
 
 ## Artifacts
 

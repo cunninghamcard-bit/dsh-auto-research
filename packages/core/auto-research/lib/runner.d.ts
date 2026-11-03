@@ -8,7 +8,7 @@
  * batch executor.
  */
 import type { BranchRef, ExecutorBackend, Logger, WorkspaceBackend } from 'dsh-auto-research-api';
-import type { WorkerRunServer } from './run-server.js';
+import type { WorkerRuns } from './research-run.js';
 import type { BatchResult, EvaluationResult, Latest, MetricDiagnostic, ResearchOptions, ResearchPlan, SubagentsService, TrajectoryRow, WorkerAgentOptions } from './types.js';
 /** Raised when the caller stops a batch; branches and sessions are kept. */
 export declare class ResearchStoppedError extends Error {
@@ -42,8 +42,8 @@ export interface RunnerDeps {
     workerProvider: string;
     workerAgentOptions: WorkerAgentOptions | null;
     workers: ActiveWorkers;
-    /** Serves `research-run` requests of running workers. */
-    runs: WorkerRunServer;
+    /** `research_run` handlers of running workers. */
+    runs: WorkerRuns;
     signal?: AbortSignal;
     logger?: Logger;
     rng?: () => number;
@@ -97,7 +97,7 @@ export declare class Runner {
      */
     private awaitSettled;
     /**
-     * A worker's `research-run` handler: run argv on its branch head through the
+     * A worker's `research_run` handler: run a bash command on its branch head through the
      * batch executor, no longer than the turn has left. Every request is
      * appended to the branch's `research-runs.jsonl`.
      */

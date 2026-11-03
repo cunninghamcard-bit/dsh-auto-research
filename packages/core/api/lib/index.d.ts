@@ -60,7 +60,7 @@ export interface BackendCreateOptions {
     readonly runId: string;
     /** The batch's run directory on the host. */
     readonly output: string;
-    /** The coordinator's shell environment, including its `DSH_LAYERFS_*` binding. */
+    /** The coordinator's `DSH_*` bash variables, from `ctx.shellEnv`: its `DSH_LAYERFS_*` binding. */
     readonly env: Readonly<Record<string, string | undefined>>;
     readonly logger?: Logger;
 }

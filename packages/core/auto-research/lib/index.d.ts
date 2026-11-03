@@ -2,9 +2,9 @@
  * Cordis entry of the `dsh-auto-research` bundle.
  *
  * Provides the `ctx.researchWorkspace` and `ctx.researchExecutor` registries,
- * registers the `auto-research` SubagentProvider and the packaged skills. The
- * `subagent_auto_research` tool comes from `@deepseek-ai/dsh-tool-subagent`
- * through `cordis.patch.yml`.
+ * registers the `auto-research` SubagentProvider, the workers' `research_run`
+ * tool and the packaged skills. The `subagent_auto_research` tool comes from
+ * `@deepseek-ai/dsh-tool-subagent` through `cordis.patch.yml`.
  */
 import type { PluginContext } from 'dsh-auto-research-api';
 import { AutoResearchProvider } from './provider.js';

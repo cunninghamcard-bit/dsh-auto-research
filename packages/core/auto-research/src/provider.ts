@@ -12,7 +12,7 @@ import type { ExecutorBackend, WorkspaceBackend } from 'dsh-auto-research-api'
 import { normalizeOptions, resolveWorkerAgentOptions, validatePlan } from './plan.js'
 import type { Config } from './plan.js'
 import type { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js'
-import { WorkerRunServer } from './run-server.js'
+import { WorkerRuns } from './research-run.js'
 import { ActiveWorkers, ResearchStoppedError, Runner } from './runner.js'
 import type {
   ContentBlock,
@@ -75,7 +75,7 @@ export class AutoResearchProvider implements SubagentProvider {
   readonly capabilities = Object.freeze({ agentOptions: true, agentPreset: false, outputSchema: false, depthLimit: false })
   readonly inheritsParentContext = false
   readonly workers = new ActiveWorkers()
-  readonly runs = new WorkerRunServer()
+  readonly runs = new WorkerRuns()
 
   constructor(
     readonly ctx: ProviderContext,
@@ -153,7 +153,7 @@ export class AutoResearchProvider implements SubagentProvider {
     const latest = await fsp.readFile(latestFile, 'utf8').then(raw => JSON.parse(raw) as Latest, () => null)
     const runId = randomUUID()
     const output = join(runtime, 'runs', runId)
-    const env = { ...process.env, ...this.ctx.shellEnv?.collect({ agent: request.parent, callId: SHELL_ENV_CALL_ID, rootCallId: SHELL_ENV_CALL_ID }) }
+    const env = this.ctx.shellEnv?.collect({ agent: request.parent, callId: SHELL_ENV_CALL_ID, rootCallId: SHELL_ENV_CALL_ID }) ?? {}
     const created = { runId, output, env, ...(this.ctx.logger ? { logger: this.ctx.logger } : {}) }
 
     const release = await acquireLock(runtime, runId)

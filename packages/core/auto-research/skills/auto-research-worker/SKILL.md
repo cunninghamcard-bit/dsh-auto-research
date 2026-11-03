@@ -21,13 +21,13 @@ You run experiments on one LayerFS branch of a research batch. A coordinator own
 
 ## Running on the evaluation hardware
 
-Your own Sandbox has no GPU. To run a command where the evaluator runs (a Colab GPU when the batch uses one, else a LayerFS Sandbox), commit first, then:
+Your own Sandbox has no GPU. To run a command where the evaluator runs (a Colab GPU when the batch uses one, else a LayerFS Sandbox), commit first, then call the `research_run` tool:
 
-```bash
-node "$DSH_AUTO_RESEARCH_RUN" --timeout 600 -- python3 bench.py --size 4096
+```json
+{ "command": "python3 bench.py --size 4096", "timeout_seconds": 600 }
 ```
 
-It runs the command from the root of your branch's newest commit, in a fresh copy, and prints its stdout and stderr; the exit code is the command's (124 on timeout). Only committed files are there; nothing it writes is kept. Your runs wait in one queue with every other branch's runs and evaluations, so keep them short and purposeful. The first stderr line names the environment and commit.
+It runs the command with `bash -c` from the root of your branch's newest commit, in a fresh copy, and returns the environment, the commit, the exit code and the tail of stdout and stderr. Only committed files are there; nothing it writes is kept. Your runs wait in one queue with every other branch's runs and evaluations, so keep them short and purposeful.
 
 ## Rules
 

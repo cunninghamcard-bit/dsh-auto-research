@@ -8,7 +8,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import * as fsp from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { normalizeOptions, resolveWorkerAgentOptions, validatePlan } from './plan.js';
-import { WorkerRunServer } from './run-server.js';
+import { WorkerRuns } from './research-run.js';
 import { ActiveWorkers, ResearchStoppedError, Runner } from './runner.js';
 /** Where the coordinator's runs and `LATEST.json` live, relative to its cwd. */
 const RUNTIME_DIR = '.auto-research-methods';
@@ -52,7 +52,7 @@ export class AutoResearchProvider {
     capabilities = Object.freeze({ agentOptions: true, agentPreset: false, outputSchema: false, depthLimit: false });
     inheritsParentContext = false;
     workers = new ActiveWorkers();
-    runs = new WorkerRunServer();
+    runs = new WorkerRuns();
     constructor(ctx, config, workspaces, executors) {
         this.ctx = ctx;
         this.config = config;
@@ -128,7 +128,7 @@ export class AutoResearchProvider {
         const latest = await fsp.readFile(latestFile, 'utf8').then(raw => JSON.parse(raw), () => null);
         const runId = randomUUID();
         const output = join(runtime, 'runs', runId);
-        const env = { ...process.env, ...this.ctx.shellEnv?.collect({ agent: request.parent, callId: SHELL_ENV_CALL_ID, rootCallId: SHELL_ENV_CALL_ID }) };
+        const env = this.ctx.shellEnv?.collect({ agent: request.parent, callId: SHELL_ENV_CALL_ID, rootCallId: SHELL_ENV_CALL_ID }) ?? {};
         const created = { runId, output, env, ...(this.ctx.logger ? { logger: this.ctx.logger } : {}) };
         const release = await acquireLock(runtime, runId);
         let workspace = null;
