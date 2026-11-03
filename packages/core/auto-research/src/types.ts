@@ -86,7 +86,7 @@ export interface ResearchPlanInput {
   metric_subset?: unknown
   portfolio_size?: unknown
   meaningful_gain?: unknown
-  /** LayerFS ref the first batch starts from: `main`, a branch or a commit. */
+  /** Workspace ref the first batch starts from: `main`, a branch or a commit. */
   base?: unknown
   options?: PlanOptions
   [key: string]: unknown

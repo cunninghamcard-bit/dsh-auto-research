@@ -1,7 +1,7 @@
 /**
  * One research batch.
  *
- * A port of ara's `Runner` onto LayerFS branches and dsh continuable
+ * A port of ara's `Runner` onto workspace branches and dsh continuable
  * subagents: explore forks the leader's commit into fresh branches, each with
  * a new worker; continue gives the leader's branch a worker seeded with the
  * leader worker's own session. Every state is a commit, scored by the plan's evaluator through the
@@ -193,8 +193,7 @@ export class Runner {
         await this.writeBranchFile(scratch, { id, phase, ref, seconds, view: rsiTop ? view : null });
         const prompt = buildWorkerPrompt({
             plan: this.plan,
-            project: this.deps.workspace.project,
-            branch: ref.branch,
+            branch: this.deps.workspace.describe(ref),
             scratch,
             seconds,
             portfolioSize: rsiTop ? this.plan.portfolio_size : null,
@@ -256,8 +255,8 @@ export class Runner {
             run_id: this.deps.runId,
             branch_id: branch.id,
             phase: branch.phase,
-            layerfs_project: this.deps.workspace.project,
-            layerfs_branch: branch.ref.branch,
+            project: this.deps.workspace.project,
+            branch: branch.ref.branch,
             start_commit: branch.ref.commit,
             deadline_unix: Math.floor(Date.now() / 1000 + branch.seconds),
             seconds: branch.seconds,

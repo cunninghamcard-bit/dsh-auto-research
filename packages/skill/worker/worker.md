@@ -1,6 +1,6 @@
 # Auto research (branch worker)
 
-You run experiments on one LayerFS branch of a research batch. A coordinator owns the plan and the evaluator. After your turn the runner reads your branch's newest commit and scores it with the evaluator. Only committed work is scored.
+You run experiments on one branch of a research batch. A coordinator owns the plan and the evaluator. After your turn the runner reads your branch's newest commit and scores it with the evaluator. Only committed work is scored.
 
 ## Start
 
@@ -10,12 +10,12 @@ You run experiments on one LayerFS branch of a research batch. A coordinator own
 
 ## Where things are
 
-- **The project** is your LayerFS branch, `layerfs_branch` in project `layerfs_project`. Read and change it with the `layerfs` command or the SDK, as the LayerFS instructions in your system prompt describe: mount a Workspace in your own Sandbox, run commands there, commit, unmount.
+- **The project** is your branch, `branch` in project `project`. Your first prompt says how to read, change and commit it.
 - **Your current directory** is a scratch folder on the host for notes, scripts and logs. It is not part of the project and is not evaluated.
 
 ## Running on the evaluation hardware
 
-Your own Sandbox has no GPU. To run a command where the evaluator runs (a Colab GPU when the batch uses one, else a LayerFS Sandbox), commit first, then call the `research_run` tool:
+Where you change the branch may lack the hardware the evaluator uses, such as a GPU. To run a command where the evaluator runs, commit first, then call the `research_run` tool:
 
 ```json
 { "command": "python3 bench.py --size 4096", "timeout_seconds": 600 }
@@ -27,7 +27,6 @@ It runs the command with `bash -c` from the root of your branch's newest commit,
 
 - Change only your own branch. Never fork, merge into or publish to another branch or `main`.
 - Commit after every step that changes files, with a message naming the step and its result. Before your time runs out, make sure your best state is the branch head.
-- Unmount every Workspace before you end your turn.
 - Do not modify the evaluator or weaken any check to make a candidate pass. Do not fabricate results or passing checks.
 - End your turn before `deadline_unix`. Do not start a command likely to overrun it. When the time is up the turn is interrupted; what you committed is still scored.
 - Keep `NOTES.md` in your current directory current: results, failed approaches with the reason, and the next step. A continued session reads it again.
@@ -37,7 +36,7 @@ It runs the command with `bash -c` from the root of your branch's newest commit,
 | Field | Meaning |
 |---|---|
 | `branch_id`, `phase` | This branch's id, and `explore` or `continue` |
-| `layerfs_project`, `layerfs_branch` | Where you work |
+| `project`, `branch` | Where you work |
 | `start_commit` | The commit your turn started from |
 | `deadline_unix`, `seconds` | When your turn ends, and its length |
 | `rsi_top` | `{ portfolio_size, metric_view }` on RSI-top explore branches, else `null` |

@@ -4,7 +4,7 @@
  * Provides the `ctx.researchExecutor` registry and `ctx.researchWorkers`, and
  * registers the `auto-research` SubagentProvider, the `auto-research-continue`
  * provider continue workers start through, and the workers' `research_run` tool;
- * workers' agents do not get the `subagent_auto_research` tool. The
+ * workers' agents do not get the batch tool (`batchTool`). The
  * workspace (`ctx.researchWorkspace`), the executors and the prompts are other
  * packages of the bundle; the `subagent_auto_research` tool comes from
  * `@deepseek-ai/dsh-tool-subagent`. All are rows of `cordis.patch.yml`.
@@ -13,8 +13,6 @@ import { AutoResearchProvider } from './provider.js';
 import { ResearchExecutorRegistry } from './registry.js';
 import { researchRunTool } from './research-run.js';
 export const name = 'dsh-auto-research';
-/** The batch tool `cordis.patch.yml` registers through `@deepseek-ai/dsh-tool-subagent`. */
-const BATCH_TOOL = 'subagent_auto_research';
 export const inject = ['subagents'];
 /** Standard-schema config: an object, validated per batch with the plan. */
 export const Config = Object.freeze({
@@ -45,9 +43,11 @@ export function apply(ctx, config = {}) {
         const tools = inner.tools;
         // Only running workers' steps see `research_run`.
         inner.effect(() => tools.register(researchRunTool(provider.workers), { when: ({ agent }) => provider.workers.has(agent.id) }));
+        // Workers never start batches: their agents are created without the batch tool.
+        const batchTool = config.batchTool ?? 'subagent_auto_research';
         inner.on('agent/created', ({ agent }) => {
-            if (provider.workers.has(agent.id) && tools.get(BATCH_TOOL))
-                agent.ctx.tools.restrict({ deny: [BATCH_TOOL] });
+            if (provider.workers.has(agent.id) && tools.get(batchTool))
+                agent.ctx.tools.restrict({ deny: [batchTool] });
         });
     });
     ctx.inject(['sessionQuery'], inner => {

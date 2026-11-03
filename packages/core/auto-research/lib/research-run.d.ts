@@ -1,7 +1,6 @@
 /**
  * `research_run`: the dsh tool a branch worker calls to run a command on its
- * own branch through the batch executor (a Colab GPU, or a LayerFS Sandbox),
- * the same way the evaluator runs.
+ * own branch through the batch executor, the same way the evaluator runs.
  *
  * The runner registers each worker's session id in {@link Workers} before the
  * worker starts, and the tool takes part in a step only when the calling agent

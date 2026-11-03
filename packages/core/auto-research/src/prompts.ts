@@ -15,9 +15,9 @@ export function branchFile(scratch: string): string {
 }
 
 /** The first prompt of a fresh worker. */
-export function buildWorkerPrompt({ plan, project, branch, scratch, seconds, portfolioSize }: {
+export function buildWorkerPrompt({ plan, branch, scratch, seconds, portfolioSize }: {
   plan: ResearchPlan
-  project: string
+  /** The workspace's description of the worker's branch. */
   branch: string
   scratch: string
   seconds: number
@@ -28,7 +28,7 @@ export function buildWorkerPrompt({ plan, project, branch, scratch, seconds, por
     plan.worker_prompt,
     '',
     'Objective: ' + plan.objective,
-    `Your branch: LayerFS project ${project}, branch ${branch}. Work and commit only on this branch.`,
+    branch,
     `Your folder for notes and scratch files: ${scratch} (the current directory). It is not part of the project.`,
     `Time: ${Math.round(seconds / 60)} minutes. Commit your best state before then; only committed work is evaluated.`,
     `This branch's parameters: ${branchFile(scratch)}`,

@@ -1,7 +1,7 @@
 /**
  * One research batch.
  *
- * A port of ara's `Runner` onto LayerFS branches and dsh continuable
+ * A port of ara's `Runner` onto workspace branches and dsh continuable
  * subagents: explore forks the leader's commit into fresh branches, each with
  * a new worker; continue gives the leader's branch a worker seeded with the
  * leader worker's own session. Every state is a commit, scored by the plan's evaluator through the

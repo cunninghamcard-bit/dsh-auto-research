@@ -6,6 +6,8 @@ import type { ResearchOptions, ResearchPlan, ResearchPlanInput, WorkerAgentOptio
 /** Plugin configuration: the defaults a plan's `options` override. */
 export interface Config extends Partial<ResearchOptions> {
     providerName?: string;
+    /** The `toolName` of the `subagent_auto_research` row; workers' agents are created without it. */
+    batchTool?: string;
     workerProvider?: string;
     workerLlmProvider?: string;
     workerModel?: string;

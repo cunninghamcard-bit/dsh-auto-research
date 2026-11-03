@@ -50,6 +50,7 @@ Requirements:
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `providerName` | `auto-research` | Registry name of the provider |
+| `batchTool` | `subagent_auto_research` | `toolName` of the tool row; workers' agents are created without this tool |
 | `workerProvider` | `spawn` | Worker provider; it must support continuable (in-process) children |
 | `workerModel`, `workerLlmProvider`, `workerReasoningEffort`, `workerAgentOptions` | the coordinator's | Worker LLM; without a provider, the coordinator's provider |
 | `planPath` | `.auto-research-methods/plan.json` | Plan file, relative to the coordinator's folder |

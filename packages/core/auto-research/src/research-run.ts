@@ -1,7 +1,6 @@
 /**
  * `research_run`: the dsh tool a branch worker calls to run a command on its
- * own branch through the batch executor (a Colab GPU, or a LayerFS Sandbox),
- * the same way the evaluator runs.
+ * own branch through the batch executor, the same way the evaluator runs.
  *
  * The runner registers each worker's session id in {@link Workers} before the
  * worker starts, and the tool takes part in a step only when the calling agent
@@ -101,7 +100,7 @@ export function researchRunTool(workers: Workers): ResearchRunTool {
   return {
     name: RESEARCH_RUN_TOOL,
     description:
-      'Run a bash command on the evaluation hardware (a Colab GPU when the batch uses one, else a LayerFS Sandbox), '
+      'Run a bash command where the evaluator runs (this batch\'s executor), '
       + 'from the root of a fresh copy of your branch\'s newest commit. Commit first: only committed files are there, and nothing the command writes is kept. '
       + 'Returns the environment, the commit, the exit code, stdout and stderr. Runs of all branches share one queue with the evaluations, so keep them short.',
     parameters: {

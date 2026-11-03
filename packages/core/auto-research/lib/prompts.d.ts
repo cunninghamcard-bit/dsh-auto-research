@@ -9,9 +9,9 @@ import type { ResearchPlan, TrajectoryRow } from './types.js';
 /** The branch's parameters, in the worker's scratch folder. */
 export declare function branchFile(scratch: string): string;
 /** The first prompt of a fresh worker. */
-export declare function buildWorkerPrompt({ plan, project, branch, scratch, seconds, portfolioSize }: {
+export declare function buildWorkerPrompt({ plan, branch, scratch, seconds, portfolioSize }: {
     plan: ResearchPlan;
-    project: string;
+    /** The workspace's description of the worker's branch. */
     branch: string;
     scratch: string;
     seconds: number;

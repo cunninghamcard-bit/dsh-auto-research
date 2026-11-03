@@ -52,6 +52,7 @@ pnpm run build
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
 | `providerName` | `auto-research` | provider 注册名 |
+| `batchTool` | `subagent_auto_research` | 工具那一行的 `toolName`；worker 的 agent 创建时去掉这个工具 |
 | `workerProvider` | `spawn` | worker 使用的 provider，必须支持可续接的进程内子 agent |
 | `workerModel`、`workerLlmProvider`、`workerReasoningEffort`、`workerAgentOptions` | 与协调者相同 | worker 使用的模型；不指定 provider 时用协调者的 provider |
 | `planPath` | `.auto-research-methods/plan.json` | plan 文件路径，相对于协调者所在目录 |

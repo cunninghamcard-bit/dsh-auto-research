@@ -57,7 +57,7 @@ export class AutoResearchProvider {
         const output = join(runtime, 'runs', runId);
         const logged = this.ctx.logger ? { logger: this.ctx.logger } : {};
         if (!this.ctx.researchWorkspace)
-            throw new Error('No research workspace: load dsh-auto-research-workspace-layerfs');
+            throw new Error('No research workspace: load a workspace plugin of the bundle');
         const workspace = await this.ctx.researchWorkspace.open(request.parent, logged);
         const executor = await this.executors.select(options.executor, logged).catch(async (error) => {
             await workspace.close().catch(() => { });

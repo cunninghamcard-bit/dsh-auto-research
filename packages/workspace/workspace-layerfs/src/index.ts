@@ -152,6 +152,13 @@ export class LayerFSWorkspace implements Workspace {
     return { branch: forked.branch, commit: forked.head, base: forked.base }
   }
 
+  describe(ref: BranchRef): string {
+    return [
+      `Your branch: LayerFS project ${this.project}, branch ${ref.branch}. Work and commit only on this branch.`,
+      'Read and change it with the `layerfs` command or the SDK, as the LayerFS instructions in your system prompt describe: mount a Workspace in your own Sandbox, run commands there, commit, and unmount every Workspace before you end your turn.',
+    ].join('\n')
+  }
+
   async head(branch: string): Promise<BranchRef> {
     for (let page = 0; ;) {
       const listed = await retry(() => this.client.project.list_branches(1000, page))

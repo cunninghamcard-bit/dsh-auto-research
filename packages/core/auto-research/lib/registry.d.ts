@@ -1,8 +1,7 @@
 /**
  * `ctx.researchExecutor`, the registry the core plugin provides: where
  * commands run. Executors are Cordis plugins that inject it and register a
- * factory: `sandbox` from `dsh-auto-research-workspace-layerfs`, `colab` from
- * `dsh-auto-research-executor-colab`. The core ships none of its own.
+ * factory. The core ships none of its own.
  */
 import type { ExecutorBackend, ExecutorBackendFactory, Logger } from 'dsh-auto-research-api';
 interface Factory<B, O> {

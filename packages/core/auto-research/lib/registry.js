@@ -1,8 +1,7 @@
 /**
  * `ctx.researchExecutor`, the registry the core plugin provides: where
  * commands run. Executors are Cordis plugins that inject it and register a
- * factory: `sandbox` from `dsh-auto-research-workspace-layerfs`, `colab` from
- * `dsh-auto-research-executor-colab`. The core ships none of its own.
+ * factory. The core ships none of its own.
  */
 export class BackendRegistry {
     label;
@@ -54,7 +53,7 @@ export class BackendRegistry {
 }
 export class ResearchExecutorRegistry extends BackendRegistry {
     constructor() {
-        super('executor', 'load dsh-auto-research-workspace-layerfs (sandbox) or dsh-auto-research-executor-colab');
+        super('executor', 'load an executor plugin of the bundle');
     }
 }
 function names(factories) {

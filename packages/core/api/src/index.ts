@@ -58,6 +58,8 @@ export interface Workspace {
   fork(from: BranchRef | string, name: string): Promise<BranchRef>
   /** The branch's newest commit. */
   head(branch: string): Promise<BranchRef>
+  /** How a worker reaches and changes `ref`'s branch; part of the worker's first prompt. */
+  describe(ref: BranchRef): string
   /** Run a command on a commit inside a Sandbox; nothing is committed. */
   run(ref: BranchRef, options: RunOptions): Promise<ExecutionResult>
   /** Write the commit's tree as a `.tar.gz` under `directory` and return its path. */

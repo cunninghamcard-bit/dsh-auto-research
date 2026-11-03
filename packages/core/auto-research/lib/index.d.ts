@@ -4,7 +4,7 @@
  * Provides the `ctx.researchExecutor` registry and `ctx.researchWorkers`, and
  * registers the `auto-research` SubagentProvider, the `auto-research-continue`
  * provider continue workers start through, and the workers' `research_run` tool;
- * workers' agents do not get the `subagent_auto_research` tool. The
+ * workers' agents do not get the batch tool (`batchTool`). The
  * workspace (`ctx.researchWorkspace`), the executors and the prompts are other
  * packages of the bundle; the `subagent_auto_research` tool comes from
  * `@deepseek-ai/dsh-tool-subagent`. All are rows of `cordis.patch.yml`.

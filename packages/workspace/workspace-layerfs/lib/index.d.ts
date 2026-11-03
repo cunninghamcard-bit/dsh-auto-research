@@ -66,6 +66,7 @@ export declare class LayerFSWorkspace implements Workspace {
     private sandbox;
     constructor(client: LayerFSClient, project: string, logger?: Logger | null);
     fork(from: BranchRef | string, name: string): Promise<BranchRef>;
+    describe(ref: BranchRef): string;
     head(branch: string): Promise<BranchRef>;
     run(ref: BranchRef, options: RunOptions): Promise<ExecutionResult>;
     exportTree(ref: BranchRef, directory: string): Promise<string>;
