@@ -63,7 +63,7 @@ The runner copies the evaluator outside every candidate, hashes it, and runs it 
 
 - Print exactly one JSON object on stdout. An invalid candidate prints `"valid": false` with a `reason`.
 - `score` and every metric are finite numbers; booleans are rejected.
-- Every `evidence` entry is a regular file inside the evaluated workspace.
+- A valid result needs at least one `evidence` entry; an empty list fails the evaluation. Each entry is a relative path to a regular file that existed in the workspace before evaluation, or one the evaluator wrote under `.method-evaluation/`. Citing the evaluated source file is enough.
 - Never modify the workspace. Disposable files go under the candidate's `.method-evaluation/` only. The runner compares the full inventory before and after.
 - Check real correctness or feasibility. Do not trust scores the candidate reports about itself; replay them. Do not import editable candidate code as the checker.
 - If no honest automatic evaluator is possible, explain the missing criterion and stop.

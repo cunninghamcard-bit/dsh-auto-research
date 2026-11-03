@@ -136,7 +136,8 @@ worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以
 
 - stdout 只输出一个 JSON 对象；无效候选输出 `valid: false`。
 - `score` 必须有限；布尔值与非有限哨兵会被拒绝。
-- `evidence` 的每一项都必须是被评估工作区内包含的普通文件。
+- 有效结果的 `evidence` 至少要有一项；空列表会让评估失败（`No evaluation evidence`）。
+- 每一项是相对路径（不能有 `./`、`..`、空段或反斜杠），指向评估开始前就已存在于工作区的普通文件，或评估器写在 `.method-evaluation/` 下的文件。被评估的源文件本身也可以作为一项。
 - 脚本不得修改工作区；运行器会比较评估前后的完整清单。
 - 每次评估前后都会校验冻结副本的 SHA-256。
 - `.py` 使用 `python3 -I -B`；`.js/.mjs/.cjs` 使用当前 Node 可执行文件。可用 `evaluator_interpreter` 覆盖。

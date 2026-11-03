@@ -135,7 +135,8 @@ The evaluator is copied out of the candidate workspace, hashed, and executed wit
 
 - One JSON object on stdout. Invalid candidates emit `valid: false`.
 - `score` must be finite; booleans and non-finite sentinels are rejected.
-- Every entry in `evidence` must be a contained regular file inside the evaluated workspace.
+- A valid result lists at least one `evidence` entry; an empty list fails the evaluation (`No evaluation evidence`).
+- Each entry is a relative path (no `./`, `..`, empty segments or backslashes) to a regular file that already existed in the workspace before the evaluation, or to a file the evaluator wrote under `.method-evaluation/`. The evaluated source file itself is a valid entry.
 - The script must not modify the workspace; the runner compares the full inventory before and after.
 - The frozen copy's SHA-256 is checked before and after every evaluation.
 - `.py` evaluators run with `python3 -I -B`; `.js/.mjs/.cjs` run with the current Node executable. Set `evaluator_interpreter` to override.
