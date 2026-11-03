@@ -1,7 +1,7 @@
 {
-  "name": "dsh-auto-research-executor-local",
+  "name": "dsh-auto-research-worker",
   "version": "0.3.0",
-  "description": "Runs dsh-auto-research commands in the batch's LayerFS Sandbox",
+  "description": "The branch-worker skill of dsh-auto-research: how a worker uses its branch, commits and research_run",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -12,7 +12,7 @@
     },
     "./package.json": "./package.json"
   },
-  "files": ["lib", "src"],
+  "files": ["lib", "src", "skills"],
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit"

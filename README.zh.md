@@ -16,11 +16,12 @@
 
 | 包 | 路径 | 职责 |
 | --- | --- | --- |
-| `dsh-auto-research` | `packages/core/auto-research` | bundle 本身：提供 `ctx.researchWorkspace`、`ctx.researchExecutor` 两个注册表，注册 `auto-research` SubagentProvider 和 skills，运行批次 |
-| `dsh-auto-research-api` | `packages/core/api` | 只有类型：`BranchRef`、`WorkspaceBackend`、`ExecutorBackend` 和工厂接口；实现包只依赖它 |
-| `dsh-auto-research-workspace-layerfs` | `packages/workspace/workspace-layerfs` | 对话所绑定 LayerFS 项目的分支：fork 分支、读取分支 head、在自己的 Sandbox 里对某个提交执行命令、把提交导出为 tarball |
-| `dsh-auto-research-executor-local` | `packages/executor/executor-local` | 在 workspace 的 LayerFS Sandbox 里执行命令（CPU），优先级 0 |
-| `dsh-auto-research-executor-colab` | `packages/executor/executor-colab` | 经已登录 Colab CLI 的 ssh 代理在 Google Colab GPU 上执行命令，配置后优先级 100 |
+| `dsh-auto-research` | `packages/core/auto-research` | bundle 本身和 runner：注册 `auto-research` SubagentProvider 和 worker 的 `research_run` 工具，提供 `ctx.researchExecutor` 注册表 |
+| `dsh-auto-research-api` | `packages/core/api` | 插件之间的约定：`BranchRef`、`Workspace`、`ExecutorBackend`、工厂接口，以及提示词包共用的 skill 注册函数 |
+| `dsh-auto-research-workspace-layerfs` | `packages/workspace/workspace-layerfs` | 所有 LayerFS 相关的代码：提供 `ctx.researchWorkspace`（fork 对话所绑定项目的分支、读取 head、在自己的 Sandbox 里对某个提交执行命令、把提交导出为 tarball），并把这个 Sandbox 登记为 `sandbox` 执行器，优先级 0 |
+| `dsh-auto-research-coordinator` | `packages/skill/coordinator` | 只有提示词：协调者 skill `auto-research` |
+| `dsh-auto-research-worker` | `packages/skill/worker` | 只有提示词：worker skill `auto-research-worker` |
+| `dsh-auto-research-executor-colab` | `packages/executor/executor-colab` | 经已登录 Colab CLI 的 ssh 代理在 Google Colab GPU 上执行命令，附带 Colab 的 skill，配置后优先级 100 |
 
 ```bash
 pnpm install
@@ -29,7 +30,7 @@ pnpm run build
 
 ## 安装
 
-把 `packages/core/auto-research` 链接进 dsh profile，并在 bundles 里加入 `dsh-auto-research`。bundle 自带的 [`cordis.patch.yml`](packages/core/auto-research/cordis.patch.yml) 会插入四行：核心、LayerFS workspace、本地执行器、`subagent_auto_research` 工具。
+把 `packages/core/auto-research` 链接进 dsh profile，并在 bundles 里加入 `dsh-auto-research`。bundle 自带的 [`cordis.patch.yml`](packages/core/auto-research/cordis.patch.yml) 会插入五行：核心、LayerFS、协调者和 worker 的提示词、`subagent_auto_research` 工具。
 
 要用 Colab，再插入 Colab 行并指定会话：
 
@@ -53,7 +54,7 @@ pnpm run build
 | --- | --- | --- |
 | `providerName` | `auto-research` | provider 注册名 |
 | `workerProvider` | `spawn` | worker 使用的 provider，必须支持可续接的进程内子 agent |
-| `workerModel`、`workerLlmProvider`、`workerReasoningEffort`、`workerAgentOptions` | 与协调者相同 | worker 使用的模型；`workerModel` 可以填模型 id，也可以填显示名 |
+| `workerModel`、`workerLlmProvider`、`workerReasoningEffort`、`workerAgentOptions` | 与协调者相同 | worker 使用的模型；不指定 provider 时用协调者的 provider |
 | `planPath` | `.auto-research-methods/plan.json` | plan 文件路径，相对于协调者所在目录 |
 | `rounds` | `3` | 每个批次的轮数 |
 | `branches` | `4` | 每轮 explore 的分支数 |
@@ -61,7 +62,7 @@ pnpm run build
 | `exploitationMinutes` | `15` | continue 阶段的时长（分钟） |
 | `forkAndFlush` | `true` | 每一轮都执行 explore |
 | `rsiTop` | `false` | 只在停滞时执行 explore，并给 worker 随机指标视图、要求写假设组合 |
-| `workspaceBackend`、`executor` | `auto` | 已注册的后端名；`auto` 按优先级取第一个可用的 |
+| `executor` | `auto` | 已登记的执行器（`sandbox`、`colab`）；`auto` 按优先级取第一个可用的 |
 
 plan 的 `options` 可以覆盖以上任何一项。
 

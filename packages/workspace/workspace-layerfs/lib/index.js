@@ -3,8 +3,10 @@
  * of the coordinator's project.
  *
  * Workers reach their branch with the `layerfs` command the dsh-layerfs preset
- * gives every bash call; this backend only forks branches, reads their heads,
- * and runs commands on a commit in a Sandbox of its own. Nothing is copied to
+ * gives every bash call; this plugin forks branches, reads their heads, and
+ * runs commands on a commit in a Sandbox of its own. It provides
+ * `ctx.researchWorkspace` and registers that Sandbox as the `sandbox`
+ * executor, the default where no other executor applies. Nothing is copied to
  * the host except an exported tarball an executor asks for.
  */
 var __rewriteRelativeImportExtension = (this && this.__rewriteRelativeImportExtension) || function (path, preserveJsx) {
@@ -20,7 +22,7 @@ import * as fsp from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 export const name = 'dsh-auto-research-workspace-layerfs';
-export const inject = ['researchWorkspace'];
+export const inject = ['researchExecutor', 'shellEnv'];
 /** The `DSH_LAYERFS_*` names `@dsh-layerfs/host` publishes, and the `LAYERFS_*` names `LayerFS.open` reads. */
 const SDK_ENVIRONMENT = [
     ['LAYERFS_HOME', 'DSH_LAYERFS_HOME'],
@@ -103,14 +105,11 @@ const EXPORT_CHUNK = 4 * 1024 * 1024;
 export class LayerFSWorkspace {
     client;
     project;
-    runId;
     logger;
-    name = 'layerfs';
     sandbox = null;
-    constructor(client, project, runId, logger = null) {
+    constructor(client, project, logger = null) {
         this.client = client;
         this.project = project;
-        this.runId = runId;
         this.logger = logger;
     }
     async fork(from, name) {
@@ -128,26 +127,6 @@ export class LayerFSWorkspace {
                 throw new Error(`LayerFS branch ${branch} does not exist`);
             page = listed.nextPagePos;
         }
-    }
-    async readText(ref, path) {
-        const at = ref.commit ?? ref.branch;
-        const absolute = path.startsWith('/') ? path : '/' + path;
-        let text = '';
-        for (let line = 1; line !== undefined;) {
-            let page;
-            try {
-                const start = line;
-                page = await retry(() => this.client.fs.read(at, absolute, start));
-            }
-            catch (error) {
-                if (refusal(error) === 'NoSuchPath')
-                    return null;
-                throw error;
-            }
-            text += page.text;
-            line = typeof page.nextLine === 'number' ? page.nextLine : undefined;
-        }
-        return text;
     }
     async run(ref, options) {
         options.signal?.throwIfAborted();
@@ -241,17 +220,39 @@ export class LayerFSWorkspace {
         }
     }
 }
-export class LayerFSWorkspaceFactory {
-    name = 'layerfs';
-    priority = 100;
-    async create(options) {
-        const client = await openLayerfs(options.env);
+/** The synthetic tool-call id the coordinator's bash variables are read under. */
+const SHELL_ENV_CALL_ID = 'auto-research-env';
+/** `ctx.researchWorkspace`: the project the coordinator's session is bound to. */
+export class LayerFSWorkspaceService {
+    shellEnv;
+    constructor(shellEnv) {
+        this.shellEnv = shellEnv;
+    }
+    async open(parent, options) {
+        const env = this.shellEnv.collect({ agent: parent, callId: SHELL_ENV_CALL_ID, rootCallId: SHELL_ENV_CALL_ID });
+        const client = await openLayerfs(env);
         if (!client)
-            return null;
-        return new LayerFSWorkspace(client, options.env.DSH_LAYERFS_PROJECT, options.runId, options.logger ?? null);
+            throw new Error('This session is not bound to a LayerFS project; use LayerFS in the conversation first');
+        return new LayerFSWorkspace(client, env.DSH_LAYERFS_PROJECT, options.logger ?? null);
+    }
+}
+/** The `sandbox` executor: run in the batch workspace's own Sandbox (CPU). */
+export class SandboxExecutor {
+    name = 'sandbox';
+    run(request) {
+        const { ref, workspace, ...options } = request;
+        return workspace.run(ref, options);
+    }
+}
+export class SandboxExecutorFactory {
+    name = 'sandbox';
+    priority = 0;
+    async create() {
+        return new SandboxExecutor();
     }
 }
 export function apply(ctx) {
-    ctx.effect(() => ctx.researchWorkspace.register(new LayerFSWorkspaceFactory()));
+    ctx.provide('researchWorkspace', new LayerFSWorkspaceService(ctx.shellEnv));
+    ctx.effect(() => ctx.researchExecutor.register(new SandboxExecutorFactory()));
 }
 //# sourceMappingURL=index.js.map

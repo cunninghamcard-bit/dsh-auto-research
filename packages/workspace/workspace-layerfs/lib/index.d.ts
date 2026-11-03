@@ -3,11 +3,13 @@
  * of the coordinator's project.
  *
  * Workers reach their branch with the `layerfs` command the dsh-layerfs preset
- * gives every bash call; this backend only forks branches, reads their heads,
- * and runs commands on a commit in a Sandbox of its own. Nothing is copied to
+ * gives every bash call; this plugin forks branches, reads their heads, and
+ * runs commands on a commit in a Sandbox of its own. It provides
+ * `ctx.researchWorkspace` and registers that Sandbox as the `sandbox`
+ * executor, the default where no other executor applies. Nothing is copied to
  * the host except an exported tarball an executor asks for.
  */
-import type { BackendCreateOptions, BranchRef, ExecutionResult, Logger, PluginContext, RunOptions, WorkspaceBackend, WorkspaceBackendFactory } from 'dsh-auto-research-api';
+import type { BranchRef, ExecutionRequest, ExecutionResult, ExecutorBackend, ExecutorBackendFactory, Logger, PluginContext, RunOptions, Workspace, WorkspaceService } from 'dsh-auto-research-api';
 export declare const name = "dsh-auto-research-workspace-layerfs";
 export declare const inject: string[];
 /** A mounted Workspace. */
@@ -49,12 +51,6 @@ export interface LayerFSClient {
         }>;
         unmount: (ws: Mount, discard?: boolean) => Promise<unknown>;
     };
-    fs: {
-        read: (ref: string, path: string, startLine?: number) => Promise<{
-            text: string;
-            nextLine?: number | null;
-        }>;
-    };
     close: () => Promise<unknown>;
 }
 /**
@@ -63,17 +59,14 @@ export interface LayerFSClient {
  * set on `process.env` around the open and restored right after it.
  */
 export declare function openLayerfs(env: Readonly<Record<string, string | undefined>>): Promise<LayerFSClient | null>;
-export declare class LayerFSWorkspace implements WorkspaceBackend {
+export declare class LayerFSWorkspace implements Workspace {
     readonly client: LayerFSClient;
     readonly project: string;
-    readonly runId: string;
     readonly logger: Logger | null;
-    readonly name = "layerfs";
     private sandbox;
-    constructor(client: LayerFSClient, project: string, runId: string, logger?: Logger | null);
+    constructor(client: LayerFSClient, project: string, logger?: Logger | null);
     fork(from: BranchRef | string, name: string): Promise<BranchRef>;
     head(branch: string): Promise<BranchRef>;
-    readText(ref: BranchRef, path: string): Promise<string | null>;
     run(ref: BranchRef, options: RunOptions): Promise<ExecutionResult>;
     exportTree(ref: BranchRef, directory: string): Promise<string>;
     close(): Promise<void>;
@@ -89,10 +82,31 @@ export declare class LayerFSWorkspace implements WorkspaceBackend {
      */
     private mount;
 }
-export declare class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
-    readonly name = "layerfs";
-    readonly priority = 100;
-    create(options: BackendCreateOptions): Promise<LayerFSWorkspace | null>;
+/** `ctx.shellEnv` surface: the `DSH_*` variables a bash call of `agent` would get. */
+interface ShellEnv {
+    collect: (execution: {
+        agent?: unknown;
+        callId: string;
+        rootCallId?: string;
+    }) => Readonly<Record<string, string>>;
+}
+/** `ctx.researchWorkspace`: the project the coordinator's session is bound to. */
+export declare class LayerFSWorkspaceService implements WorkspaceService {
+    readonly shellEnv: ShellEnv;
+    constructor(shellEnv: ShellEnv);
+    open(parent: unknown, options: {
+        logger?: Logger;
+    }): Promise<LayerFSWorkspace>;
+}
+/** The `sandbox` executor: run in the batch workspace's own Sandbox (CPU). */
+export declare class SandboxExecutor implements ExecutorBackend {
+    readonly name = "sandbox";
+    run(request: ExecutionRequest): Promise<ExecutionResult>;
+}
+export declare class SandboxExecutorFactory implements ExecutorBackendFactory {
+    readonly name = "sandbox";
+    readonly priority = 0;
+    create(): Promise<SandboxExecutor>;
 }
 export declare function apply(ctx: PluginContext): void;
 export {};

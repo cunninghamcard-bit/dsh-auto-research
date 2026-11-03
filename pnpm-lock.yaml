@@ -22,12 +22,15 @@ importers:
       dsh-auto-research-api:
         specifier: workspace:*
         version: link:../api
+      dsh-auto-research-coordinator:
+        specifier: workspace:*
+        version: link:../../skill/coordinator
       dsh-auto-research-executor-colab:
         specifier: workspace:*
         version: link:../../executor/executor-colab
-      dsh-auto-research-executor-local:
+      dsh-auto-research-worker:
         specifier: workspace:*
-        version: link:../../executor/executor-local
+        version: link:../../skill/worker
       dsh-auto-research-workspace-layerfs:
         specifier: workspace:*
         version: link:../../workspace/workspace-layerfs
@@ -38,7 +41,13 @@ importers:
         specifier: workspace:*
         version: link:../../core/api
 
-  packages/executor/executor-local:
+  packages/skill/coordinator:
+    dependencies:
+      dsh-auto-research-api:
+        specifier: workspace:*
+        version: link:../../core/api
+
+  packages/skill/worker:
     dependencies:
       dsh-auto-research-api:
         specifier: workspace:*

@@ -51,7 +51,7 @@ export declare class ColabExecutorFactory implements ExecutorBackendFactory {
     readonly name = "colab";
     readonly priority = 100;
     constructor(config: ColabConfig);
-    /** Null unless sessions are named or may be created, so `auto` falls back to local. */
+    /** Null unless sessions are named or may be created, so `auto` falls back to the Sandbox. */
     create(options: {
         logger?: Logger;
     }): Promise<ColabExecutor | null>;

@@ -16,6 +16,7 @@ import * as fsp from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { registerSkillDirectory } from 'dsh-auto-research-api'
 import type {
   ExecutionRequest,
   ExecutionResult,
@@ -23,6 +24,7 @@ import type {
   ExecutorBackendFactory,
   Logger,
   PluginContext,
+  SkillsService,
 } from 'dsh-auto-research-api'
 
 export const name = 'dsh-auto-research-executor-colab'
@@ -201,29 +203,14 @@ export class ColabExecutorFactory implements ExecutorBackendFactory {
 
   constructor(readonly config: ColabConfig) {}
 
-  /** Null unless sessions are named or may be created, so `auto` falls back to local. */
+  /** Null unless sessions are named or may be created, so `auto` falls back to the Sandbox. */
   async create(options: { logger?: Logger }): Promise<ColabExecutor | null> {
     if (!this.config.sessions?.length && !this.config.createSessions) return null
     return new ColabExecutor(this.config, options.logger ?? null)
   }
 }
 
-const SKILL = fileURLToPath(new URL('../skills/auto-research-colab/SKILL.md', import.meta.url))
-
 export function apply(ctx: PluginContext, config: ColabConfig = {}): void {
   ctx.effect(() => ctx.researchExecutor!.register(new ColabExecutorFactory(config)))
-  const skill = {
-    name: 'auto-research-colab',
-    description: 'Evaluate auto-research candidates on a Google Colab GPU: plan options.executor "colab".',
-    invocation: { modelInvocable: true, userInvocable: false },
-    provider: name,
-    source: 'bundled',
-    rank: 600,
-    resourceBase: { kind: 'directory', path: join(SKILL, '..') },
-  }
-  ctx.skills!.registerProvider(() => ({
-    name,
-    list: async () => [skill],
-    get: async () => ({ ...skill, content: (await fsp.readFile(SKILL, 'utf8')).replace(/^---\n[\s\S]*?\n---\n+/, '') }),
-  }))
+  registerSkillDirectory(ctx.skills as SkillsService, name, fileURLToPath(new URL('../skills/', import.meta.url)), ['auto-research-colab'])
 }

@@ -10,9 +10,9 @@ import * as fsp from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 import { normalizeOptions, resolveWorkerAgentOptions, validatePlan } from './plan.js'
 import type { Config } from './plan.js'
-import type { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js'
-import { WorkerRuns } from './research-run.js'
-import { ActiveWorkers, ResearchStoppedError, Runner } from './runner.js'
+import type { ResearchExecutorRegistry } from './registry.js'
+import { Workers } from './research-run.js'
+import { ResearchStoppedError, Runner } from './runner.js'
 import type {
   ContentBlock,
   Latest,
@@ -35,9 +35,6 @@ export interface ProviderConfig extends Config {
 /** Where the coordinator's runs and `LATEST.json` live, relative to its cwd. */
 const RUNTIME_DIR = '.auto-research-methods'
 
-/** The synthetic tool-call id for a session-wide shell environment snapshot. */
-const SHELL_ENV_CALL_ID = 'auto-research-env'
-
 function text(blocks: string): ContentBlock[] {
   return [{ type: 'text', text: blocks }]
 }
@@ -46,13 +43,11 @@ export class AutoResearchProvider implements SubagentProvider {
   readonly name: string
   readonly capabilities = Object.freeze({ agentOptions: true, agentPreset: false, outputSchema: false, depthLimit: false })
   readonly inheritsParentContext = false
-  readonly workers = new ActiveWorkers()
-  readonly runs = new WorkerRuns()
+  readonly workers = new Workers()
 
   constructor(
     readonly ctx: ProviderContext,
     readonly config: ProviderConfig,
-    readonly workspaces: ResearchWorkspaceRegistry,
     readonly executors: ResearchExecutorRegistry,
   ) {
     this.name = config.providerName ?? 'auto-research'
@@ -80,10 +75,10 @@ export class AutoResearchProvider implements SubagentProvider {
     const latest = await fsp.readFile(latestFile, 'utf8').then(raw => JSON.parse(raw) as Latest, () => null)
     const runId = randomUUID()
     const output = join(runtime, 'runs', runId)
-    const env = this.ctx.shellEnv?.collect({ agent: request.parent, callId: SHELL_ENV_CALL_ID, rootCallId: SHELL_ENV_CALL_ID }) ?? {}
-    const created = { runId, output, env, ...(this.ctx.logger ? { logger: this.ctx.logger } : {}) }
-    const workspace = await this.workspaces.select(options.workspaceBackend, created)
-    const executor = await this.executors.select(options.executor, created).catch(async (error: unknown) => {
+    const logged = this.ctx.logger ? { logger: this.ctx.logger } : {}
+    if (!this.ctx.researchWorkspace) throw new Error('No research workspace: load dsh-auto-research-workspace-layerfs')
+    const workspace = await this.ctx.researchWorkspace.open(request.parent, logged)
+    const executor = await this.executors.select(options.executor, logged).catch(async (error: unknown) => {
       await workspace.close().catch(() => {})
       throw error
     })
@@ -102,7 +97,6 @@ export class AutoResearchProvider implements SubagentProvider {
       workerProvider,
       workerAgentOptions,
       workers: this.workers,
-      runs: this.runs,
       ...(request.signal ? { signal: request.signal } : {}),
       ...(this.ctx.logger ? { logger: this.ctx.logger } : {}),
     })

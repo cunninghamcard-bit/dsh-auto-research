@@ -3,37 +3,51 @@
  * own branch through the batch executor (a Colab GPU, or a LayerFS Sandbox),
  * the same way the evaluator runs.
  *
- * The runner registers each worker's session id before the worker starts, and
- * the tool takes part in a step only when the calling agent is one of them, so
- * no other session ever sees it. Requests of one worker run one at a time.
+ * The runner registers each worker's session id in {@link Workers} before the
+ * worker starts, and the tool takes part in a step only when the calling agent
+ * is one of them, so no other session ever sees it. Requests of one worker run
+ * one at a time.
  */
 export const RESEARCH_RUN_TOOL = 'research_run';
 /** Default timeout of one request, in seconds. */
 const DEFAULT_TIMEOUT_SECONDS = 300;
 /** How much of each output stream a result keeps: the tail. */
 const OUTPUT_CHARS = 20_000;
-/** Running workers' `research_run` handlers, by worker session id. */
-export class WorkerRuns {
+/**
+ * Running workers, by session id: who may call `research_run`, what their
+ * requests run, and which activations a stopping batch interrupts.
+ */
+export class Workers {
     sessions = new Map();
-    /** Serve `session`'s requests with `handler` until the returned function runs. */
-    register(session, handler) {
-        const entry = { handler, queue: Promise.resolve() };
-        this.sessions.set(session, entry);
+    /** Register `session` until the returned function runs. */
+    register(session, owner, handler) {
+        const worker = { owner, handler, queue: Promise.resolve(), activation: null };
+        this.sessions.set(session, worker);
         return () => {
-            if (this.sessions.get(session) === entry)
+            if (this.sessions.get(session) === worker)
                 this.sessions.delete(session);
         };
+    }
+    /** Record the activation a registered session runs in. */
+    attach(session, activation) {
+        const worker = this.sessions.get(session);
+        if (worker)
+            worker.activation = activation;
     }
     has(session) {
         return this.sessions.has(session);
     }
+    /** The running activations of one batch. */
+    activations(owner) {
+        return [...this.sessions.values()].filter(worker => worker.owner === owner && worker.activation).map(worker => worker.activation);
+    }
     /** Run one request after the session's earlier ones. */
     run(session, command, timeoutSeconds, signal) {
-        const entry = this.sessions.get(session);
-        if (!entry)
+        const worker = this.sessions.get(session);
+        if (!worker)
             return Promise.reject(new Error('research_run works only inside a running auto-research worker'));
-        const run = entry.queue.catch(() => { }).then(() => entry.handler(command, timeoutSeconds, signal));
-        entry.queue = run;
+        const run = worker.queue.catch(() => { }).then(() => worker.handler(command, timeoutSeconds, signal));
+        worker.queue = run;
         return run;
     }
 }
@@ -51,7 +65,7 @@ export function formatRun(result) {
         tail(result.stderr),
     ].join('\n');
 }
-export function researchRunTool(runs) {
+export function researchRunTool(workers) {
     return {
         name: RESEARCH_RUN_TOOL,
         description: 'Run a bash command on the evaluation hardware (a Colab GPU when the batch uses one, else a LayerFS Sandbox), '
@@ -76,7 +90,7 @@ export function researchRunTool(runs) {
                 throw new Error('command must be a non-empty string');
             const session = typeof exec.agent?.id === 'string' ? exec.agent.id : '';
             const seconds = typeof timeout === 'number' && timeout > 0 ? timeout : DEFAULT_TIMEOUT_SECONDS;
-            return formatRun(await runs.run(session, command, seconds, exec.signal ?? new AbortController().signal));
+            return formatRun(await workers.run(session, command, seconds, exec.signal ?? new AbortController().signal));
         },
     };
 }

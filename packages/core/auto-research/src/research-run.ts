@@ -3,12 +3,14 @@
  * own branch through the batch executor (a Colab GPU, or a LayerFS Sandbox),
  * the same way the evaluator runs.
  *
- * The runner registers each worker's session id before the worker starts, and
- * the tool takes part in a step only when the calling agent is one of them, so
- * no other session ever sees it. Requests of one worker run one at a time.
+ * The runner registers each worker's session id in {@link Workers} before the
+ * worker starts, and the tool takes part in a step only when the calling agent
+ * is one of them, so no other session ever sees it. Requests of one worker run
+ * one at a time.
  */
 
 import type { ExecutionResult } from 'dsh-auto-research-api'
+import type { SubagentActivation } from './types.js'
 
 /** What a worker's request runs: a bash command on the branch head, within the timeout. */
 export type WorkerRunHandler = (command: string, timeoutSeconds: number, signal: AbortSignal) => Promise<ExecutionResult & { commit: string | null }>
@@ -21,34 +23,51 @@ const DEFAULT_TIMEOUT_SECONDS = 300
 /** How much of each output stream a result keeps: the tail. */
 const OUTPUT_CHARS = 20_000
 
-interface Entry {
+interface Worker {
+  /** The runner of the batch the worker belongs to. */
+  owner: unknown
   handler: WorkerRunHandler
   queue: Promise<unknown>
+  activation: SubagentActivation | null
 }
 
-/** Running workers' `research_run` handlers, by worker session id. */
-export class WorkerRuns {
-  private readonly sessions = new Map<string, Entry>()
+/**
+ * Running workers, by session id: who may call `research_run`, what their
+ * requests run, and which activations a stopping batch interrupts.
+ */
+export class Workers {
+  private readonly sessions = new Map<string, Worker>()
 
-  /** Serve `session`'s requests with `handler` until the returned function runs. */
-  register(session: string, handler: WorkerRunHandler): () => void {
-    const entry: Entry = { handler, queue: Promise.resolve() }
-    this.sessions.set(session, entry)
+  /** Register `session` until the returned function runs. */
+  register(session: string, owner: unknown, handler: WorkerRunHandler): () => void {
+    const worker: Worker = { owner, handler, queue: Promise.resolve(), activation: null }
+    this.sessions.set(session, worker)
     return () => {
-      if (this.sessions.get(session) === entry) this.sessions.delete(session)
+      if (this.sessions.get(session) === worker) this.sessions.delete(session)
     }
+  }
+
+  /** Record the activation a registered session runs in. */
+  attach(session: string, activation: SubagentActivation): void {
+    const worker = this.sessions.get(session)
+    if (worker) worker.activation = activation
   }
 
   has(session: string): boolean {
     return this.sessions.has(session)
   }
 
+  /** The running activations of one batch. */
+  activations(owner: unknown): SubagentActivation[] {
+    return [...this.sessions.values()].filter(worker => worker.owner === owner && worker.activation).map(worker => worker.activation!)
+  }
+
   /** Run one request after the session's earlier ones. */
   run(session: string, command: string, timeoutSeconds: number, signal: AbortSignal): Promise<ExecutionResult & { commit: string | null }> {
-    const entry = this.sessions.get(session)
-    if (!entry) return Promise.reject(new Error('research_run works only inside a running auto-research worker'))
-    const run = entry.queue.catch(() => {}).then(() => entry.handler(command, timeoutSeconds, signal))
-    entry.queue = run
+    const worker = this.sessions.get(session)
+    if (!worker) return Promise.reject(new Error('research_run works only inside a running auto-research worker'))
+    const run = worker.queue.catch(() => {}).then(() => worker.handler(command, timeoutSeconds, signal))
+    worker.queue = run
     return run
   }
 }
@@ -78,7 +97,7 @@ export interface ResearchRunTool {
   execute: (args: unknown, exec: { agent?: { id?: unknown }; signal?: AbortSignal }) => Promise<string>
 }
 
-export function researchRunTool(runs: WorkerRuns): ResearchRunTool {
+export function researchRunTool(workers: Workers): ResearchRunTool {
   return {
     name: RESEARCH_RUN_TOOL,
     description:
@@ -103,7 +122,7 @@ export function researchRunTool(runs: WorkerRuns): ResearchRunTool {
       if (typeof command !== 'string' || command.trim() === '') throw new Error('command must be a non-empty string')
       const session = typeof exec.agent?.id === 'string' ? exec.agent.id : ''
       const seconds = typeof timeout === 'number' && timeout > 0 ? timeout : DEFAULT_TIMEOUT_SECONDS
-      return formatRun(await runs.run(session, command, seconds, exec.signal ?? new AbortController().signal))
+      return formatRun(await workers.run(session, command, seconds, exec.signal ?? new AbortController().signal))
     },
   }
 }

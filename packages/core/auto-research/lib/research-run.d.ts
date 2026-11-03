@@ -3,22 +3,31 @@
  * own branch through the batch executor (a Colab GPU, or a LayerFS Sandbox),
  * the same way the evaluator runs.
  *
- * The runner registers each worker's session id before the worker starts, and
- * the tool takes part in a step only when the calling agent is one of them, so
- * no other session ever sees it. Requests of one worker run one at a time.
+ * The runner registers each worker's session id in {@link Workers} before the
+ * worker starts, and the tool takes part in a step only when the calling agent
+ * is one of them, so no other session ever sees it. Requests of one worker run
+ * one at a time.
  */
 import type { ExecutionResult } from 'dsh-auto-research-api';
+import type { SubagentActivation } from './types.js';
 /** What a worker's request runs: a bash command on the branch head, within the timeout. */
 export type WorkerRunHandler = (command: string, timeoutSeconds: number, signal: AbortSignal) => Promise<ExecutionResult & {
     commit: string | null;
 }>;
 export declare const RESEARCH_RUN_TOOL = "research_run";
-/** Running workers' `research_run` handlers, by worker session id. */
-export declare class WorkerRuns {
+/**
+ * Running workers, by session id: who may call `research_run`, what their
+ * requests run, and which activations a stopping batch interrupts.
+ */
+export declare class Workers {
     private readonly sessions;
-    /** Serve `session`'s requests with `handler` until the returned function runs. */
-    register(session: string, handler: WorkerRunHandler): () => void;
+    /** Register `session` until the returned function runs. */
+    register(session: string, owner: unknown, handler: WorkerRunHandler): () => void;
+    /** Record the activation a registered session runs in. */
+    attach(session: string, activation: SubagentActivation): void;
     has(session: string): boolean;
+    /** The running activations of one batch. */
+    activations(owner: unknown): SubagentActivation[];
     /** Run one request after the session's earlier ones. */
     run(session: string, command: string, timeoutSeconds: number, signal: AbortSignal): Promise<ExecutionResult & {
         commit: string | null;
@@ -47,5 +56,5 @@ export interface ResearchRunTool {
         signal?: AbortSignal;
     }) => Promise<string>;
 }
-export declare function researchRunTool(runs: WorkerRuns): ResearchRunTool;
+export declare function researchRunTool(workers: Workers): ResearchRunTool;
 //# sourceMappingURL=research-run.d.ts.map

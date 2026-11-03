@@ -40,7 +40,6 @@ export function normalizeOptions(config: Config = {}, plan: ResearchPlanInput = 
     exploitationMinutes: overrides.exploitationMinutes ?? config.exploitationMinutes ?? 15,
     rsiTop: overrides.rsiTop ?? config.rsiTop ?? false,
     forkAndFlush: overrides.forkAndFlush ?? config.forkAndFlush ?? true,
-    workspaceBackend: overrides.workspaceBackend ?? config.workspaceBackend ?? 'auto',
     executor: overrides.executor ?? config.executor ?? 'auto',
   }
 }

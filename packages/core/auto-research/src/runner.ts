@@ -15,11 +15,11 @@ import type {
   BranchRef,
   ExecutorBackend,
   Logger,
-  WorkspaceBackend,
+  Workspace,
 } from 'dsh-auto-research-api'
-import type { WorkerRunHandler, WorkerRuns } from './research-run.js'
+import type { WorkerRunHandler, Workers } from './research-run.js'
 import { sampleMetricViews, validatePortfolio } from './protocols.js'
-import { branchFile, buildContinueMessage, buildWorkerPrompt } from './skills.js'
+import { branchFile, buildContinueMessage, buildWorkerPrompt } from './prompts.js'
 import type {
   BatchResult,
   ContentBlock,
@@ -48,27 +48,6 @@ export class ResearchStoppedError extends Error {
 /** How long a worker may take to settle after it is interrupted. */
 const WORKER_GRACE_MS = 30_000
 
-/** Working folders of running workers, for the skill catalog. */
-export class ActiveWorkers {
-  readonly cwds = new Set<string>()
-  onChange: () => void = () => {}
-
-  add(cwd: string): void {
-    this.cwds.add(cwd)
-    this.onChange()
-  }
-
-  remove(cwd: string): void {
-    this.cwds.delete(cwd)
-    this.onChange()
-  }
-
-  ownsCwd(cwd: string): boolean {
-    for (const root of this.cwds) if (cwd === root || cwd.startsWith(root + '/')) return true
-    return false
-  }
-}
-
 export interface RunnerDeps {
   plan: ResearchPlan
   options: ResearchOptions
@@ -78,7 +57,7 @@ export interface RunnerDeps {
   /** `LATEST.json` of this coordinator folder. */
   latestFile: string
   latest: Latest | null
-  workspace: WorkspaceBackend
+  workspace: Workspace
   executor: ExecutorBackend
   evaluatorText: string
   subagents: SubagentsService
@@ -86,9 +65,8 @@ export interface RunnerDeps {
   parent: unknown
   workerProvider: string
   workerAgentOptions: WorkerAgentOptions | null
-  workers: ActiveWorkers
-  /** `research_run` handlers of running workers. */
-  runs: WorkerRuns
+  /** Running workers of every batch: `research_run` handlers and activations. */
+  workers: Workers
   signal?: AbortSignal
   logger?: Logger
   rng?: () => number
@@ -125,8 +103,6 @@ export class Runner {
   readonly rows: TrajectoryRow[] = []
   readonly selections: Array<Record<string, unknown>> = []
   readonly abort = new AbortController()
-  /** Activations still running, so a stop can interrupt them. */
-  private readonly live = new Set<SubagentActivation>()
   anchor: number | null = null
   stalledWorkSeconds = 0
 
@@ -148,7 +124,7 @@ export class Runner {
   stop(): void {
     if (this.stopped()) return
     this.abort.abort()
-    for (const activation of this.live) this.interrupt(activation)
+    for (const activation of this.deps.workers.activations(this)) this.interrupt(activation)
   }
 
   private interrupt(activation: SubagentActivation): void {
@@ -291,7 +267,7 @@ export class Runner {
       && this.deps.subagents.getProvider(this.deps.workerProvider)?.capabilities.agentOptions === true
     // A reserved session id gives the worker research_run from its first step.
     const childId = randomUUID()
-    const unregister = this.deps.runs.register(childId, this.workerRun(ref.branch, folder, seconds, rsiTop ? { scratch, parentId: parent.id } : null))
+    const unregister = this.deps.workers.register(childId, this, this.workerRun(ref.branch, folder, seconds))
     const activation = await this.deps.subagents.startActivation({
       provider: this.deps.workerProvider,
       label: `${this.deps.runId.slice(0, 8)}:${id}`,
@@ -318,7 +294,7 @@ export class Runner {
     const folder = join(this.deps.output, id)
     await fsp.mkdir(folder, { recursive: true })
     await this.writeBranchFile(scratch, { id, phase: 'continue', ref, seconds, view: null })
-    const unregister = this.deps.runs.register(leader.session!, this.workerRun(ref.branch, folder, seconds, null))
+    const unregister = this.deps.workers.register(leader.session!, this, this.workerRun(ref.branch, folder, seconds))
     const activation = await this.deps.subagents.continueActivation({
       parent: this.deps.parent,
       childId: leader.session!,
@@ -367,16 +343,13 @@ export class Runner {
     portfolio: boolean
   }): Promise<TrajectoryRow> {
     const { activation } = turn
-    this.live.add(activation)
-    this.deps.workers.add(turn.scratch)
+    this.deps.workers.attach(activation.childId, activation)
     let timedOut = false
     let result: SubagentResult
     try {
       result = await this.awaitSettled(activation, turn.seconds * 1000, () => { timedOut = true })
     } finally {
       turn.unregister()
-      this.live.delete(activation)
-      this.deps.workers.remove(turn.scratch)
     }
     this.checkStopped()
     const head = await this.deps.workspace.head(turn.ref.branch)
@@ -399,11 +372,12 @@ export class Runner {
       time: Date.now(),
       last_output: output.slice(-4000),
     }
-    if (turn.portfolio && row.evaluation.valid) {
+    if (turn.portfolio) {
+      // Recorded only: nothing downstream reads it, so a missing one costs the branch nothing.
       try {
         row.portfolio = await this.readPortfolio(turn.scratch, turn.parent.id)
       } catch (error) {
-        row.evaluation = { valid: false, reason: 'RSI portfolio: ' + (error as Error).message }
+        row.portfolio_error = (error as Error).message
       }
     }
     await writeJson(join(turn.folder, 'RESULT.json'), row)
@@ -454,23 +428,10 @@ export class Runner {
    * batch executor, no longer than the turn has left. Every request is
    * appended to the branch's `research-runs.jsonl`.
    */
-  private workerRun(
-    branch: string,
-    folder: string,
-    seconds: number,
-    portfolio: { scratch: string; parentId: string } | null,
-  ): WorkerRunHandler {
+  private workerRun(branch: string, folder: string, seconds: number): WorkerRunHandler {
     const deadline = Date.now() + seconds * 1000
     return async (command, timeoutSeconds, signal) => {
       this.checkStopped()
-      if (portfolio) {
-        // RSI-top: no experiment runs before the portfolio the evaluation will require.
-        await this.readPortfolio(portfolio.scratch, portfolio.parentId).catch((error: unknown) => {
-          const file = join(portfolio.scratch, 'PORTFOLIO.json')
-          const problem = (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'it does not exist' : (error as Error).message
-          throw new Error(`Write ${file} before running experiments (${problem}). It must be a JSON array of exactly ${this.plan.portfolio_size} objects, each with non-empty strings bottleneck, mechanism, expected_effect, lineage and a number verbalized_probability in [0, 1]; the bottleneck/mechanism/expected_effect triples must be distinct. Without it the branch is rejected.`)
-        })
-      }
       const left = Math.max(1, Math.floor((deadline - Date.now()) / 1000))
       const ref = await this.deps.workspace.head(branch)
       const started = Date.now()

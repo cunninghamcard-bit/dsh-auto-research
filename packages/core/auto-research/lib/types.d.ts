@@ -2,7 +2,7 @@
  * Types of the auto-research core: the plan, trajectory rows, and the
  * structural subset of the dsh host surface the core uses.
  */
-import type { BranchRef, Logger, SkillsService } from 'dsh-auto-research-api';
+import type { BranchRef, Logger, WorkspaceService } from 'dsh-auto-research-api';
 export type Direction = 'maximize' | 'minimize';
 /** Which half of a round a branch belongs to. */
 export type Phase = 'explore' | 'continue';
@@ -43,8 +43,6 @@ export interface ResearchOptions {
     exploitationMinutes: number;
     rsiTop: boolean;
     forkAndFlush: boolean;
-    /** Registered workspace backend name, or `auto`. */
-    workspaceBackend: string;
     /** Registered executor name, or `auto`. */
     executor: string;
 }
@@ -126,6 +124,8 @@ export interface TrajectoryRow {
     diagnostic?: string;
     evaluation: EvaluationResult;
     portfolio?: unknown;
+    /** Why `PORTFOLIO.json` could not be read, on an RSI-top branch. */
+    portfolio_error?: string;
     time: number;
     last_output?: string;
 }
@@ -214,30 +214,10 @@ export interface SubagentsService {
         agent: unknown;
     }) => void;
 }
-/** `ctx.shellEnv` surface: the coordinator's `DSH_*` environment. */
-export interface ShellEnvService {
-    collect: (execution: {
-        agent?: unknown;
-        callId: string;
-        rootCallId?: string;
-    }) => Readonly<Record<string, string>>;
-}
-export interface LlmCatalog {
-    listProviders: () => Array<{
-        id: string;
-        name?: string;
-    }>;
-    listModels: (providerId: string) => Promise<Array<{
-        id: string;
-        name?: string;
-    }>>;
-}
 /** Host services the provider reads; optional ones exist while their plugin does. */
 export interface ProviderContext {
     subagents: SubagentsService;
-    skills?: SkillsService;
-    shellEnv?: ShellEnvService;
-    llm?: LlmCatalog;
+    researchWorkspace?: WorkspaceService;
     logger?: Logger;
 }
 //# sourceMappingURL=types.d.ts.map

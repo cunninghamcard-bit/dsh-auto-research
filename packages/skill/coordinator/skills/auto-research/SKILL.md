@@ -53,7 +53,7 @@ The plan is fixed for the batch. Revise metrics or the evaluator between batches
 
 ## Evaluator contract
 
-The runner reads your evaluator once per batch and records its SHA-256. For every candidate commit, the executor puts the script at `.auto-research/<name>` in a fresh copy of that commit and runs it from the branch root: `<interpreter> .auto-research/<name> .` (`.py` with `python3 -B`, `.js/.mjs` with `node`, `.sh` with `bash`; override with `evaluator_interpreter`). Nothing it writes is kept.
+The runner reads your evaluator once per batch. For every candidate commit, the executor puts the script at `.auto-research/<name>` in a fresh copy of that commit and runs it from the branch root: `<interpreter> .auto-research/<name> .` (`.py` with `python3 -B`, `.js/.mjs` with `node`, `.sh` with `bash`; override with `evaluator_interpreter`). Nothing it writes is kept.
 
 The last line of stdout is the result:
 
@@ -73,7 +73,7 @@ Each round runs an explore phase followed by a continue phase, or only the conti
 - **explore**: `branches` new branches forked from the leader's commit, each with a fresh worker.
 - **continue**: the leader's own worker session continues on the leader's branch.
 - `forkAndFlush`: every round explores.
-- `rsiTop`: a round explores when work since the last gain above `meaningful_gain` reaches `stall_seconds`. That time carries across batches in `LATEST.json`. Explore workers get distinct randomized metric views and must write a portfolio of distinct hypotheses.
+- `rsiTop`: a round explores when work since the last gain above `meaningful_gain` reaches `stall_seconds`. That time carries across batches in `LATEST.json`. Explore workers get distinct randomized metric views and are asked to write a portfolio of distinct hypotheses, which is recorded with each branch.
 
 Selection uses only the evaluator: valid candidates and the incumbent are ranked by primary score, then `selection_metrics`.
 

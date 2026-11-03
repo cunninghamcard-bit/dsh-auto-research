@@ -1,11 +1,12 @@
-# dsh-auto-research. The first row contributes the `auto-research`
-# SubagentProvider, its skills and the `researchWorkspace` /
-# `researchExecutor` registries. The workspace row keeps branches in the
-# conversation's LayerFS project; the local executor runs commands in a
-# LayerFS Sandbox (insert `dsh-auto-research-executor-colab` for a Colab GPU).
-# The last row exposes one batch as the `subagent_auto_research` tool;
-# provider-managed depth keeps it visible while the provider refuses a worker
-# that tries to start a batch.
+# dsh-auto-research. One row per package of the bundle:
+# - the core: the `auto-research` SubagentProvider, the workers' `research_run`
+#   tool and the `researchExecutor` registry;
+# - LayerFS: `ctx.researchWorkspace` (branches in the conversation's LayerFS
+#   project) and the `sandbox` executor;
+# - the coordinator and worker skills (prompts only);
+# - the `subagent_auto_research` tool, one batch per call. Provider-managed
+#   depth keeps it visible to the coordinator.
+# Insert `dsh-auto-research-executor-colab` with its sessions for a Colab GPU.
 - insert:
     - id: subagent-auto-research
       name: 'dsh-auto-research'
@@ -22,8 +23,11 @@
     - id: auto-research-workspace-layerfs
       name: 'dsh-auto-research-workspace-layerfs'
 
-    - id: auto-research-executor-local
-      name: 'dsh-auto-research-executor-local'
+    - id: auto-research-coordinator
+      name: 'dsh-auto-research-coordinator'
+
+    - id: auto-research-worker
+      name: 'dsh-auto-research-worker'
 
     - id: tool-subagent-auto-research
       name: '@deepseek-ai/dsh-tool-subagent'

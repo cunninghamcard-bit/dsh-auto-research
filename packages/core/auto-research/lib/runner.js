@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import * as fsp from 'node:fs/promises';
 import { basename, join } from 'node:path';
 import { sampleMetricViews, validatePortfolio } from './protocols.js';
-import { branchFile, buildContinueMessage, buildWorkerPrompt } from './skills.js';
+import { branchFile, buildContinueMessage, buildWorkerPrompt } from './prompts.js';
 /** Raised when the caller stops a batch; branches and sessions are kept. */
 export class ResearchStoppedError extends Error {
     constructor(message = 'Research stopped; branches and sessions kept') {
@@ -21,25 +21,6 @@ export class ResearchStoppedError extends Error {
 }
 /** How long a worker may take to settle after it is interrupted. */
 const WORKER_GRACE_MS = 30_000;
-/** Working folders of running workers, for the skill catalog. */
-export class ActiveWorkers {
-    cwds = new Set();
-    onChange = () => { };
-    add(cwd) {
-        this.cwds.add(cwd);
-        this.onChange();
-    }
-    remove(cwd) {
-        this.cwds.delete(cwd);
-        this.onChange();
-    }
-    ownsCwd(cwd) {
-        for (const root of this.cwds)
-            if (cwd === root || cwd.startsWith(root + '/'))
-                return true;
-        return false;
-    }
-}
 function outputText(output) {
     if (typeof output === 'string')
         return output;
@@ -71,8 +52,6 @@ export class Runner {
     rows = [];
     selections = [];
     abort = new AbortController();
-    /** Activations still running, so a stop can interrupt them. */
-    live = new Set();
     anchor = null;
     stalledWorkSeconds = 0;
     constructor(deps) {
@@ -93,7 +72,7 @@ export class Runner {
         if (this.stopped())
             return;
         this.abort.abort();
-        for (const activation of this.live)
+        for (const activation of this.deps.workers.activations(this))
             this.interrupt(activation);
     }
     interrupt(activation) {
@@ -223,7 +202,7 @@ export class Runner {
             && this.deps.subagents.getProvider(this.deps.workerProvider)?.capabilities.agentOptions === true;
         // A reserved session id gives the worker research_run from its first step.
         const childId = randomUUID();
-        const unregister = this.deps.runs.register(childId, this.workerRun(ref.branch, folder, seconds, rsiTop ? { scratch, parentId: parent.id } : null));
+        const unregister = this.deps.workers.register(childId, this, this.workerRun(ref.branch, folder, seconds));
         const activation = await this.deps.subagents.startActivation({
             provider: this.deps.workerProvider,
             label: `${this.deps.runId.slice(0, 8)}:${id}`,
@@ -249,7 +228,7 @@ export class Runner {
         const folder = join(this.deps.output, id);
         await fsp.mkdir(folder, { recursive: true });
         await this.writeBranchFile(scratch, { id, phase: 'continue', ref, seconds, view: null });
-        const unregister = this.deps.runs.register(leader.session, this.workerRun(ref.branch, folder, seconds, null));
+        const unregister = this.deps.workers.register(leader.session, this, this.workerRun(ref.branch, folder, seconds));
         const activation = await this.deps.subagents.continueActivation({
             parent: this.deps.parent,
             childId: leader.session,
@@ -282,8 +261,7 @@ export class Runner {
      */
     async settle(turn) {
         const { activation } = turn;
-        this.live.add(activation);
-        this.deps.workers.add(turn.scratch);
+        this.deps.workers.attach(activation.childId, activation);
         let timedOut = false;
         let result;
         try {
@@ -291,8 +269,6 @@ export class Runner {
         }
         finally {
             turn.unregister();
-            this.live.delete(activation);
-            this.deps.workers.remove(turn.scratch);
         }
         this.checkStopped();
         const head = await this.deps.workspace.head(turn.ref.branch);
@@ -315,12 +291,13 @@ export class Runner {
             time: Date.now(),
             last_output: output.slice(-4000),
         };
-        if (turn.portfolio && row.evaluation.valid) {
+        if (turn.portfolio) {
+            // Recorded only: nothing downstream reads it, so a missing one costs the branch nothing.
             try {
                 row.portfolio = await this.readPortfolio(turn.scratch, turn.parent.id);
             }
             catch (error) {
-                row.evaluation = { valid: false, reason: 'RSI portfolio: ' + error.message };
+                row.portfolio_error = error.message;
             }
         }
         await writeJson(join(turn.folder, 'RESULT.json'), row);
@@ -370,18 +347,10 @@ export class Runner {
      * batch executor, no longer than the turn has left. Every request is
      * appended to the branch's `research-runs.jsonl`.
      */
-    workerRun(branch, folder, seconds, portfolio) {
+    workerRun(branch, folder, seconds) {
         const deadline = Date.now() + seconds * 1000;
         return async (command, timeoutSeconds, signal) => {
             this.checkStopped();
-            if (portfolio) {
-                // RSI-top: no experiment runs before the portfolio the evaluation will require.
-                await this.readPortfolio(portfolio.scratch, portfolio.parentId).catch((error) => {
-                    const file = join(portfolio.scratch, 'PORTFOLIO.json');
-                    const problem = error.code === 'ENOENT' ? 'it does not exist' : error.message;
-                    throw new Error(`Write ${file} before running experiments (${problem}). It must be a JSON array of exactly ${this.plan.portfolio_size} objects, each with non-empty strings bottleneck, mechanism, expected_effect, lineage and a number verbalized_probability in [0, 1]; the bottleneck/mechanism/expected_effect triples must be distinct. Without it the branch is rejected.`);
-                });
-            }
             const left = Math.max(1, Math.floor((deadline - Date.now()) / 1000));
             const ref = await this.deps.workspace.head(branch);
             const started = Date.now();

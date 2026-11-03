@@ -7,20 +7,12 @@
  * branch. Every state is a commit, scored by the plan's evaluator through the
  * batch executor.
  */
-import type { BranchRef, ExecutorBackend, Logger, WorkspaceBackend } from 'dsh-auto-research-api';
-import type { WorkerRuns } from './research-run.js';
+import type { BranchRef, ExecutorBackend, Logger, Workspace } from 'dsh-auto-research-api';
+import type { Workers } from './research-run.js';
 import type { BatchResult, EvaluationResult, Latest, MetricDiagnostic, ResearchOptions, ResearchPlan, SubagentsService, TrajectoryRow, WorkerAgentOptions } from './types.js';
 /** Raised when the caller stops a batch; branches and sessions are kept. */
 export declare class ResearchStoppedError extends Error {
     constructor(message?: string);
-}
-/** Working folders of running workers, for the skill catalog. */
-export declare class ActiveWorkers {
-    readonly cwds: Set<string>;
-    onChange: () => void;
-    add(cwd: string): void;
-    remove(cwd: string): void;
-    ownsCwd(cwd: string): boolean;
 }
 export interface RunnerDeps {
     plan: ResearchPlan;
@@ -31,7 +23,7 @@ export interface RunnerDeps {
     /** `LATEST.json` of this coordinator folder. */
     latestFile: string;
     latest: Latest | null;
-    workspace: WorkspaceBackend;
+    workspace: Workspace;
     executor: ExecutorBackend;
     evaluatorText: string;
     subagents: SubagentsService;
@@ -39,9 +31,8 @@ export interface RunnerDeps {
     parent: unknown;
     workerProvider: string;
     workerAgentOptions: WorkerAgentOptions | null;
-    workers: ActiveWorkers;
-    /** `research_run` handlers of running workers. */
-    runs: WorkerRuns;
+    /** Running workers of every batch: `research_run` handlers and activations. */
+    workers: Workers;
     signal?: AbortSignal;
     logger?: Logger;
     rng?: () => number;
@@ -53,8 +44,6 @@ export declare class Runner {
     readonly rows: TrajectoryRow[];
     readonly selections: Array<Record<string, unknown>>;
     readonly abort: AbortController;
-    /** Activations still running, so a stop can interrupt them. */
-    private readonly live;
     anchor: number | null;
     stalledWorkSeconds: number;
     constructor(deps: RunnerDeps);

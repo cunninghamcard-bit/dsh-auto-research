@@ -3,8 +3,10 @@
  * of the coordinator's project.
  *
  * Workers reach their branch with the `layerfs` command the dsh-layerfs preset
- * gives every bash call; this backend only forks branches, reads their heads,
- * and runs commands on a commit in a Sandbox of its own. Nothing is copied to
+ * gives every bash call; this plugin forks branches, reads their heads, and
+ * runs commands on a commit in a Sandbox of its own. It provides
+ * `ctx.researchWorkspace` and registers that Sandbox as the `sandbox`
+ * executor, the default where no other executor applies. Nothing is copied to
  * the host except an exported tarball an executor asks for.
  */
 
@@ -13,18 +15,20 @@ import * as fsp from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type {
-  BackendCreateOptions,
   BranchRef,
+  ExecutionRequest,
   ExecutionResult,
+  ExecutorBackend,
+  ExecutorBackendFactory,
   Logger,
   PluginContext,
   RunOptions,
-  WorkspaceBackend,
-  WorkspaceBackendFactory,
+  Workspace,
+  WorkspaceService,
 } from 'dsh-auto-research-api'
 
 export const name = 'dsh-auto-research-workspace-layerfs'
-export const inject: string[] = ['researchWorkspace']
+export const inject: string[] = ['researchExecutor', 'shellEnv']
 
 /** A mounted Workspace. */
 interface Mount {
@@ -51,10 +55,6 @@ export interface LayerFSClient {
     mount: (sandbox: string, branch: string) => Promise<Mount>
     exec: (ws: Mount, command: string, message?: string) => Promise<{ exitCode: number | null; stdout: string; stderr: string }>
     unmount: (ws: Mount, discard?: boolean) => Promise<unknown>
-  }
-  fs: {
-    read: (ref: string, path: string, startLine?: number) =>
-      Promise<{ text: string; nextLine?: number | null }>
   }
   close: () => Promise<unknown>
 }
@@ -137,14 +137,12 @@ function quote(value: string): string {
 /** Bytes per exported chunk; base64 of it stays well inside one exec reply. */
 const EXPORT_CHUNK = 4 * 1024 * 1024
 
-export class LayerFSWorkspace implements WorkspaceBackend {
-  readonly name = 'layerfs'
+export class LayerFSWorkspace implements Workspace {
   private sandbox: Promise<string> | null = null
 
   constructor(
     readonly client: LayerFSClient,
     readonly project: string,
-    readonly runId: string,
     readonly logger: Logger | null = null,
   ) {}
 
@@ -162,25 +160,6 @@ export class LayerFSWorkspace implements WorkspaceBackend {
       if (!listed.hasMore || listed.nextPagePos === null) throw new Error(`LayerFS branch ${branch} does not exist`)
       page = listed.nextPagePos
     }
-  }
-
-  async readText(ref: BranchRef, path: string): Promise<string | null> {
-    const at = ref.commit ?? ref.branch
-    const absolute = path.startsWith('/') ? path : '/' + path
-    let text = ''
-    for (let line: number | undefined = 1; line !== undefined;) {
-      let page: { text: string; nextLine?: number | null }
-      try {
-        const start: number = line
-        page = await retry(() => this.client.fs.read(at, absolute, start))
-      } catch (error) {
-        if (refusal(error) === 'NoSuchPath') return null
-        throw error
-      }
-      text += page.text
-      line = typeof page.nextLine === 'number' ? page.nextLine : undefined
-    }
-    return text
   }
 
   async run(ref: BranchRef, options: RunOptions): Promise<ExecutionResult> {
@@ -274,17 +253,46 @@ export class LayerFSWorkspace implements WorkspaceBackend {
   }
 }
 
-export class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
-  readonly name = 'layerfs'
-  readonly priority = 100
+/** The synthetic tool-call id the coordinator's bash variables are read under. */
+const SHELL_ENV_CALL_ID = 'auto-research-env'
 
-  async create(options: BackendCreateOptions): Promise<LayerFSWorkspace | null> {
-    const client = await openLayerfs(options.env)
-    if (!client) return null
-    return new LayerFSWorkspace(client, options.env.DSH_LAYERFS_PROJECT as string, options.runId, options.logger ?? null)
+/** `ctx.shellEnv` surface: the `DSH_*` variables a bash call of `agent` would get. */
+interface ShellEnv {
+  collect: (execution: { agent?: unknown; callId: string; rootCallId?: string }) => Readonly<Record<string, string>>
+}
+
+/** `ctx.researchWorkspace`: the project the coordinator's session is bound to. */
+export class LayerFSWorkspaceService implements WorkspaceService {
+  constructor(readonly shellEnv: ShellEnv) {}
+
+  async open(parent: unknown, options: { logger?: Logger }): Promise<LayerFSWorkspace> {
+    const env = this.shellEnv.collect({ agent: parent, callId: SHELL_ENV_CALL_ID, rootCallId: SHELL_ENV_CALL_ID })
+    const client = await openLayerfs(env)
+    if (!client) throw new Error('This session is not bound to a LayerFS project; use LayerFS in the conversation first')
+    return new LayerFSWorkspace(client, env.DSH_LAYERFS_PROJECT as string, options.logger ?? null)
+  }
+}
+
+/** The `sandbox` executor: run in the batch workspace's own Sandbox (CPU). */
+export class SandboxExecutor implements ExecutorBackend {
+  readonly name = 'sandbox'
+
+  run(request: ExecutionRequest): Promise<ExecutionResult> {
+    const { ref, workspace, ...options } = request
+    return workspace.run(ref, options)
+  }
+}
+
+export class SandboxExecutorFactory implements ExecutorBackendFactory {
+  readonly name = 'sandbox'
+  readonly priority = 0
+
+  async create(): Promise<SandboxExecutor> {
+    return new SandboxExecutor()
   }
 }
 
 export function apply(ctx: PluginContext): void {
-  ctx.effect(() => ctx.researchWorkspace!.register(new LayerFSWorkspaceFactory()))
+  ctx.provide('researchWorkspace', new LayerFSWorkspaceService(ctx.shellEnv as ShellEnv))
+  ctx.effect(() => ctx.researchExecutor!.register(new SandboxExecutorFactory()))
 }

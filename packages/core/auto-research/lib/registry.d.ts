@@ -1,14 +1,10 @@
 /**
- * Backend registries the core plugin provides:
- *
- * - `ctx.researchWorkspace`: where branches live (`dsh-auto-research-workspace-layerfs`)
- * - `ctx.researchExecutor`: where commands run (`dsh-auto-research-executor-local`,
- *   `dsh-auto-research-executor-colab`)
- *
- * Backends are Cordis plugins that inject a registry and register a factory.
- * The core ships no backend of its own.
+ * `ctx.researchExecutor`, the registry the core plugin provides: where
+ * commands run. Executors are Cordis plugins that inject it and register a
+ * factory: `sandbox` from `dsh-auto-research-workspace-layerfs`, `colab` from
+ * `dsh-auto-research-executor-colab`. The core ships none of its own.
  */
-import type { BackendCreateOptions, ExecutorBackend, ExecutorBackendFactory, WorkspaceBackend, WorkspaceBackendFactory } from 'dsh-auto-research-api';
+import type { ExecutorBackend, ExecutorBackendFactory, Logger } from 'dsh-auto-research-api';
 interface Factory<B, O> {
     readonly name: string;
     readonly priority: number;
@@ -30,10 +26,9 @@ export declare class BackendRegistry<B, O, F extends Factory<B, O> = Factory<B, 
      */
     select(requested: string, options: O): Promise<B>;
 }
-export declare class ResearchWorkspaceRegistry extends BackendRegistry<WorkspaceBackend, BackendCreateOptions, WorkspaceBackendFactory> {
-    constructor();
-}
-export declare class ResearchExecutorRegistry extends BackendRegistry<ExecutorBackend, BackendCreateOptions, ExecutorBackendFactory> {
+export declare class ResearchExecutorRegistry extends BackendRegistry<ExecutorBackend, {
+    logger?: Logger;
+}, ExecutorBackendFactory> {
     constructor();
 }
 export {};

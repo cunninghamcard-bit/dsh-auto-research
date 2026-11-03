@@ -1,6 +1,7 @@
 ---
 name: auto-research-colab
 description: Evaluate auto-research candidates on a Google Colab GPU: plan options.executor "colab".
+user-invocable: false
 ---
 
 # Auto research on Colab GPUs

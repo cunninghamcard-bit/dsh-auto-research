@@ -1,12 +1,8 @@
 /**
- * Backend registries the core plugin provides:
- *
- * - `ctx.researchWorkspace`: where branches live (`dsh-auto-research-workspace-layerfs`)
- * - `ctx.researchExecutor`: where commands run (`dsh-auto-research-executor-local`,
- *   `dsh-auto-research-executor-colab`)
- *
- * Backends are Cordis plugins that inject a registry and register a factory.
- * The core ships no backend of its own.
+ * `ctx.researchExecutor`, the registry the core plugin provides: where
+ * commands run. Executors are Cordis plugins that inject it and register a
+ * factory: `sandbox` from `dsh-auto-research-workspace-layerfs`, `colab` from
+ * `dsh-auto-research-executor-colab`. The core ships none of its own.
  */
 export class BackendRegistry {
     label;
@@ -56,14 +52,9 @@ export class BackendRegistry {
         throw new Error(`no ${this.label} is available (registered: ${names(factories)}); ${this.hint}`);
     }
 }
-export class ResearchWorkspaceRegistry extends BackendRegistry {
-    constructor() {
-        super('workspace backend', 'load dsh-auto-research-workspace-layerfs and bind the session to a LayerFS project');
-    }
-}
 export class ResearchExecutorRegistry extends BackendRegistry {
     constructor() {
-        super('executor', 'load dsh-auto-research-executor-local or dsh-auto-research-executor-colab');
+        super('executor', 'load dsh-auto-research-workspace-layerfs (sandbox) or dsh-auto-research-executor-colab');
     }
 }
 function names(factories) {

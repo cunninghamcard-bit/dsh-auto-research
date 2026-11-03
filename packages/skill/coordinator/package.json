@@ -1,0 +1,24 @@
+{
+  "name": "dsh-auto-research-coordinator",
+  "version": "0.3.0",
+  "description": "The coordinator skill of dsh-auto-research: how to write the plan and the evaluator and run batches",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["lib", "src", "skills"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dsh-auto-research-api": "workspace:*"
+  },
+  "license": "MIT"
+}

@@ -8,29 +8,24 @@ import { randomUUID } from 'node:crypto';
 import * as fsp from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { normalizeOptions, resolveWorkerAgentOptions, validatePlan } from './plan.js';
-import { WorkerRuns } from './research-run.js';
-import { ActiveWorkers, ResearchStoppedError, Runner } from './runner.js';
+import { Workers } from './research-run.js';
+import { ResearchStoppedError, Runner } from './runner.js';
 /** Where the coordinator's runs and `LATEST.json` live, relative to its cwd. */
 const RUNTIME_DIR = '.auto-research-methods';
-/** The synthetic tool-call id for a session-wide shell environment snapshot. */
-const SHELL_ENV_CALL_ID = 'auto-research-env';
 function text(blocks) {
     return [{ type: 'text', text: blocks }];
 }
 export class AutoResearchProvider {
     ctx;
     config;
-    workspaces;
     executors;
     name;
     capabilities = Object.freeze({ agentOptions: true, agentPreset: false, outputSchema: false, depthLimit: false });
     inheritsParentContext = false;
-    workers = new ActiveWorkers();
-    runs = new WorkerRuns();
-    constructor(ctx, config, workspaces, executors) {
+    workers = new Workers();
+    constructor(ctx, config, executors) {
         this.ctx = ctx;
         this.config = config;
-        this.workspaces = workspaces;
         this.executors = executors;
         this.name = config.providerName ?? 'auto-research';
     }
@@ -57,10 +52,11 @@ export class AutoResearchProvider {
         const latest = await fsp.readFile(latestFile, 'utf8').then(raw => JSON.parse(raw), () => null);
         const runId = randomUUID();
         const output = join(runtime, 'runs', runId);
-        const env = this.ctx.shellEnv?.collect({ agent: request.parent, callId: SHELL_ENV_CALL_ID, rootCallId: SHELL_ENV_CALL_ID }) ?? {};
-        const created = { runId, output, env, ...(this.ctx.logger ? { logger: this.ctx.logger } : {}) };
-        const workspace = await this.workspaces.select(options.workspaceBackend, created);
-        const executor = await this.executors.select(options.executor, created).catch(async (error) => {
+        const logged = this.ctx.logger ? { logger: this.ctx.logger } : {};
+        if (!this.ctx.researchWorkspace)
+            throw new Error('No research workspace: load dsh-auto-research-workspace-layerfs');
+        const workspace = await this.ctx.researchWorkspace.open(request.parent, logged);
+        const executor = await this.executors.select(options.executor, logged).catch(async (error) => {
             await workspace.close().catch(() => { });
             throw error;
         });
@@ -79,7 +75,6 @@ export class AutoResearchProvider {
             workerProvider,
             workerAgentOptions,
             workers: this.workers,
-            runs: this.runs,
             ...(request.signal ? { signal: request.signal } : {}),
             ...(this.ctx.logger ? { logger: this.ctx.logger } : {}),
         });

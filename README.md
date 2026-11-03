@@ -16,11 +16,12 @@ This repository is a pnpm workspace. Each package is one Cordis plugin:
 
 | Package | Path | Role |
 | --- | --- | --- |
-| `dsh-auto-research` | `packages/core/auto-research` | The bundle. Provides the `ctx.researchWorkspace` and `ctx.researchExecutor` registries. Registers the `auto-research` SubagentProvider and its skills. Runs batches. |
-| `dsh-auto-research-api` | `packages/core/api` | Types only: `BranchRef`, `WorkspaceBackend`, `ExecutorBackend`, factories. Implementation packages depend on it alone. |
-| `dsh-auto-research-workspace-layerfs` | `packages/workspace/workspace-layerfs` | Branches of the conversation's LayerFS project. Forks branches, reads branch heads, runs a command on a commit in its own Sandbox, and exports a commit as a tarball. |
-| `dsh-auto-research-executor-local` | `packages/executor/executor-local` | Runs commands in the workspace's LayerFS Sandbox (CPU). Priority 0. |
-| `dsh-auto-research-executor-colab` | `packages/executor/executor-colab` | Runs commands on a Google Colab GPU over ssh through the signed-in Colab CLI's proxy. Priority 100 when configured. |
+| `dsh-auto-research` | `packages/core/auto-research` | The bundle and the runner. Registers the `auto-research` SubagentProvider and the workers' `research_run` tool, and provides the `ctx.researchExecutor` registry. |
+| `dsh-auto-research-api` | `packages/core/api` | The contract: `BranchRef`, `Workspace`, `ExecutorBackend`, factories, and the skill registration the prompt packages share. |
+| `dsh-auto-research-workspace-layerfs` | `packages/workspace/workspace-layerfs` | Everything LayerFS. Provides `ctx.researchWorkspace` (forks branches of the conversation's project, reads heads, runs a command on a commit in its own Sandbox, exports a commit as a tarball) and registers that Sandbox as the `sandbox` executor, priority 0. |
+| `dsh-auto-research-coordinator` | `packages/skill/coordinator` | Prompts only: the `auto-research` coordinator skill. |
+| `dsh-auto-research-worker` | `packages/skill/worker` | Prompts only: the `auto-research-worker` skill. |
+| `dsh-auto-research-executor-colab` | `packages/executor/executor-colab` | Runs commands on a Google Colab GPU over ssh through the signed-in Colab CLI's proxy, with its skill. Priority 100 when configured. |
 
 ```bash
 pnpm install
@@ -29,7 +30,7 @@ pnpm run build
 
 ## Install
 
-Link `packages/core/auto-research` into a dsh profile and list `dsh-auto-research` in its bundles. The bundle's [`cordis.patch.yml`](packages/core/auto-research/cordis.patch.yml) inserts four rows: the core, the LayerFS workspace, the local executor, and the `subagent_auto_research` tool. To use Colab, insert the Colab row with sessions:
+Link `packages/core/auto-research` into a dsh profile and list `dsh-auto-research` in its bundles. The bundle's [`cordis.patch.yml`](packages/core/auto-research/cordis.patch.yml) inserts five rows: the core, LayerFS, the coordinator and worker prompts, and the `subagent_auto_research` tool. To use Colab, insert the Colab row with sessions:
 
 ```yaml
 - insert:
@@ -51,7 +52,7 @@ Requirements:
 | --- | --- | --- |
 | `providerName` | `auto-research` | Registry name of the provider |
 | `workerProvider` | `spawn` | Worker provider; it must support continuable (in-process) children |
-| `workerModel`, `workerLlmProvider`, `workerReasoningEffort`, `workerAgentOptions` | the coordinator's | Worker LLM; `workerModel` matches a model id or display name |
+| `workerModel`, `workerLlmProvider`, `workerReasoningEffort`, `workerAgentOptions` | the coordinator's | Worker LLM; without a provider, the coordinator's provider |
 | `planPath` | `.auto-research-methods/plan.json` | Plan file, relative to the coordinator's folder |
 | `rounds` | `3` | Rounds per batch |
 | `branches` | `4` | Explore branches per round |
@@ -59,7 +60,7 @@ Requirements:
 | `exploitationMinutes` | `15` | Continue turn length |
 | `forkAndFlush` | `true` | Explore every round |
 | `rsiTop` | `false` | Explore when stalled, with randomized metric views and portfolios |
-| `workspaceBackend`, `executor` | `auto` | Registered names; `auto` takes the first available by priority |
+| `executor` | `auto` | A registered executor (`sandbox`, `colab`); `auto` takes the first available by priority |
 
 A plan overrides any of these in `options`.
 

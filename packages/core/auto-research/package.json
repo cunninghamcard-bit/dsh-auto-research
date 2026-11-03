@@ -20,8 +20,7 @@
     "src",
     "icon.svg",
     "cordis.patch.yml",
-    "locale",
-    "skills"
+    "locale"
   ],
   "scripts": {
     "build": "tsc",
@@ -30,7 +29,8 @@
   "dependencies": {
     "dsh-auto-research-api": "workspace:*",
     "dsh-auto-research-workspace-layerfs": "workspace:*",
-    "dsh-auto-research-executor-local": "workspace:*",
+    "dsh-auto-research-coordinator": "workspace:*",
+    "dsh-auto-research-worker": "workspace:*",
     "dsh-auto-research-executor-colab": "workspace:*"
   },
   "keywords": [
