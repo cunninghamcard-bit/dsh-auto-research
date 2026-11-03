@@ -107,7 +107,6 @@ export class LayerFSWorkspace {
     logger;
     name = 'layerfs';
     sandbox = null;
-    scratch = 0;
     constructor(client, project, runId, logger = null) {
         this.client = client;
         this.project = project;
@@ -210,7 +209,7 @@ export class LayerFSWorkspace {
         const head = await this.head(ref.branch);
         const branch = head.commit === ref.commit
             ? ref.branch
-            : (await this.fork(ref, `${ref.branch}-at-${(this.scratch += 1)}`)).branch;
+            : (await this.fork(ref, `${ref.branch.slice(0, 48)}-at-${randomUUID().slice(0, 8)}`)).branch;
         const ws = await this.mount(branch);
         try {
             return await use(ws);

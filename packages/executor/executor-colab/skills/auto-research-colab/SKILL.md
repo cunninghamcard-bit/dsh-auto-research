@@ -18,4 +18,4 @@ Write the evaluator for the Colab VM: it runs with the VM's `python3`, its CUDA 
 
 Sessions cost compute units. The executor uses only the sessions named in its configuration unless `createSessions` is set; ask the user before a batch that would create or keep sessions running.
 
-A score measured on one GPU is not comparable with one from another: the batch frontier is keyed by evaluator and executor, so switching executor starts over from `base`.
+A score measured on one GPU is not comparable with one from another: the batch frontier is keyed by evaluator and executor, so after switching executor the last leader is evaluated again as the new baseline.

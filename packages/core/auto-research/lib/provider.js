@@ -25,15 +25,22 @@ async function acquireLock(runtime, runId) {
     await fsp.mkdir(runtime, { recursive: true });
     const path = join(runtime, 'runner.lock');
     const info = JSON.stringify({ pid: process.pid, runId, started_at: new Date().toISOString() }) + '\n';
-    try {
-        await fsp.writeFile(path, info, { flag: 'wx', mode: 0o600 });
+    for (let attempt = 0;; attempt += 1) {
+        try {
+            await fsp.writeFile(path, info, { flag: 'wx', mode: 0o600 });
+            return () => fsp.rm(path, { force: true });
+        }
+        catch (error) {
+            if (error.code !== 'EEXIST')
+                throw error;
+            // A lock from another process is stale: batches run inside the dsh process that started them.
+            const owner = Number(/"pid":(\d+)/.exec(await fsp.readFile(path, 'utf8').catch(() => ''))?.[1]);
+            if (attempt > 0 || owner === process.pid) {
+                throw new Error(`Another auto-research batch is running in this folder: ${path}`);
+            }
+            await fsp.rm(path, { force: true });
+        }
     }
-    catch (error) {
-        if (error.code !== 'EEXIST')
-            throw error;
-        throw new Error(`Another auto-research batch is running in this folder: ${path} (delete it if none is)`);
-    }
-    return () => fsp.rm(path, { force: true });
 }
 export class AutoResearchProvider {
     ctx;

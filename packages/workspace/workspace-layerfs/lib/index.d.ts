@@ -70,7 +70,6 @@ export declare class LayerFSWorkspace implements WorkspaceBackend {
     readonly logger: Logger | null;
     readonly name = "layerfs";
     private sandbox;
-    private scratch;
     constructor(client: LayerFSClient, project: string, runId: string, logger?: Logger | null);
     fork(from: BranchRef | string, name: string): Promise<BranchRef>;
     head(branch: string): Promise<BranchRef>;

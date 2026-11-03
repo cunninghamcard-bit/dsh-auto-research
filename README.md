@@ -81,7 +81,7 @@ A plan overrides any of these in `options`.
 }
 ```
 
-`base` is the LayerFS ref the first batch starts from. Later batches start from the leader in `LATEST.json` while the evaluator and the executor stay the same. A changed evaluator or a different executor starts a new frontier from `base`.
+`base` is the LayerFS ref the first batch starts from. Later batches start from the leader in `LATEST.json`. When the evaluator or the executor changed, that leader is evaluated again as the new baseline and the stall clock restarts; scores from different evaluators or GPUs are never compared.
 
 ## Evaluator contract
 
@@ -103,7 +103,7 @@ Workers cannot change the evaluator. It lives outside every branch, and each wor
 AutoResearchProvider.start
  ① validate the plan, read the evaluator, pick the worker provider and model
  ② workspace = researchWorkspace.select(), executor = researchExecutor.select()
- ③ baseline: the LATEST.json leader (same evaluator and executor) or a branch forked from plan.base, evaluated
+ ③ baseline: the LATEST.json leader as is (same evaluator and executor), else a fork of that leader (or of plan.base) evaluated again
  ④ each round
     ├ explore: fork the leader's commit into `branches` branches; startActivation(spawn, cwd = a scratch folder)
     │          interrupt at the deadline; evaluate each branch head; choose

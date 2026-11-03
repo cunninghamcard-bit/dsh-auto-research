@@ -84,8 +84,8 @@ plan 的 `options` 可以覆盖以上任何一项。
 ```
 
 - `base` 是第一个批次的起点，填一个 LayerFS ref。
-- 只要评估器和执行器都不变，之后的批次从 `LATEST.json` 记录的 leader 继续。
-- 评估器或执行器任一变化，就从 `base` 重新开始一条前沿。
+- 之后的批次从 `LATEST.json` 记录的 leader 继续。
+- 评估器或执行器任一变化时，先用新的评估器对这个 leader 重新打分，作为新的基线，停滞计时清零。不同评估器或不同 GPU 上的分数之间不做比较。
 
 ## 评估器约定
 
@@ -107,7 +107,7 @@ worker 改不到评估器：评估器在所有分支之外，每个 worker 只�
 AutoResearchProvider.start
  ① 校验 plan，读取评估器，确定 worker provider 和模型
  ② workspace = researchWorkspace.select()，executor = researchExecutor.select()
- ③ 基线：LATEST.json 中的 leader（评估器和执行器都相同时），否则从 plan.base fork 一个分支并评估
+ ③ 基线：评估器和执行器都相同时直接沿用 LATEST.json 中的 leader；否则 fork 这个 leader（没有时 fork plan.base）并重新评估
  ④ 每一轮
     ├ explore：从 leader 的提交 fork 出 branches 个分支；startActivation(spawn, cwd = 草稿目录)
     │          到时 interrupt；评估各分支 head；选择
