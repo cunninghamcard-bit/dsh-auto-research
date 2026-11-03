@@ -1,0 +1,21 @@
+{
+  "name": "dsh-auto-research-api",
+  "version": "0.3.0",
+  "description": "Contract between dsh-auto-research and its workspace and executor plugins",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": ["lib", "src"],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "license": "MIT"
+}

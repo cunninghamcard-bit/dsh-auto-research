@@ -1,79 +1,15 @@
 {
-  "name": "dsh-auto-research",
-  "version": "0.2.0",
-  "description": "Evidence-scored, fork-and-flush and RSI-top research batches as a DeepSeek Harness SubagentProvider, isolated with LayerFS",
-  "icon": "./icon.svg",
+  "name": "dsh-auto-research-workspace",
+  "private": true,
+  "description": "dsh-auto-research: the research-batch bundle and its workspace and executor plugins",
   "type": "module",
-  "main": "lib/index.js",
-  "types": "lib/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./lib/index.d.ts",
-      "default": "./lib/index.js"
-    },
-    "./api": {
-      "types": "./lib/api.d.ts",
-      "default": "./lib/api.js"
-    },
-    "./layerfs": {
-      "types": "./lib/layerfs.d.ts",
-      "default": "./lib/layerfs.js"
-    },
-    "./snapshot": {
-      "types": "./lib/snapshot.d.ts",
-      "default": "./lib/snapshot.js"
-    },
-    "./local": {
-      "types": "./lib/local.d.ts",
-      "default": "./lib/local.js"
-    },
-    "./colab": {
-      "types": "./lib/colab/index.d.ts",
-      "default": "./lib/colab/index.js"
-    },
-    "./package.json": "./package.json",
-    "./lib/*": "./lib/*",
-    "./cordis.patch.yml": "./cordis.patch.yml",
-    "./locale/*.json": "./locale/*.json"
-  },
-  "files": [
-    "lib",
-    "src",
-    "icon.svg",
-    "cordis.patch.yml",
-    "locale",
-    "skills",
-    "README.md",
-    "README.zh.md",
-    "LICENSE",
-    "tsconfig.json"
-  ],
-  "scripts": {
-    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
-    "build": "tsc",
-    "test": "npm run typecheck && npm run build && node --test tests/*.test.ts"
-  },
-  "keywords": [
-    "dsh",
-    "deepseek-harness",
-    "cordis",
-    "subagent",
-    "research",
-    "rsi-top",
-    "fork-and-flush",
-    "layerfs",
-    "auto-research",
-    "typescript"
-  ],
   "license": "MIT",
   "engines": {
-    "node": ">=22.19.0",
-    "dsh": ">=0.2.1-alpha.4 <0.3.0"
+    "node": ">=22.19.0"
   },
-  "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
-    }
+  "scripts": {
+    "build": "pnpm -r --workspace-concurrency=1 run build",
+    "typecheck": "pnpm -r --workspace-concurrency=1 run typecheck"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",

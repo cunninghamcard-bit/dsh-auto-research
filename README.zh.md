@@ -1,232 +1,140 @@
-# 自动研究（dsh-auto-research）
+# dsh-auto-research
 
-为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 提供以证据评分的研究批次，注册为名为 `auto-research` 的 `SubagentProvider`。
+[DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 上以评估器打分的研究批次，分支放在 [LayerFS](https://github.com/layerfs) 上。
 
-一次激活运行一个**批次**：冻结评估器、评估基线、用**分叉-刷新（fork-and-flush）**和/或 **RSI-top** 运行隔离的研究分支；可选地在协作 cohort 之间共享检查点；按独立评估分数选择 leader；并写入完整的凭据链。科学目标、指标与“是否继续”的判断属于协调模型，而不属于本插件。
+一次 `subagent_auto_research` 调用运行一个**批次**。每个研究状态都是一个 LayerFS 提交，由 plan 指定的评估器打分：
 
-技术栈：Node.js ESM、Cordis 插件、`ctx.subagents`，可选 [LayerFS](https://github.com/layerfs) 写时复制分支。无运行时依赖。
+- **explore**：从 leader 的提交 fork 出若干新分支，每个分支起一个新 worker。
+- **continue**：在 leader 的分支上续接 leader 自己的 worker 会话。
+- **选择**：保留有效分数最好的状态。
 
-## 新增内容
+目标、指标以及是否再跑一批，由协调者模型决定，插件不做判断。
 
-| Cordis 行 | 作用 |
-| --- | --- |
-| `subagent-auto-research` | 提供 `ctx.researchWorkspace` 与 `ctx.researchExecutor`，注册 `auto-research` provider 与 `auto-research` / `auto-research-worker` 两个 skill |
-| `auto-research-layerfs` | 在 `ctx.researchWorkspace` 注册 LayerFS 写时复制分支（优先级 100） |
-| `auto-research-snapshot` | 在 `ctx.researchWorkspace` 注册全量复制快照分支（优先级 0，回退） |
-| `auto-research-local` | 在本机运行冻结评估器，存在 `ctx.subprocess` 时经由它（`ctx.researchExecutor`，优先级 0） |
-| `tool-subagent-auto-research` | 通过 `@deepseek-ai/dsh-tool-subagent` 暴露 `subagent_auto_research`，深度由 provider 管理 |
+## 包
 
-协调者加载 `auto-research` skill。它检查仓库、编写计划、委派一个批次，然后审阅 `RESULT.json`、`DASHBOARD.json`、`LEADER.json`、`SELECTIONS.json` 以及协作证据，再决定是否运行下一批。
+本仓库是 pnpm workspace，每个包是一个 Cordis 插件：
 
-
-## Skills
-
-所有面向模型的指令都以 skill 形式放在 [`skills/`](skills)，插件不注入任何系统提示词。插件把两个 skill 注册到 `skills` 服务（`@deepseek-ai/dsh-skill`），profile 必须加载该服务：
-
-| Skill | 在哪些 cwd 列出 | 内容 |
+| 包 | 路径 | 职责 |
 | --- | --- | --- |
-| `auto-research` | 分支 checkout 之外的所有 cwd | 协调者流程、plan 结构、evaluator 契约、审阅 |
-| `auto-research-worker` | 存活分支 checkout 内的 cwd（用户不可调用） | 分支规则、`BRANCH.json` 字段、RSI-top portfolio、协作 epoch |
-| `auto-research-colab` | 加载 `dsh-auto-research/colab` 时的所有 cwd | 用 `$DSH_COLAB_CLI` 做 GPU 预检、`options.executor: "colab"` |
+| `dsh-auto-research` | `packages/core/auto-research` | bundle 本身：提供 `ctx.researchWorkspace`、`ctx.researchExecutor` 两个注册表，注册 `auto-research` SubagentProvider 和 skills，运行批次 |
+| `dsh-auto-research-api` | `packages/core/api` | 只有类型：`BranchRef`、`WorkspaceBackend`、`ExecutorBackend` 和工厂接口；实现包只依赖它 |
+| `dsh-auto-research-workspace-layerfs` | `packages/workspace/workspace-layerfs` | 对话所绑定 LayerFS 项目的分支：fork 分支、读取分支 head、在自己的 Sandbox 里对某个提交执行命令、把提交导出为 tarball |
+| `dsh-auto-research-executor-local` | `packages/executor/executor-local` | 在 workspace 的 LayerFS Sandbox 里执行命令（CPU），优先级 0 |
+| `dsh-auto-research-executor-colab` | `packages/executor/executor-colab` | 通过已登录的 Colab CLI 在 Google Colab GPU 上执行命令，配置后优先级 100 |
 
-worker 的提示词由 plan 的 `worker_prompt`、目标、checkout 路径，以及指向 worker skill 和 `.auto-research-methods/BRANCH.json` 的说明组成。启动前 runner 在 checkout 中写入：
-
-- `.auto-research-methods/BRANCH.json`：run 与分支 id、阶段、父分支、LayerFS 分支、截止时间、provider 秒数、`handoff`、`rsi_top`（portfolio 大小与完整指标视图）、`cooperation`（同伴证据、共享上下文）、环境变量名。
-- `.auto-research-methods/WORKER.json`：标识 worker checkout 的标记。
-- 分支续接父分支时的 `.auto-research-methods/HANDOFF.md`。
-- `.claude/skills/auto-research-worker/SKILL.md` 与 `.agents/skills/auto-research-worker/SKILL.md`，供外部 CLI worker（`claude-code`、`codex`）从 checkout 中发现 worker skill。
-
-这些文件在 activation 结束时、评估与提交之前全部删除；`.agents` 不计入 inventory。
+```bash
+pnpm install
+pnpm run build
+```
 
 ## 安装
 
-把该 bundle 加入 DSH profile（插件管理器会读取 `dsh.bundle.patch`），或手动把 [`cordis.patch.yml`](cordis.patch.yml) 中的各行插入 profile patch。下面的代码块与该文件逐字一致；配置表列的是代码默认值，profile 中的配置会覆盖它们。插件注入 `skills` 服务，profile 必须加载 `@deepseek-ai/dsh-skill` 与 `@deepseek-ai/dsh-tool-skill`（DSH base bundle 已包含）。provider 需要至少一个其他已注册的 `ctx.subagents` provider 来执行 worker（`claude-code`、`codex`、`acp`、`dsh-sdk`、`spawn` 等）。存在多个候选时请显式设置 `workerProvider`。
+把 `packages/core/auto-research` 链接进 dsh profile，并在 bundles 里加入 `dsh-auto-research`。bundle 自带的 [`cordis.patch.yml`](packages/core/auto-research/cordis.patch.yml) 会插入四行：核心、LayerFS workspace、本地执行器、`subagent_auto_research` 工具。
+
+要用 Colab，再插入 Colab 行并指定会话：
 
 ```yaml
 - insert:
-    - id: subagent-auto-research
-      name: 'dsh-auto-research'
+    - id: auto-research-executor-colab
+      name: 'dsh-auto-research-executor-colab'
       config:
-        providerName: auto-research
-        rounds: 1
-        branches: 4
-        explorationMinutes: 30
-        exploitationMinutes: 30
-        rsiTop: true
-        forkAndFlush: true
-        shareContext: false
-        sharingIntervalMinutes: 10
-
-    - id: auto-research-layerfs
-      name: 'dsh-auto-research/layerfs'
-
-    - id: auto-research-snapshot
-      name: 'dsh-auto-research/snapshot'
-
-    - id: auto-research-local
-      name: 'dsh-auto-research/local'
-
-    - id: tool-subagent-auto-research
-      name: '@deepseek-ai/dsh-tool-subagent'
-      config:
-        provider: auto-research
-        toolName: subagent_auto_research
-        maxDepth: provider-managed
+        sessions: [my-h100]   # 已用 `colab new -s my-h100 --gpu H100` 创建的会话
 ```
+
+依赖：
+
+- [dsh-layerfs](https://github.com/layerfs/dsh-layerfs)，且对话绑定了 LayerFS 项目。worker 通过它提供的 `layerfs` 命令操作分支。
+- 带 `ctx.subagents.continueActivation` 的 dsh（deepseek-harness 分支 `feat/subagent-continue-activation`）。
+- 会话持久化。continue 阶段要从持久化记录冷恢复 worker 会话。
 
 ## 配置
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
 | `providerName` | `auto-research` | provider 注册名 |
-| `workerProvider` | 第一个其他 provider | 执行分支 worker 的 `ctx.subagents` provider |
-| `planPath` | `.auto-research-methods/plan.json` | 从委派 checkout 读取的计划文件 |
-| `rounds` | `1` | 单批次轮数（上限，不是完成声明） |
-| `branches` | `4` | 并行探索分支数 |
-| `explorationMinutes` | `30` | 每阶段探索窗口 |
-| `exploitationMinutes` | `30` | 每阶段继续窗口 |
-| `rsiTop` | `false` | 启用随机指标子集视图与 portfolio |
-| `forkAndFlush` | `false` | 每轮强制启动新的探索 cohort |
-| `shareContext` | `false` | 启用协作检查点与 peer review |
-| `sharingIntervalMinutes` | `10` | 阶段窗口内的检查点节奏 |
-| `executor` | `auto` | 运行冻结评估器的已注册执行后端（`local`、`colab` 或第三方）；`auto` 按优先级取第一个可用的。计划可在 `options.executor` 覆盖 |
-| `workspaceBackend` | `auto` | 已注册的后端名称（`layerfs`、`snapshot` 或第三方后端）；`auto` 按优先级取第一个可用的。计划可在 `options.workspaceBackend` 覆盖 |
-| `layerfs` | 自动 | 显式 LayerFS 设置；`false` 使 `layerfs` 后端拒绝本批次 |
-| `workerEnv` | `{}` | 按配置原样传给 worker 的环境变量（`DSH_*` 名同时经 `ctx.shellEnv` 提供）；`CONFIG.json` 省略疑似机密的键 |
+| `workerProvider` | `spawn` | worker 使用的 provider，必须支持可续接的进程内子 agent |
+| `workerModel`、`workerLlmProvider`、`workerReasoningEffort`、`workerAgentOptions` | 与协调者相同 | worker 使用的模型；`workerModel` 可以填模型 id，也可以填显示名 |
+| `planPath` | `.auto-research-methods/plan.json` | plan 文件路径，相对于协调者所在目录 |
+| `rounds` | `3` | 每个批次的轮数 |
+| `branches` | `4` | 每轮 explore 的分支数 |
+| `explorationMinutes` | `5` | explore 阶段每个 worker 的时长（分钟） |
+| `exploitationMinutes` | `15` | continue 阶段的时长（分钟） |
+| `forkAndFlush` | `true` | 每一轮都执行 explore |
+| `rsiTop` | `false` | 只在停滞时执行 explore，并给 worker 随机指标视图、要求写假设组合 |
+| `workspaceBackend`、`executor` | `auto` | 已注册的后端名；`auto` 按优先级取第一个可用的 |
 
-计划可以包含 `options` 对象，按批次覆盖上述值。科学取值由模型决定；插件只拒绝不可能的组合（例如指标子集大于已声明指标集）。
+plan 的 `options` 可以覆盖以上任何一项。
 
-## 计划
+## Plan
 
-协调者把计划写在候选源码之外的 `planPath`（默认 `.auto-research-methods/plan.json`），或由 profile 在配置中设置 `plan`。只有这两个来源。单批覆盖写在 `plan.options` 下，字段名与配置相同（`workerProvider`、`workerModel`、`branches` 等）。
+写在协调者目录下的 `.auto-research-methods/plan.json`：
 
 ```json
 {
-  "objective": "用户的确切目标与范围",
-  "worker_prompt": "任务特定说明、约束、如何运行检查、如何保存证据",
-  "evaluator": "/absolute/path/to/evaluator.mjs",
-  "evaluation_seconds": 60,
+  "objective": "…",
+  "worker_prompt": "…",
+  "base": "main",
+  "evaluator": "/abs/path/evaluate.py",
+  "evaluation_seconds": 120,
   "direction": "maximize",
-  "metrics": [
-    { "name": "validity", "definition": "任务特定的固定定义" },
-    { "name": "best_trial", "definition": "最佳有效试验", "optional": true }
-  ],
-  "selection_metrics": [
-    { "name": "verified_progress", "direction": "maximize" }
-  ],
-  "stall_seconds": 1200,
-  "meaningful_gain": 0.0,
-  "metric_subset": 1,
-  "portfolio_size": 4
+  "metrics": [{ "name": "speedup" }],
+  "meaningful_gain": 0.01,
+  "options": { "rounds": 3, "branches": 4 }
 }
 ```
 
-- `selection_metrics` 必须同时声明在 `metrics` 中且为有限值；只在主分数并列时用于排序。
-- 可选指标可以缺失；缺失的观测不会被当成 0。
-- 启用 `rsiTop` 时必须给出 `stall_seconds`、`metric_subset` 和 `portfolio_size`。
-- `workspace` 可以指定 checkout 内的紧凑种子子目录；必须是相对路径，解析后严格位于 checkout 内，且不在 `.auto-research-methods` 内。
+- `base` 是第一个批次的起点，填一个 LayerFS ref。
+- 只要评估器和执行器都不变，之后的批次从 `LATEST.json` 记录的 leader 继续。
+- 评估器或执行器任一变化，就从 `base` 重新开始一条前沿。
 
-## 评估器契约
+## 评估器约定
 
-评估器会被复制到候选工作区之外、计算哈希，并以候选工作区作为最后一个参数执行：
+评估器是宿主机上的一个文件。runner 每个批次读取一次，并记录它的 SHA-256。对每个候选提交，执行器：
 
-```text
-<stdout> {"valid": true, "score": 1.0, "metrics": {"validity": 1.0}, "evidence": ["relative/receipt.json"]}
+1. 取该提交的一份新副本，把评估器放到 `.auto-research/<name>`；
+2. 在分支根目录执行 `<interpreter> .auto-research/<name> .`；
+3. 执行结束后丢弃这份副本。
+
+解释器按扩展名选择：`.py` 用 `python3 -B`，`.js`/`.mjs` 用 `node`，`.sh` 用 `bash`；也可以用 `evaluator_interpreter` 指定。
+
+stdout 的最后一行是结果：`{"valid": true, "score": <数字>, "metrics": {…}}`。无效候选输出 `"valid": false` 并附 `reason`。
+
+worker 改不到评估器：评估器在所有分支之外，每个 worker 只能写自己的分支。
+
+## 批次流程
+
+```
+AutoResearchProvider.start
+ ① 校验 plan，读取评估器，确定 worker provider 和模型
+ ② workspace = researchWorkspace.select()，executor = researchExecutor.select()
+ ③ 基线：LATEST.json 中的 leader（评估器和执行器都相同时），否则从 plan.base fork 一个分支并评估
+ ④ 每一轮
+    ├ explore：从 leader 的提交 fork 出 branches 个分支；startActivation(spawn, cwd = 草稿目录)
+    │          到时 interrupt；评估各分支 head；选择
+    ├ continue：在 leader 的分支上 continueActivation(leader 会话)；到时 interrupt；评估；选择
+    └ 停滞计时：增益超过 meaningful_gain 时清零
+ ⑤ 写 DASHBOARD.json、LEADER.json、RESULT.json、LATEST.json
 ```
 
-- stdout 只输出一个 JSON 对象；无效候选输出 `valid: false`。
-- `score` 必须有限；布尔值与非有限哨兵会被拒绝。
-- 有效结果的 `evidence` 至少要有一项；空列表会让评估失败（`No evaluation evidence`）。
-- 每一项是相对路径（不能有 `./`、`..`、空段或反斜杠），指向评估开始前就已存在于工作区的普通文件，或评估器写在 `.method-evaluation/` 下的文件。被评估的源文件本身也可以作为一项。
-- 脚本不得修改工作区；运行器会比较评估前后的完整清单。
-- 每次评估前后都会校验冻结副本的 SHA-256。
-- `.py` 使用 `python3 -I -B`；`.js/.mjs/.cjs` 使用当前 Node 可执行文件。可用 `evaluator_interpreter` 覆盖。
-
-## 批次生命周期
-
-1. 冻结评估器并写入 `PLAN.json` / `CONFIG.json`。
-2. 快照（或建立 LayerFS 基线）起始工作区并评估。基线无效时，在任何 worker 启动前停止。
-3. 每轮判断 `stalled`（`stalled_work_seconds >= stall_seconds`）与 `explore = forkAndFlush || (rsiTop && stalled)`。`stalled_work_seconds` 只累计上次超过 `meaningful_gain` 的提升之后的阶段工作时间，通过 `LATEST.json` 的 `frontier` 跨批次保存，因此单开 RSI-top 在 `rounds: 1` 时也会探索。评估器哈希不同的 frontier 会被丢弃。
-4. 探索阶段运行 `branches` 个并行 worker；继续阶段运行一个。每个分支获得隔离 fork/mount、Worker Prompt、预算预留；RSI-top 下还会获得不同的随机指标视图与 portfolio 协议。
-5. 用冻结评估器评估完成的分支，校验 `PORTFOLIO.json`，选择 leader：主分数（按计划的 `direction`）只要更好就替换 leader，提升再小也替换。主分数相同时依次比较 `selection_metrics`，再优先非基线分支，再取最新的分支。`meaningful_gain` 不参与选择，只用于重置停滞计时。评估器分数有噪声时，应由评估器自己多次试验取平均。
-6. 运行继续阶段，或写出 `RESULT.json` 结束。
-
-启用 `shareContext` 时，每个阶段在总窗口内运行协作 epoch。每个 epoch 发布 `PEER-EVIDENCE.json` 与 `shared-context.md`；分支写 `SHARED_CHECKPOINT.json`（显式文本证据白名单），恢复 epoch 还要写 `PEER-REVIEW.json`，且必须恰好覆盖每个 peer 一次。验证通过的完成状态会按内容寻址保存；若后续 epoch 失败，会恢复到独立的 `<branch>-last-completed/` 目录。
+- worker 的 cwd 是宿主机上的草稿目录 `runs/<run>/<branch>/scratch`，里面放 `BRANCH.json`、worker 的笔记，RSI-top 分支还有 `PORTFOLIO.json`。
+- 项目本身是 worker 的 LayerFS 分支，worker 用 `layerfs` 命令修改它。
 
 ## 产物
 
-所有内容位于 `<checkout>/.auto-research-methods/runs/<run-id>/`：
+`.auto-research-methods/runs/<run>/` 下：
 
-| 文件 | 用途 |
-| --- | --- |
-| `PLAN.json`、`CONFIG.json` | 冻结输入 |
-| `evaluator.*` | 冻结评估器副本 |
-| `initial/` | 基线工作区、清单、评估 |
-| `round-N-<phase>-<n>/` | 分支工作区、`INPUT-MANIFEST.json`、`LAUNCH.json`、`BUDGET.json`、`RESULT.json`、评估日志 |
-| `round-N-<phase>-epoch-N-branch-M/` | 协作 epoch 分支产物 |
-| `round-N-<phase>-COLLABORATION.json` | epoch 历史、peer bundle 路径、保留的检查点 |
-| `PEER-EVIDENCE.json` | 不可变的 peer 观测发布 |
-| `shared-context.md` | 逐字研究检查点与 `RESEARCH_CONTEXT/` 主题索引 |
-| `checkpoint-objects/` | 内容寻址的完成文件 |
-| `DASHBOARD.json` | 所有轨迹与指标诊断 |
-| `SELECTIONS.json` | 每轮选择凭据 |
-| `LEADER.json` | 选中的候选 |
-| `RESULT.json` | 批次边界结果 |
+- `PLAN.json`
+- `DASHBOARD.json`：全部轨迹、每次选择、指标诊断。
+- `LEADER.json`、`RESULT.json`
+- 每个分支一个目录，含：
+  - `RESULT.json`：分支、提交、会话、评估结果；
+  - `worker-output.md`、`evaluation.log`；
+  - `scratch/`。
 
-`<checkout>/.auto-research-methods/LATEST.json` 记录选中的工作区、其 LayerFS 分支、原始清单，以及停滞状态 `frontier`（`evaluator_sha256`、`anchor_score`、`stalled_work_seconds`）。下一批只在原始工作区仍匹配时从该 leader 开始；否则停止并要求协调者先对齐起点。使用 LayerFS 时，若之前的挂载路径已不可用，会重新挂载保存的分支。
-
-## LayerFS 集成
-
-存在 `DSH_LAYERFS_PROJECT` 与 `DSH_LAYERFS_SDK`（或 `config.layerfs` 提供）时，分支使用 `branch.fork`、`sandbox.create`、`workspace.mount(sandbox, branch)`、`workspace.commit` 与 `workspace.unmount`。每个批次按需创建一个 Sandbox；该 Sandbox 已自行关闭（`NoSuchSandbox`）或已满（`Capacity`，16 个挂载）时，在新 Sandbox 中重试一次挂载。`Busy` 拒绝会以指数退避重试；分支名保持在 63 字符以内；被采用的分支名会先校验。验证通过的状态会提交，并以其 LayerFS 分支作为检查点；已完成的科学拒绝分支会以 `rejected` 提交并以 `discard: false` 卸载，保留在 LayerFS 历史中；provider 失败与超时的工作会作为未验证状态提交并保留以供审阅。没有绑定项目时 `layerfs` 工厂返回 null，`auto` 选择落到 `snapshot` 后端（全量拷贝与内容寻址检查点对象）。核心自身不注册任何后端：没有可用后端时批次失败，错误信息列出已注册的后端。第三方后端从 `dsh-auto-research/api` 引入类型与共享工具，inject `researchWorkspace`，并调用 `ctx.researchWorkspace.register({ name, priority, create })`。
-
-真实 LayerFS 挂载返回 Sandbox 内部路径（如 `/workspaces/1`）。当该路径在宿主上不可访问时，后端在 `<run>/<branch>/workspace` 暂存宿主副本，并在该副本上执行评估与 worker，同时在提交时用一次 `client.fs.apply`（先建父目录，再写入，最后删除）发布新增/修改/删除的文件，再调用 `workspace.commit`。冻结基线后会重新挂载分支，使 Sandbox 内的 `/workspaces/<n>` 与宿主暂存副本一致；worker 轮次结束后会把已提交的 Sandbox 覆盖层同步回宿主副本再评估。`fs.read` 无法表示的二进制文件通过 `workspace.exec` + `base64` 原样复制，无法复制时标记为跳过且绝不会被误删。worker 还会收到 `DSH_AUTO_RESEARCH_BRANCH` 与 `DSH_AUTO_RESEARCH_SANDBOX_PATH`。
-
-宿主暂存副本是唯一写入方，Sandbox 挂载只用于执行。worker 返回后，`reconcile` 先把 Sandbox overlay 的改动提交进分支历史，再把两边与暂存副本的初始清单比较：只有 Sandbox 改动时合并回宿主副本；只有宿主改动时由提交发布；两边都改动时分支判为无效（`workspace conflict: host and sandbox both modified: <路径>`），不评估，并以 `rejected` 提交，两边的改动都留在分支历史中。
-
-每个 cohort 开始前由后端估算分支新增的字节数：snapshot 后端与暂存的 LayerFS 挂载按全量宿主副本计算，宿主可直接访问的 LayerFS 挂载（写时复制）计为 0。只有估算值超过可用空间时才拒绝。
-
-符号链接在清单中记为 `symlink:<链接文本>`，不跟随。snapshot 复制时原样重建；已完成状态的检查点记在 `links` 中；暂存的 LayerFS 分支只在宿主副本保留链接（SDK 不能写入链接），并列入 `skippedFiles`。
-
-provider 从 `config.layerfs`、`process.env` 与会话的 `ctx.shellEnv` contributor（由 dsh-layerfs 的 `@dsh-layerfs/host` 发布）解析 `DSH_LAYERFS_PROJECT`、`DSH_LAYERFS_SDK`、`DSH_LAYERFS_BACKEND`、`DSH_LAYERFS_CLI`、`DSH_LAYERFS_SKILL`、`DSH_LAYERFS_HOME`、`DSH_LAYERFS_STORE_PATH`、`DSH_LAYERFS_DOCKER`、`DSH_LAYERFS_IMAGE`、`DSH_LAYERFS_VOLUME`、`DSH_LAYERFS_DAEMON`、`DSH_LAYERFS_CONTAINER_PREFIX`、`DSH_LAYERFS_DAEMON_HOST`、`DSH_LAYERFS_WORKER_ENDPOINT`、`DSH_LAYERFS_TRACE`、`DSH_LAYERFS_TRACE_STEP` 与 `DSH_LAYERFS_TRACE_START`。显式 `config.layerfs` 优先；宿主注入的 `layerfs.client` 从不由本插件关闭。LayerFS 1.1 的 `LayerFS.open(project)` 不接受参数，只在打开时读取一次 `LAYERFS_*`，因此插件在打开期间把对应的 `LAYERFS_*` 写入 `process.env`，打开后恢复。macOS 上 `DSH_LAYERFS_WORKER_ENDPOINT` 指向 `@layerfs/runtime` 启动的 worker 容器。项目必须事先存在：在 dsh 中导入该 checkout（项目标签 → Import project…）或调用 `POST /layerfs/init`；项目不存在时批次失败并给出这条指引。
-
-## Colab GPU 评估
-
-默认 patch 不含 `dsh-auto-research/colab`，需要连同 endpoint 自行插入：
-
-```yaml
-- insert:
-    - id: auto-research-colab
-      name: 'dsh-auto-research/colab'
-      config:
-        connectionFile: ~/.config/dsh-colab/connection.json
-```
-
-`node lib/colab/cli.js bootstrap` 输出启动队列服务（`COLAB_WORKER_PY`）与隧道的单格 Colab notebook 代码。配置了 endpoint 或连接文件（在该行中，或 `DSH_COLAB_ENDPOINT` / `DSH_COLAB_CONNECTION`）时，`colab` 执行后端（优先级 100）在 `auto` 选择中胜出；未配置时它返回 null，由 `local` 运行评估器。队列一次只跑一个任务。每次评估上传冻结评估器及其哈希和工作区清单；远端评估器哈希与冻结副本不同，或评估改动了上传的工作区时，结果被拒绝。`FrozenEvaluator` 本地的哈希与清单校验照常执行。worker 通过 `ctx.shellEnv` 获得 `DSH_COLAB_*`，用 `node "$DSH_COLAB_CLI" exec . -- <命令>` 做 GPU 预检。
-
-## 安全
-
-- 用户原始 checkout 永远不会被评估或修改；分支是拷贝或 CoW 挂载。
-- 共享检查点拒绝符号链接、路径穿越、点文件（`.method-evaluation` 除外）、私有凭据文件名以及疑似凭据内容。
-- worker skill 禁止递归派生与发布/合并；provider 也会拒绝来自 worker checkout 或存活 worker 子会话的 `subagent_auto_research` 调用。
-- `CONFIG.json` 省略 `workerEnv` 与 `layerfs` 中疑似机密的键；worker 仍按配置收到完整的 `workerEnv`。
-- 不会自动合并、重置、覆盖、删除或发布。
-- 批次边界不能证明用户目标已完成，也不能证明存在基准提升。
-
-## 构建
-
-源码位于 `src/*.ts`（严格 TypeScript），`npm run build` 编译到 `lib/`（`lib/index.js`、`lib/*.d.ts`），`npm test` 依次执行 typecheck、build 和 `node --test tests/*.test.ts`。测试也全部是严格 TypeScript（`tsconfig.test.json` 同时检查 `src` 与 `tests`）。
-
-## 测试
-
-```bash
-npm test
-```
-
-`node:test` 测试覆盖协议（指标视图、portfolio、检查点、peer review、综合上下文）、评估器冻结与完整性、两种工作区后端与完成状态恢复、完整运行器批次（分叉-刷新、RSI 停滞、协作、失败/超时区分）、provider/插件生命周期、取消与包元数据。
+`.auto-research-methods/LATEST.json` 记录 leader 和前沿，供下一个批次使用。插件不会合并或发布任何内容。
 
 ## 限制
 
-- worker 的 provider session 会被记录，但通用 `startActivation` 接口无法恢复会话；续跑依靠 handoff：上一轮的助手输出写入下一轮 checkout 的 `.auto-research-methods/HANDOFF.md`（由 `BRANCH.json` 的 `handoff` 指出），run 目录在 `<branch>/HANDOFF.md` 留一份副本。`LAUNCH.json` 记录 `continuation: "handoff"`（全新分支为 `"none"`）。
-- Sandbox 内部的 LayerFS 挂载通过宿主暂存目录桥接；超大工作区需要复制成本。二进制文件通过 `workspace.exec` 原样复制，无法复制时跳过并告警，且不会被删除。
-- 协作 epoch 复用分支工作区，要求 worker 在共享窗口内完成；硬性阶段截止时间仍然生效。
-- 评估器必须是本地可执行脚本；除已接受的工作区与清单检查外没有额外沙箱。
+- worker 必须是进程内的 dsh agent（`spawn`）；外部 provider 的会话不能续接。
+- worker 如果在命令执行到一半时被中断，可能留下一个未卸载的 LayerFS Workspace，它所在的 Sandbox 会一直运行到该 Workspace 被卸载。
+- Colab 执行器使用的 `exportTree` 导出时会排除 `.git`。

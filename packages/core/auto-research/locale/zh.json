@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "自动研究",
+    "description": "在 LayerFS 分支上以评估器打分的研究批次：explore 分叉，continue 续接 leader 自己的 worker 会话"
+  }
+}

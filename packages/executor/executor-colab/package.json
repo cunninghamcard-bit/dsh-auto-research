@@ -1,0 +1,28 @@
+{
+  "name": "dsh-auto-research-executor-colab",
+  "version": "0.3.0",
+  "description": "Runs dsh-auto-research commands on Google Colab through the Colab CLI",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "skills"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dsh-auto-research-api": "workspace:*"
+  },
+  "license": "MIT"
+}

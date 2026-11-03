@@ -1,229 +1,132 @@
 # dsh-auto-research
 
-Evidence-scored research batches for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), as a `SubagentProvider` named `auto-research`.
+Evidence-scored research batches for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), on [LayerFS](https://github.com/layerfs) branches.
 
-One activation runs one **Batch**: freeze the evaluator, evaluate the baseline, run isolated research branches with **fork-and-flush** and/or **RSI-top**, optionally share checkpoints between cooperative cohorts, select a leader by independently evaluated score, and write a complete receipt trail. The coordinator model — not this plugin — owns the scientific objective, metrics, and decision to continue.
+One `subagent_auto_research` call runs one **batch**. Every research state is a LayerFS commit, and the plan's evaluator scores each one.
 
-Stack: strict TypeScript (ES2024, compiled to `lib/` with declarations and source maps), Node.js ESM, Cordis plugins, `ctx.subagents`, optional [LayerFS](https://github.com/layerfs) copy-on-write branches. No runtime dependencies.
+- **Explore** forks the leader's commit into new branches, each with a fresh worker.
+- **Continue** resumes the leader's own worker session on the leader's branch.
+- **Selection** keeps the best valid score.
 
-## What it adds
+The coordinator model, not this plugin, owns the objective, the metrics and the decision to run another batch.
 
-| Cordis row | Contribution |
-| --- | --- |
-| `subagent-auto-research` | Provides `ctx.researchWorkspace` and `ctx.researchExecutor`, and registers the `auto-research` provider and the `auto-research` / `auto-research-worker` skills |
-| `auto-research-layerfs` | Registers LayerFS copy-on-write branches on `ctx.researchWorkspace` (priority 100) |
-| `auto-research-snapshot` | Registers full-copy snapshot branches on `ctx.researchWorkspace` (priority 0, the fallback) |
-| `auto-research-local` | Runs the frozen evaluator on this host, through `ctx.subprocess` when present (`ctx.researchExecutor`, priority 0) |
-| `tool-subagent-auto-research` | Exposes `subagent_auto_research` through `@deepseek-ai/dsh-tool-subagent` with provider-managed depth |
+## Packages
 
-The coordinator loads the `auto-research` skill. It inspects the repository, writes a plan, delegates one batch, then reviews `RESULT.json`, `DASHBOARD.json`, `LEADER.json`, `SELECTIONS.json`, and any cooperative evidence before deciding whether another batch is justified.
+This repository is a pnpm workspace. Each package is one Cordis plugin:
 
-## Skills
-
-Every model-facing instruction ships as a skill under [`skills/`](skills); the plugin injects no system-prompt text. The plugin registers both skills with the `skills` service (`@deepseek-ai/dsh-skill`), which the profile must load:
-
-| Skill | Listed for | Content |
+| Package | Path | Role |
 | --- | --- | --- |
-| `auto-research` | every cwd outside a branch checkout | coordinator workflow, plan schema, evaluator contract, review |
-| `auto-research-worker` | cwds inside a live branch checkout (not user-invocable) | branch rules, `BRANCH.json` fields, RSI-top portfolio, cooperative epochs |
-| `auto-research-colab` | every cwd, when `dsh-auto-research/colab` is loaded | `$DSH_COLAB_CLI` pre-flight GPU commands, `options.executor: "colab"` |
+| `dsh-auto-research` | `packages/core/auto-research` | The bundle. Provides the `ctx.researchWorkspace` and `ctx.researchExecutor` registries. Registers the `auto-research` SubagentProvider and its skills. Runs batches. |
+| `dsh-auto-research-api` | `packages/core/api` | Types only: `BranchRef`, `WorkspaceBackend`, `ExecutorBackend`, factories. Implementation packages depend on it alone. |
+| `dsh-auto-research-workspace-layerfs` | `packages/workspace/workspace-layerfs` | Branches of the conversation's LayerFS project. Forks branches, reads branch heads, runs a command on a commit in its own Sandbox, and exports a commit as a tarball. |
+| `dsh-auto-research-executor-local` | `packages/executor/executor-local` | Runs commands in the workspace's LayerFS Sandbox (CPU). Priority 0. |
+| `dsh-auto-research-executor-colab` | `packages/executor/executor-colab` | Runs commands on a Google Colab GPU through the signed-in Colab CLI. Priority 100 when configured. |
 
-A worker's prompt is the plan's `worker_prompt`, the objective, the checkout, and a pointer to the worker skill and to `.auto-research-methods/BRANCH.json`. Before launch the runner writes into the checkout:
-
-- `.auto-research-methods/BRANCH.json`: run and branch ids, phase, parent, LayerFS branch, deadline, provider seconds, `handoff`, `rsi_top` (portfolio size and the full metric view), `cooperation` (peer evidence, shared context), environment keys.
-- `.auto-research-methods/WORKER.json`: the marker that identifies a worker checkout.
-- `.auto-research-methods/HANDOFF.md` when the branch continues a parent.
-- `.claude/skills/auto-research-worker/SKILL.md` and `.agents/skills/auto-research-worker/SKILL.md`, so external CLI workers (`claude-code`, `codex`) discover the worker skill from the checkout.
-
-All of these are removed when the activation ends, before evaluation and commit; `.agents` is excluded from inventories.
+```bash
+pnpm install
+pnpm run build
+```
 
 ## Install
 
-Add the bundle to a DSH profile (the plugin manager reads `dsh.bundle.patch`), or insert the rows from [`cordis.patch.yml`](cordis.patch.yml) into the profile patch manually. The block below is that file verbatim; the configuration table lists the code defaults, which a profile row overrides. The plugin injects the `skills` service, so the profile must load `@deepseek-ai/dsh-skill` and `@deepseek-ai/dsh-tool-skill` (the DSH base bundle does). The provider expects at least one other registered `ctx.subagents` provider to execute workers (`claude-code`, `codex`, `acp`, `dsh-sdk`, `spawn`, …). Set `workerProvider` when the profile has more than one candidate.
+Link `packages/core/auto-research` into a dsh profile and list `dsh-auto-research` in its bundles. The bundle's [`cordis.patch.yml`](packages/core/auto-research/cordis.patch.yml) inserts four rows: the core, the LayerFS workspace, the local executor, and the `subagent_auto_research` tool. To use Colab, insert the Colab row with sessions:
 
 ```yaml
 - insert:
-    - id: subagent-auto-research
-      name: 'dsh-auto-research'
+    - id: auto-research-executor-colab
+      name: 'dsh-auto-research-executor-colab'
       config:
-        providerName: auto-research
-        rounds: 1
-        branches: 4
-        explorationMinutes: 30
-        exploitationMinutes: 30
-        rsiTop: true
-        forkAndFlush: true
-        shareContext: false
-        sharingIntervalMinutes: 10
-
-    - id: auto-research-layerfs
-      name: 'dsh-auto-research/layerfs'
-
-    - id: auto-research-snapshot
-      name: 'dsh-auto-research/snapshot'
-
-    - id: auto-research-local
-      name: 'dsh-auto-research/local'
-
-    - id: tool-subagent-auto-research
-      name: '@deepseek-ai/dsh-tool-subagent'
-      config:
-        provider: auto-research
-        toolName: subagent_auto_research
-        maxDepth: provider-managed
+        sessions: [my-h100]   # running `colab new -s my-h100 --gpu H100` sessions
 ```
+
+Requirements:
+
+- [dsh-layerfs](https://github.com/layerfs/dsh-layerfs) with the conversation bound to a LayerFS project. Workers use its `layerfs` command.
+- A dsh with `ctx.subagents.continueActivation` (deepseek-harness `feat/subagent-continue-activation`).
+- Session persistence. Continue cold-resumes the worker session.
 
 ## Configuration
 
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `providerName` | `auto-research` | Registry name of the provider |
-| `workerProvider` | first other provider | `ctx.subagents` provider used for branch workers |
-| `planPath` | `.auto-research-methods/plan.json` | Plan file read from the delegated checkout |
-| `rounds` | `1` | Rounds in one batch (a ceiling, not a completion claim) |
-| `branches` | `4` | Parallel explore branches |
-| `explorationMinutes` | `30` | Per-phase explore window |
-| `exploitationMinutes` | `30` | Per-phase continue window |
-| `rsiTop` | `false` | Enable randomized metric-subset views and portfolios |
-| `forkAndFlush` | `false` | Force a fresh explore cohort every round |
-| `shareContext` | `false` | Enable cooperative checkpoints and peer review |
-| `sharingIntervalMinutes` | `10` | Checkpoint cadence inside a phase window |
-| `executor` | `auto` | Registered executor for the frozen evaluator (`local`, `colab`, or a third-party one); `auto` takes the first available by priority. A plan may override it in `options.executor` |
-| `workspaceBackend` | `auto` | Registered backend name (`layerfs`, `snapshot`, or a third-party one); `auto` takes the first available by priority. A plan may override it in `options.workspaceBackend` |
-| `layerfs` | auto | Explicit LayerFS settings; `false` makes the `layerfs` backend decline the batch |
-| `workerEnv` | `{}` | Environment passed to workers as configured (`DSH_*` names also through `ctx.shellEnv`); `CONFIG.json` omits secret-looking keys |
+| `workerProvider` | `spawn` | Worker provider; it must support continuable (in-process) children |
+| `workerModel`, `workerLlmProvider`, `workerReasoningEffort`, `workerAgentOptions` | the coordinator's | Worker LLM; `workerModel` matches a model id or display name |
+| `planPath` | `.auto-research-methods/plan.json` | Plan file, relative to the coordinator's folder |
+| `rounds` | `3` | Rounds per batch |
+| `branches` | `4` | Explore branches per round |
+| `explorationMinutes` | `5` | Explore turn length |
+| `exploitationMinutes` | `15` | Continue turn length |
+| `forkAndFlush` | `true` | Explore every round |
+| `rsiTop` | `false` | Explore when stalled, with randomized metric views and portfolios |
+| `workspaceBackend`, `executor` | `auto` | Registered names; `auto` takes the first available by priority |
 
-Every plan may include an `options` object that overrides these per-batch values. The model chooses scientific values; the plugin only rejects impossible combinations (for example a metric subset larger than the declared metric set).
+A plan overrides any of these in `options`.
 
 ## Plan
 
-The coordinator writes the plan outside the candidate source, at `planPath` (default `.auto-research-methods/plan.json`), or the profile sets `plan` in the configuration. These are the only two sources. Per-batch overrides go in `plan.options`, under the configuration's own field names (`workerProvider`, `workerModel`, `branches`, …).
+`.auto-research-methods/plan.json` in the coordinator's folder:
 
 ```json
 {
-  "objective": "The user's exact objective and scope",
-  "worker_prompt": "Task-specific instructions, constraints, how to run checks, and how to save evidence",
-  "evaluator": "absolute/path/to/evaluator.mjs",
-  "evaluation_seconds": 60,
+  "objective": "…",
+  "worker_prompt": "…",
+  "base": "main",
+  "evaluator": "/abs/path/evaluate.py",
+  "evaluation_seconds": 120,
   "direction": "maximize",
-  "metrics": [
-    { "name": "validity", "definition": "task-specific fixed definition" },
-    { "name": "best_trial", "definition": "best valid trial", "optional": true }
-  ],
-  "selection_metrics": [
-    { "name": "verified_progress", "direction": "maximize" }
-  ],
-  "stall_seconds": 1200,
-  "meaningful_gain": 0.0,
-  "metric_subset": 1,
-  "portfolio_size": 4
+  "metrics": [{ "name": "speedup" }],
+  "meaningful_gain": 0.01,
+  "options": { "rounds": 3, "branches": 4 }
 }
 ```
 
-- `selection_metrics` must also be declared in `metrics` and be finite; they only rank candidates whose primary score ties.
-- Optional metrics may be absent; a missing observation is never coerced to zero.
-- `stall_seconds`, `metric_subset`, and `portfolio_size` are required when `rsiTop` is enabled.
-- `workspace` may name a compact seed subdirectory inside the checkout. It must be relative, resolve to a directory strictly inside the checkout, and stay outside `.auto-research-methods`.
+`base` is the LayerFS ref the first batch starts from. Later batches start from the leader in `LATEST.json` while the evaluator and the executor stay the same. A changed evaluator or a different executor starts a new frontier from `base`.
 
 ## Evaluator contract
 
-The evaluator is copied out of the candidate workspace, hashed, and executed with the candidate workspace as its final argument:
+The evaluator is a file on the host. The runner reads it once per batch and records its SHA-256. For each candidate commit, the executor:
 
-```text
-<stdout> {"valid": true, "score": 1.0, "metrics": {"validity": 1.0}, "evidence": ["relative/receipt.json"]}
+1. places the evaluator at `.auto-research/<name>` in a fresh copy of the commit;
+2. runs `<interpreter> .auto-research/<name> .` from the branch root;
+3. discards the copy.
+
+The interpreter is `python3 -B` for `.py`, `node` for `.js`/`.mjs`, `bash` for `.sh`, or `evaluator_interpreter`.
+
+The last line of stdout is the result: `{"valid": true, "score": <number>, "metrics": {…}}`. An invalid candidate prints `"valid": false` with a `reason`.
+
+Workers cannot change the evaluator. It lives outside every branch, and each worker writes only its own branch.
+
+## Batch
+
+```
+AutoResearchProvider.start
+ ① validate the plan, read the evaluator, pick the worker provider and model
+ ② workspace = researchWorkspace.select(), executor = researchExecutor.select()
+ ③ baseline: the LATEST.json leader (same evaluator and executor) or a branch forked from plan.base, evaluated
+ ④ each round
+    ├ explore: fork the leader's commit into `branches` branches; startActivation(spawn, cwd = a scratch folder)
+    │          interrupt at the deadline; evaluate each branch head; choose
+    ├ continue: continueActivation(leader session) on the leader's branch; interrupt at the deadline; evaluate; choose
+    └ stall clock: reset on a gain above meaningful_gain
+ ⑤ write DASHBOARD.json, LEADER.json, RESULT.json, LATEST.json
 ```
 
-- One JSON object on stdout. Invalid candidates emit `valid: false`.
-- `score` must be finite; booleans and non-finite sentinels are rejected.
-- A valid result lists at least one `evidence` entry; an empty list fails the evaluation (`No evaluation evidence`).
-- Each entry is a relative path (no `./`, `..`, empty segments or backslashes) to a regular file that already existed in the workspace before the evaluation, or to a file the evaluator wrote under `.method-evaluation/`. The evaluated source file itself is a valid entry.
-- The script must not modify the workspace; the runner compares the full inventory before and after.
-- The frozen copy's SHA-256 is checked before and after every evaluation.
-- `.py` evaluators run with `python3 -I -B`; `.js/.mjs/.cjs` run with the current Node executable. Set `evaluator_interpreter` to override.
-
-## Batch lifecycle
-
-1. Freeze the evaluator and write `PLAN.json` / `CONFIG.json`.
-2. Snapshot (or LayerFS-baseline) the starting workspace and evaluate it. An invalid baseline stops the batch before any worker starts.
-3. For each round, decide `stalled` (`stalled_work_seconds >= stall_seconds`) and `explore = forkAndFlush || (rsiTop && stalled)`. `stalled_work_seconds` counts phase work time since the last gain above `meaningful_gain` and is carried across batches in `LATEST.json` (`frontier`), so RSI-top alone also explores with `rounds: 1`. A frontier frozen against a different evaluator is discarded.
-4. Explore runs `branches` parallel workers; continue runs one worker. Each branch gets an isolated fork/mount, a Worker Prompt, a budget reservation, and (under RSI-top) a distinct randomized metric view plus portfolio protocol.
-5. Evaluate completed branches with the frozen evaluator, validate `PORTFOLIO.json`, and select a leader: any better primary score (in the plan's `direction`) replaces the leader, however small the gain. A primary-score tie is broken by `selection_metrics` in order, then a branch over the baseline, then the newest branch. `meaningful_gain` does not gate selection; it only resets the stall clock. An evaluator with noisy scores should average its own repeated trials.
-6. Either run the continue phase or finish with `RESULT.json`.
-
-With `shareContext`, each phase runs cooperative epochs inside the same total window. Every epoch publishes `PEER-EVIDENCE.json` and `shared-context.md`; branches write `SHARED_CHECKPOINT.json` (explicit text evidence allowlist) and, on resumed epochs, `PEER-REVIEW.json` covering every supplied peer exactly once. A verified completed state is retained content-addressed and restored into a separate `<branch>-last-completed/` directory if a later epoch fails.
+A worker's cwd is a scratch folder on the host, `runs/<run>/<branch>/scratch`. It holds `BRANCH.json`, the worker's notes and, on RSI-top branches, `PORTFOLIO.json`. The project itself is the worker's LayerFS branch, which it changes with the `layerfs` command.
 
 ## Artifacts
 
-Everything lives under `<checkout>/.auto-research-methods/runs/<run-id>/`:
+Under `.auto-research-methods/runs/<run>/`:
 
-| File | Purpose |
-| --- | --- |
-| `PLAN.json`, `CONFIG.json` | Frozen inputs |
-| `evaluator.*` | Frozen evaluator copy |
-| `initial/` | Baseline workspace, manifest, evaluation |
-| `round-N-<phase>-<n>/` | Branch workspace, `INPUT-MANIFEST.json`, `LAUNCH.json`, `BUDGET.json`, `RESULT.json`, evaluation logs |
-| `round-N-<phase>-epoch-N-branch-M/` | Cooperative epoch branch artifact |
-| `round-N-<phase>-COLLABORATION.json` | Epoch history, peer bundle paths, retained checkpoints |
-| `PEER-EVIDENCE.json` | Immutable published peer observations |
-| `shared-context.md` | Verbatim research checkpoints plus `RESEARCH_CONTEXT/` topic index |
-| `checkpoint-objects/` | Content-addressed completed files |
-| `DASHBOARD.json` | Every trajectory plus metric diagnostics |
-| `SELECTIONS.json` | Round-by-round selection receipts |
-| `LEADER.json` | Selected candidate |
-| `RESULT.json` | Batch boundary result |
+- `PLAN.json`
+- `DASHBOARD.json`: every trajectory, every selection, and the metric diagnostics.
+- `LEADER.json`, `RESULT.json`
+- Per branch: `RESULT.json` (branch, commit, session, evaluation), `worker-output.md`, `evaluation.log`, `scratch/`.
 
-`<checkout>/.auto-research-methods/LATEST.json` records the selected workspace, its LayerFS branch, the original manifest, and the stall `frontier` (`evaluator_sha256`, `anchor_score`, `stalled_work_seconds`). The next batch starts from that leader only when the original workspace still matches; otherwise it stops and asks the coordinator to reconcile the starting point. With LayerFS, the saved branch is remounted when its previous mount path is no longer available. If `LATEST.json` names a leader workspace or branch and neither can be adopted, the new batch fails loud instead of silently restarting from the seed. `runner.lock` (created exclusively, holding the owner pid) makes one checkout single-instance; a lock whose pid is gone is replaced, an unreadable one must be deleted by hand. For a compact `plan.workspace` seed, runtime artifacts live inside the seed (`.auto-research-methods/`) and `<checkout>/.auto-research-methods/SEED.json` points at them.
-
-## LayerFS integration
-
-When `DSH_LAYERFS_PROJECT` and `DSH_LAYERFS_SDK` are present (or `config.layerfs` provides them), branches use `branch.fork`, `sandbox.create`, `workspace.mount(sandbox, branch)`, `workspace.commit`, and `workspace.unmount`. One Sandbox is created lazily per batch; when it has closed itself (`NoSuchSandbox`) or is full (`Capacity`, 16 mounts) the mount is retried once in a new Sandbox. `Busy` refusals are retried with exponential backoff, branch names stay within Docker's 63-character limit, and adopted branch names are validated. Verified states are committed; completed branches that were scientifically rejected are committed as `rejected` and unmounted with `discard: false`, so losing work remains in LayerFS history. Provider failures and timed-out work are committed as unverified and kept for review. Without a bound project the `layerfs` factory declines and `auto` selection falls through to the `snapshot` backend (full copies with content-addressed checkpoint objects). The core registers no backend of its own: when nothing is available the batch fails and names the registered backends. A third-party backend imports its types and the shared workspace utilities from `dsh-auto-research/api`, injects `researchWorkspace`, and calls `ctx.researchWorkspace.register({ name, priority, create })`.
-
-The provider resolves `DSH_LAYERFS_PROJECT`, `DSH_LAYERFS_SDK`, `DSH_LAYERFS_BACKEND`, `DSH_LAYERFS_CLI`, `DSH_LAYERFS_SKILL`, `DSH_LAYERFS_HOME`, `DSH_LAYERFS_STORE_PATH`, `DSH_LAYERFS_DOCKER`, `DSH_LAYERFS_IMAGE`, `DSH_LAYERFS_VOLUME`, `DSH_LAYERFS_DAEMON`, `DSH_LAYERFS_CONTAINER_PREFIX`, `DSH_LAYERFS_DAEMON_HOST`, `DSH_LAYERFS_WORKER_ENDPOINT`, `DSH_LAYERFS_TRACE`, `DSH_LAYERFS_TRACE_STEP`, and `DSH_LAYERFS_TRACE_START` from `config.layerfs`, `process.env`, and the session's `ctx.shellEnv` contributors (dsh-layerfs's `@dsh-layerfs/host` publishes them). Explicit `config.layerfs` wins. LayerFS 1.1's `LayerFS.open(project)` takes no options and reads `LAYERFS_*` once, so the plugin sets the matching `LAYERFS_*` names on `process.env` for the duration of the open and restores them after. On macOS `DSH_LAYERFS_WORKER_ENDPOINT` names the worker container that `@layerfs/runtime` started. The project must already exist: import the checkout in dsh (project chip → Import project…) or `POST /layerfs/init`; a missing project fails the batch with that instruction. A host-injected `layerfs.client` is never closed by this plugin.
-
-Real LayerFS mounts return a Sandbox-internal path such as `/workspaces/1`. When that path is not host-accessible, the backend stages a host copy at `<run>/<branch>/workspace`, evaluates and runs workers there, and on commit publishes added/modified/deleted files in one `client.fs.apply` (parent `mkdir`s, then writes, then removals) before `workspace.commit`. Workers also receive `DSH_AUTO_RESEARCH_BRANCH` and `DSH_AUTO_RESEARCH_SANDBOX_PATH`.
-
-The host staging copy is the only writer; the Sandbox mount is for execution. After a worker returns, `reconcile` commits any dirty Sandbox overlay into the branch history, then compares both views with the inventory the staging copy started from: Sandbox-only changes are folded into the host copy, host-only changes are published by the commit, and a branch whose two views both changed is invalid (`workspace conflict: host and sandbox both modified: <paths>`). It is not evaluated and is committed as `rejected`, so both sides stay in the branch history.
-
-Before a cohort, the backend estimates the bytes its forks add: full host copies for the snapshot backend and staged LayerFS mounts, nothing for host-accessible LayerFS mounts (copy-on-write). The cohort is refused only when that estimate does not fit.
-
-Symlinks are recorded in manifests as `symlink:<link text>` and never followed. Snapshot copies recreate them, completed-state checkpoints store them under `links`, and a staged LayerFS branch keeps them on the host copy only (the SDK cannot write links), listed in `skippedFiles`.
-
-## Colab GPU evaluation
-
-`dsh-auto-research/colab` is not in the default patch; insert it with an endpoint:
-
-```yaml
-- insert:
-    - id: auto-research-colab
-      name: 'dsh-auto-research/colab'
-      config:
-        connectionFile: ~/.config/dsh-colab/connection.json
-```
-
-`node lib/colab/cli.js bootstrap` prints the one-cell Colab notebook that starts the queue server (`COLAB_WORKER_PY`) behind a tunnel. With an endpoint or connection file configured (in the row, or `DSH_COLAB_ENDPOINT` / `DSH_COLAB_CONNECTION`), the `colab` executor (priority 100) wins `auto` selection; without one it declines and `local` runs the evaluator. The queue runs one job at a time. Each evaluation uploads the frozen evaluator with its hash and a manifest of the workspace; a result is rejected when the remote evaluator hash differs from the frozen copy or the evaluation changed the uploaded workspace. `FrozenEvaluator` keeps its own local hash and manifest checks either way. Workers get `DSH_COLAB_*` through `ctx.shellEnv` and run `node "$DSH_COLAB_CLI" exec . -- <command>` for pre-flight GPU work.
-
-## Safety
-
-- The user's original checkout is never evaluated or mutated; branches are copies or CoW mounts.
-- Symlinks, path traversal, dotfiles (except `.method-evaluation`), private credential names, and credential-looking evidence are rejected from shared checkpoints.
-- The worker skill forbids recursive spawning and publishing/merging; the provider also rejects `subagent_auto_research` calls from a worker checkout or a live worker child session.
-- `CONFIG.json` omits secret-looking keys of `workerEnv` and `layerfs`; workers still receive `workerEnv` as configured.
-- No automatic merge, reset, overwrite, deletion, or publication occurs.
-- A batch boundary is not proof that the user's objective is complete or that a benchmark gain exists.
-
-## Tests
-
-```bash
-npm run typecheck   # strict tsc --noEmit for src and tests
-npm run build       # tsc -> lib/index.js + lib/*.d.ts
-npm test            # typecheck + build + node --test tests/*.test.ts
-```
-
-The `node:test` suite covers protocols (full RSI views, reservoir sampling, portfolios, checkpoint auto-discovery, peer review, shared-context fidelity), evaluator freezing/integrity/shebang handling, both workspace backends, LayerFS staging and Busy retries, completion restoration, full runner batches (fork-and-flush, RSI stall, cooperation, sibling aborts, provider.jsonl handoff, failure/timeout distinctions), the checkout lock, cancellation artifacts, provider/plugin lifecycle, and TypeScript build outputs.
+`.auto-research-methods/LATEST.json` holds the leader and the frontier for the next batch. Nothing is merged or published.
 
 ## Limitations
 
-- The generic `startActivation` seam cannot resume a provider's own CLI session. Continuation is the handoff: each turn is archived in `provider.jsonl`, and the previous assistant output is written to `.auto-research-methods/HANDOFF.md` in the next worker's checkout (named by `BRANCH.json` `handoff`); the run folder keeps a copy at `<branch>/HANDOFF.md`. `LAUNCH.json` records `continuation: "handoff"` (or `"none"` for a fresh branch).
-- Sandbox-internal LayerFS mounts are bridged through a host staging directory; very large workspaces pay a copy cost. Binary adopted files that `fs.read` refuses are copied through `workspace.exec` + `base64`; when that is unavailable they are skipped with a warning and never removed from the branch.
-- Cooperative epochs reuse a branch workspace and require the worker to finish within the share window; the hard phase deadline still applies.
-- The evaluator must be a local executable script; there is no built-in sandbox beyond the accepted workspace and inventory checks.
+- Workers must be in-process dsh agents (`spawn`). External providers cannot continue a session.
+- A worker interrupted mid-command may leave a LayerFS Workspace mounted. Its Sandbox stays up until that Workspace is unmounted.
+- `exportTree` (used by the Colab executor) excludes `.git`.
