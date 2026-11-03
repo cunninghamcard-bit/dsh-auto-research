@@ -300,12 +300,13 @@ export class Runner {
       branch: ref.branch,
       scratch,
       seconds,
+      portfolioSize: rsiTop ? this.plan.portfolio_size : null,
     })
     const passOptions = this.deps.workerAgentOptions
       && this.deps.subagents.getProvider(this.deps.workerProvider)?.capabilities.agentOptions === true
     // A reserved session id gives the worker research_run from its first step.
     const childId = randomUUID()
-    const unregister = this.deps.runs.register(childId, this.workerRun(ref.branch, folder, seconds))
+    const unregister = this.deps.runs.register(childId, this.workerRun(ref.branch, folder, seconds, rsiTop ? { scratch, parentId: parent.id } : null))
     const activation = await this.deps.subagents.startActivation({
       provider: this.deps.workerProvider,
       label: `${this.deps.runId.slice(0, 8)}:${id}`,
@@ -332,7 +333,7 @@ export class Runner {
     const folder = join(this.deps.output, id)
     await fsp.mkdir(folder, { recursive: true })
     await this.writeBranchFile(scratch, { id, phase: 'continue', ref, seconds, view: null })
-    const unregister = this.deps.runs.register(leader.session!, this.workerRun(ref.branch, folder, seconds))
+    const unregister = this.deps.runs.register(leader.session!, this.workerRun(ref.branch, folder, seconds, null))
     const activation = await this.deps.subagents.continueActivation({
       parent: this.deps.parent,
       childId: leader.session!,
@@ -415,8 +416,7 @@ export class Runner {
     }
     if (turn.portfolio && row.evaluation.valid) {
       try {
-        const text = await fsp.readFile(join(turn.scratch, 'PORTFOLIO.json'), 'utf8')
-        row.portfolio = validatePortfolio(JSON.parse(text), { portfolioSize: this.plan.portfolio_size, parentId: turn.parent.id })
+        row.portfolio = await this.readPortfolio(turn.scratch, turn.parent.id)
       } catch (error) {
         row.evaluation = { valid: false, reason: 'RSI portfolio: ' + (error as Error).message }
       }
@@ -457,14 +457,35 @@ export class Runner {
   }
 
   /**
+   * A worker's `PORTFOLIO.json`, validated against the plan's portfolio size.
+   */
+  private async readPortfolio(scratch: string, parentId: string): Promise<unknown> {
+    const text = await fsp.readFile(join(scratch, 'PORTFOLIO.json'), 'utf8')
+    return validatePortfolio(JSON.parse(text), { portfolioSize: this.plan.portfolio_size, parentId })
+  }
+
+  /**
    * A worker's `research_run` handler: run a bash command on its branch head through the
    * batch executor, no longer than the turn has left. Every request is
    * appended to the branch's `research-runs.jsonl`.
    */
-  private workerRun(branch: string, folder: string, seconds: number): WorkerRunHandler {
+  private workerRun(
+    branch: string,
+    folder: string,
+    seconds: number,
+    portfolio: { scratch: string; parentId: string } | null,
+  ): WorkerRunHandler {
     const deadline = Date.now() + seconds * 1000
     return async (command, timeoutSeconds, signal) => {
       this.checkStopped()
+      if (portfolio) {
+        // RSI-top: no experiment runs before the portfolio the evaluation will require.
+        await this.readPortfolio(portfolio.scratch, portfolio.parentId).catch((error: unknown) => {
+          const file = join(portfolio.scratch, 'PORTFOLIO.json')
+          const problem = (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'it does not exist' : (error as Error).message
+          throw new Error(`Write ${file} before running experiments (${problem}). It must be a JSON array of exactly ${this.plan.portfolio_size} objects, each with non-empty strings bottleneck, mechanism, expected_effect, lineage and a number verbalized_probability in [0, 1]; the bottleneck/mechanism/expected_effect triples must be distinct. Without it the branch is rejected.`)
+        })
+      }
       const left = Math.floor((deadline - Date.now()) / 1000)
       if (left < 5) throw new Error('the turn has no time left for another run')
       const ref = await this.deps.workspace.head(branch)

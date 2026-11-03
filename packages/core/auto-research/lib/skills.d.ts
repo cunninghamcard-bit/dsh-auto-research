@@ -69,12 +69,14 @@ export declare function registerSkills(skills: SkillsService, isWorkerCwd: (cwd:
     invalidate: () => void;
 };
 /** The first prompt of a fresh worker. */
-export declare function buildWorkerPrompt({ plan, project, branch, scratch, seconds }: {
+export declare function buildWorkerPrompt({ plan, project, branch, scratch, seconds, portfolioSize }: {
     plan: ResearchPlan;
     project: string;
     branch: string;
     scratch: string;
     seconds: number;
+    /** Set on RSI-top explore branches. */
+    portfolioSize: number | null;
 }): string;
 /** The message that continues a leader's worker session for one more turn. */
 export declare function buildContinueMessage({ plan, leader, head, seconds }: {

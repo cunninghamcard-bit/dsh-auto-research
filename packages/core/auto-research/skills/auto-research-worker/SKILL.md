@@ -55,4 +55,4 @@ It runs the command with `bash -c` from the root of your branch's newest commit,
 2. Before experimenting, write `PORTFOLIO.json` in your current directory: a JSON array of exactly `portfolio_size` objects, each with non-empty strings `bottleneck`, `mechanism`, `expected_effect`, `lineage`, and a number `verbalized_probability` in [0, 1]. The bottleneck/mechanism/effect triples must be distinct. The probabilities are proposal weights and need not sum to one.
 3. Test the feasible directions within your time. Never report untested proposals as completed experiments.
 
-A missing or malformed portfolio rejects the branch.
+A missing or malformed portfolio rejects the branch, and `research_run` refuses to run until the portfolio is valid.

@@ -83,7 +83,7 @@ export function registerSkills(skills, isWorkerCwd) {
     return { invalidate: () => control?.invalidate() };
 }
 /** The first prompt of a fresh worker. */
-export function buildWorkerPrompt({ plan, project, branch, scratch, seconds }) {
+export function buildWorkerPrompt({ plan, project, branch, scratch, seconds, portfolioSize }) {
     return [
         plan.worker_prompt,
         '',
@@ -93,6 +93,9 @@ export function buildWorkerPrompt({ plan, project, branch, scratch, seconds }) {
         `Time: ${Math.round(seconds / 60)} minutes. Commit your best state before then; only committed work is evaluated.`,
         `Before anything else, load the skill \`${WORKER_SKILL}\`. If you cannot load skills, read ${skillFile(WORKER_SKILL)}.`,
         `This branch's parameters: ${branchFile(scratch)}`,
+        ...(portfolioSize === null ? [] : [
+            `This is an RSI-top branch. Before you change any file, write ${join(scratch, 'PORTFOLIO.json')}: a JSON array of exactly ${portfolioSize} objects, each with non-empty strings bottleneck, mechanism, expected_effect, lineage and a number verbalized_probability in [0, 1], with distinct bottleneck/mechanism/expected_effect triples. Base it on the metric_view in the parameters file. research_run refuses to run until it is valid, and a branch without it is rejected however well it scores.`,
+        ]),
     ].join('\n');
 }
 /** The message that continues a leader's worker session for one more turn. */

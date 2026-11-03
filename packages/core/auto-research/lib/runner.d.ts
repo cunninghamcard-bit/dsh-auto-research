@@ -97,6 +97,10 @@ export declare class Runner {
      */
     private awaitSettled;
     /**
+     * A worker's `PORTFOLIO.json`, validated against the plan's portfolio size.
+     */
+    private readPortfolio;
+    /**
      * A worker's `research_run` handler: run a bash command on its branch head through the
      * batch executor, no longer than the turn has left. Every request is
      * appended to the branch's `research-runs.jsonl`.
