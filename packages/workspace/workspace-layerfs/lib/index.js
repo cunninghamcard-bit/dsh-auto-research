@@ -21,6 +21,7 @@ import { randomUUID } from 'node:crypto';
 import * as fsp from 'node:fs/promises';
 import { isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { untilAborted } from 'dsh-auto-research-api';
 export const name = 'dsh-auto-research-workspace-layerfs';
 export const inject = ['researchExecutor', 'shellEnv'];
 /** The `DSH_LAYERFS_*` names `@dsh-layerfs/host` publishes, and the `LAYERFS_*` names `LayerFS.open` reads. */
@@ -134,8 +135,8 @@ export class LayerFSWorkspace {
             page = listed.nextPagePos;
         }
     }
-    async run(ref, options) {
-        options.signal?.throwIfAborted();
+    /** Run a command on `ref` in this workspace's Sandbox; nothing is committed. The `sandbox` executor queues these. */
+    async execute(ref, options) {
         const seconds = Math.max(1, Math.ceil(options.timeoutMs / 1000));
         const setup = (options.files ?? []).map(file => {
             const target = quote(file.name);
@@ -242,12 +243,19 @@ export class LayerFSWorkspaceService {
         return new LayerFSWorkspace(client, env.DSH_LAYERFS_PROJECT, options.logger ?? null);
     }
 }
-/** The `sandbox` executor: run in the batch workspace's own Sandbox (CPU). */
+/** The `sandbox` executor: run in the batch workspace's own Sandbox (CPU), one command at a time. */
 export class SandboxExecutor {
     name = 'sandbox';
+    /** The last request; each starts after the previous command has ended. */
+    queue = Promise.resolve();
     run(request) {
         const { ref, workspace, ...options } = request;
-        return workspace.run(ref, options);
+        const current = this.queue.catch(() => { }).then(() => {
+            options.signal?.throwIfAborted();
+            return workspace.execute(ref, options);
+        });
+        this.queue = current;
+        return untilAborted(current, options.signal);
     }
 }
 export class SandboxExecutorFactory {

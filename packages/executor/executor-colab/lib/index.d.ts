@@ -5,7 +5,8 @@
  * Each request streams the commit as a tarball into a fresh directory on the
  * VM, runs the command there under `timeout`, and removes the directory. One
  * ssh connection per session is kept open and reused. Requests on one
- * session run one at a time, so runs do not share the GPU. Sessions cost
+ * session run one at a time, so runs do not share the GPU; a request whose
+ * caller gave up still holds its session until the command ends. Sessions cost
  * compute units: by default only sessions named in the configuration are used.
  */
 import type { ExecutionRequest, ExecutionResult, ExecutorBackend, ExecutorBackendFactory, Logger, PluginContext } from 'dsh-auto-research-api';
@@ -42,6 +43,7 @@ export declare class ColabExecutor implements ExecutorBackend {
     /** The session with the fewest queued requests. */
     private pick;
     run(request: ExecutionRequest): Promise<ExecutionResult>;
+    /** One request, until the command on the VM has ended: an aborted caller does not cut it short. */
     private runOn;
     /** Close the reused connections; stop only the sessions this executor created. */
     close(): Promise<void>;

@@ -14,6 +14,7 @@ import { randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { untilAborted } from 'dsh-auto-research-api'
 import type {
   BranchRef,
   ExecutionRequest,
@@ -169,8 +170,8 @@ export class LayerFSWorkspace implements Workspace {
     }
   }
 
-  async run(ref: BranchRef, options: RunOptions): Promise<ExecutionResult> {
-    options.signal?.throwIfAborted()
+  /** Run a command on `ref` in this workspace's Sandbox; nothing is committed. The `sandbox` executor queues these. */
+  async execute(ref: BranchRef, options: RunOptions): Promise<ExecutionResult> {
     const seconds = Math.max(1, Math.ceil(options.timeoutMs / 1000))
     const setup = (options.files ?? []).map(file => {
       const target = quote(file.name)
@@ -280,13 +281,20 @@ export class LayerFSWorkspaceService implements WorkspaceService {
   }
 }
 
-/** The `sandbox` executor: run in the batch workspace's own Sandbox (CPU). */
+/** The `sandbox` executor: run in the batch workspace's own Sandbox (CPU), one command at a time. */
 export class SandboxExecutor implements ExecutorBackend {
   readonly name = 'sandbox'
+  /** The last request; each starts after the previous command has ended. */
+  private queue: Promise<unknown> = Promise.resolve()
 
   run(request: ExecutionRequest): Promise<ExecutionResult> {
     const { ref, workspace, ...options } = request
-    return workspace.run(ref, options)
+    const current = this.queue.catch(() => {}).then(() => {
+      options.signal?.throwIfAborted()
+      return (workspace as LayerFSWorkspace).execute(ref, options)
+    })
+    this.queue = current
+    return untilAborted(current, options.signal)
   }
 }
 

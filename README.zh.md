@@ -5,7 +5,7 @@
 一次 `subagent_auto_research` 调用运行一个**批次**。每个研究状态都是一个 LayerFS 提交，由 plan 指定的评估器打分：
 
 - **explore**：从 leader 的提交 fork 出若干新分支，每个分支起一个新 worker。
-- **continue**：在 leader 的分支上续接 leader 自己的 worker 会话。
+- **continue**：从 leader 的提交再 fork 一个分支，交给一个以 leader worker 会话为种子的新 worker。分支在它的回合结束后不再改动。
 - **选择**：保留有效分数最好的状态。
 
 目标、指标以及是否再跑一批，由协调者模型决定，插件不做判断。
@@ -18,7 +18,7 @@
 | --- | --- | --- |
 | `dsh-auto-research` | `packages/core/auto-research` | bundle 本身和 runner：注册 `auto-research` SubagentProvider 和 worker 的 `research_run` 工具，提供 `ctx.researchExecutor` 注册表和 `ctx.researchWorkers` |
 | `dsh-auto-research-api` | `packages/core/api` | 插件之间的约定：`BranchRef`、`Workspace`、`ExecutorBackend`、工厂接口，以及提示词包共用的 skill 注册函数 |
-| `dsh-auto-research-workspace-layerfs` | `packages/workspace/workspace-layerfs` | 所有 LayerFS 相关的代码：提供 `ctx.researchWorkspace`（fork 对话所绑定项目的分支、读取 head、在自己的 Sandbox 里对某个提交执行命令、把提交导出为 tarball），并把这个 Sandbox 登记为 `sandbox` 执行器，优先级 0 |
+| `dsh-auto-research-workspace-layerfs` | `packages/workspace/workspace-layerfs` | 所有 LayerFS 相关的代码：提供 `ctx.researchWorkspace`（fork 对话所绑定项目的分支、读取 head、把提交导出为 tarball），并把自己的 Sandbox 登记为 `sandbox` 执行器，优先级 0，一次只执行一个命令 |
 | `dsh-auto-research-coordinator` | `packages/skill/coordinator` | 只有提示词：协调者 skill `auto-research` |
 | `dsh-auto-research-worker` | `packages/skill/worker` | 只有提示词：`worker.md`，通过 `ctx.systemPrompt.context` 只注入给正在运行的 worker（依据核心提供的 `ctx.researchWorkers`），其他会话看不到 |
 | `dsh-auto-research-executor-colab` | `packages/executor/executor-colab` | 经已登录 Colab CLI 的 ssh 代理在 Google Colab GPU 上执行命令，附带 Colab 的 skill，配置后优先级 100 |
@@ -112,7 +112,7 @@ AutoResearchProvider.start
  ④ 每一轮
     ├ explore：从 leader 的提交 fork 出 branches 个分支；startActivation(spawn, cwd = 草稿目录)
     │          到时 interrupt；评估各分支 head；选择
-    ├ continue：在 leader 的分支上 startActivation(auto-research-continue，种子 = leader worker 已完成的回合)；
+    ├ continue：fork leader 的提交；复制它的目录；startActivation(auto-research-continue，种子 = leader worker 已完成的回合)；
     │          到时 interrupt；评估；选择
     └ 停滞计时：增益超过 meaningful_gain 时清零
  ⑤ 写 DASHBOARD.json、LEADER.json、RESULT.json、LATEST.json

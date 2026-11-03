@@ -3,8 +3,9 @@
  *
  * A port of ara's `Runner` onto workspace branches and dsh continuable
  * subagents: explore forks the leader's commit into fresh branches, each with
- * a new worker; continue gives the leader's branch a worker seeded with the
- * leader worker's own session. Every state is a commit, scored by the plan's evaluator through the
+ * a new worker; continue forks the leader's commit once more for a worker
+ * seeded with the leader worker's own session. A branch is never changed
+ * after its turn, so every row keeps its commit, session and folder. Every state is a commit, scored by the plan's evaluator through the
  * batch executor.
  */
 import type { BranchRef, ExecutorBackend, Logger, Workspace } from 'dsh-auto-research-api';
@@ -65,13 +66,17 @@ export declare class Runner {
     /** Fork the leader's commit into `branches` fresh branches, one new worker each. */
     private explore;
     /**
-     * Continue the leader's worker on the leader's branch. A leader without a
-     * session (the baseline), or one whose session cannot be read, gets a fresh
-     * worker on a fork instead.
+     * Continue the leader's worker on a fork of the leader's commit. A leader
+     * without a session (the baseline), or one whose session cannot be read,
+     * gets a fresh worker on the fork instead.
      */
     private continueLeader;
     private freshWorker;
-    /** A new worker session seeded with the leader worker's completed turns, on the leader's branch. */
+    /**
+     * A new worker session seeded with the leader worker's completed turns, on
+     * a fork of the leader's commit, in a folder of this batch that starts as a
+     * copy of the leader's.
+     */
     private resumeWorker;
     private writeBranchFile;
     /**

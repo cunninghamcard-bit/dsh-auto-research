@@ -5,7 +5,7 @@ You run experiments on one branch of a research batch. A coordinator owns the pl
 ## Start
 
 1. Read `BRANCH.json` in your current directory (fields below).
-2. If this is a continued session (a message tells you your branch was selected as the leader), keep working from where you left off on the same branch.
+2. If this is a continued session (a message tells you your branch was selected as the leader), keep working from where you left off, on the new branch and in the new folder that message names.
 3. Read your notes in the current directory if you left any.
 
 ## Where things are

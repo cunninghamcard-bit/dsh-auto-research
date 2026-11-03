@@ -24,16 +24,13 @@ export function buildWorkerPrompt({ plan, branch, scratch, seconds, portfolioSiz
         ]),
     ].join('\n');
 }
-/** The message that continues a leader's worker session for one more turn. */
-export function buildContinueMessage({ plan, leader, head, seconds }) {
-    const moved = head.commit !== leader.ref.commit;
+/** The first message of a continue worker, after the leader worker's own turns. */
+export function buildContinueMessage({ plan, leader, ref, scratch, seconds }) {
     return [
-        `Your branch ${leader.ref.branch} was selected as the leader with score ${leader.evaluation.score} (${plan.direction}).`,
-        moved
-            ? `That score is from commit ${leader.ref.commit}; the branch head is now ${head.commit}, which scored lower. Build on the better state.`
-            : `It is the branch head, commit ${head.commit}.`,
-        `Continue the research for ${Math.round(seconds / 60)} more minutes on the same branch. Commit your best state before then; only committed work is evaluated.`,
-        `Updated parameters: ${branchFile(leader.scratch)}`,
+        `Your branch ${leader.ref.branch} was selected as the leader with score ${leader.evaluation.score} (${plan.direction}), at commit ${leader.ref.commit}.`,
+        `Continue the research for ${Math.round(seconds / 60)} more minutes on a new branch forked from that commit: ${ref.branch}. Work and commit only on this branch; leave ${leader.ref.branch} as it is.`,
+        `Your folder is now ${scratch} (the current directory), a copy of your previous one.`,
+        `Commit your best state before then; only committed work is evaluated. Updated parameters: ${branchFile(scratch)}`,
     ].join('\n');
 }
 //# sourceMappingURL=prompts.js.map

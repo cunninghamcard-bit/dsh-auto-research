@@ -5,7 +5,8 @@
  * Each request streams the commit as a tarball into a fresh directory on the
  * VM, runs the command there under `timeout`, and removes the directory. One
  * ssh connection per session is kept open and reused. Requests on one
- * session run one at a time, so runs do not share the GPU. Sessions cost
+ * session run one at a time, so runs do not share the GPU; a request whose
+ * caller gave up still holds its session until the command ends. Sessions cost
  * compute units: by default only sessions named in the configuration are used.
  */
 import { execFile, spawn } from 'node:child_process';
@@ -15,7 +16,7 @@ import * as fsp from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { registerSkillDirectory } from 'dsh-auto-research-api';
+import { registerSkillDirectory, untilAborted } from 'dsh-auto-research-api';
 export const name = 'dsh-auto-research-executor-colab';
 export const inject = ['researchExecutor', 'skills'];
 /** The ssh key the Colab proxy installs on the VM; created on first use. */
@@ -112,17 +113,16 @@ export class ColabExecutor {
         const session = await this.pick();
         this.pending.set(session, (this.pending.get(session) ?? 0) + 1);
         const previous = this.queues.get(session) ?? Promise.resolve();
-        const current = previous.catch(() => { }).then(() => this.runOn(session, request));
+        const current = previous.catch(() => { }).then(() => {
+            request.signal?.throwIfAborted();
+            return this.runOn(session, request);
+        });
         this.queues.set(session, current);
-        try {
-            return await current;
-        }
-        finally {
-            this.pending.set(session, (this.pending.get(session) ?? 1) - 1);
-        }
+        void current.catch(() => { }).finally(() => this.pending.set(session, (this.pending.get(session) ?? 1) - 1));
+        return untilAborted(current, request.signal);
     }
+    /** One request, until the command on the VM has ended: an aborted caller does not cut it short. */
     async runOn(session, request) {
-        request.signal?.throwIfAborted();
         await this.ensureKey();
         this.used.add(session);
         const local = await fsp.mkdtemp(join(tmpdir(), 'auto-research-colab-'));
@@ -140,12 +140,9 @@ export class ColabExecutor {
                 createReadStream(archive).pipe(child.stdin);
                 // The remote `timeout` ends the command; this ends a connection that hangs past it.
                 const guard = setTimeout(() => child.kill('SIGKILL'), (seconds + 60) * 1000);
-                const abort = () => { child.kill('SIGKILL'); };
-                request.signal?.addEventListener('abort', abort, { once: true });
                 child.on('error', reject);
                 child.on('close', code => {
                     clearTimeout(guard);
-                    request.signal?.removeEventListener('abort', abort);
                     resolveRun({ code, timedOut: code === 124 || code === 137 || code === null, stdout, stderr, environment });
                 });
             });

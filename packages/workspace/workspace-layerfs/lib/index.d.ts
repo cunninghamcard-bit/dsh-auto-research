@@ -68,7 +68,8 @@ export declare class LayerFSWorkspace implements Workspace {
     fork(from: BranchRef | string, name: string): Promise<BranchRef>;
     describe(ref: BranchRef): string;
     head(branch: string): Promise<BranchRef>;
-    run(ref: BranchRef, options: RunOptions): Promise<ExecutionResult>;
+    /** Run a command on `ref` in this workspace's Sandbox; nothing is committed. The `sandbox` executor queues these. */
+    execute(ref: BranchRef, options: RunOptions): Promise<ExecutionResult>;
     exportTree(ref: BranchRef, directory: string): Promise<string>;
     close(): Promise<void>;
     /**
@@ -99,9 +100,11 @@ export declare class LayerFSWorkspaceService implements WorkspaceService {
         logger?: Logger;
     }): Promise<LayerFSWorkspace>;
 }
-/** The `sandbox` executor: run in the batch workspace's own Sandbox (CPU). */
+/** The `sandbox` executor: run in the batch workspace's own Sandbox (CPU), one command at a time. */
 export declare class SandboxExecutor implements ExecutorBackend {
     readonly name = "sandbox";
+    /** The last request; each starts after the previous command has ended. */
+    private queue;
     run(request: ExecutionRequest): Promise<ExecutionResult>;
 }
 export declare class SandboxExecutorFactory implements ExecutorBackendFactory {

@@ -12,6 +12,17 @@
  */
 
 export { registerSkillDirectory } from './skills.js'
+
+/** `promise`, or a rejection with the abort reason once `signal` aborts; the work itself goes on. */
+export function untilAborted<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (!signal) return promise
+  if (signal.aborted) return Promise.reject(signal.reason)
+  return new Promise<T>((resolveWait, reject) => {
+    const abort = (): void => reject(signal.reason)
+    signal.addEventListener('abort', abort, { once: true })
+    promise.then(resolveWait, reject).finally(() => signal.removeEventListener('abort', abort))
+  })
+}
 export type { SkillsService } from './skills.js'
 
 /** One branch at one commit. The runner holds this value, never a host path. */
@@ -60,8 +71,6 @@ export interface Workspace {
   head(branch: string): Promise<BranchRef>
   /** How a worker reaches and changes `ref`'s branch; part of the worker's first prompt. */
   describe(ref: BranchRef): string
-  /** Run a command on a commit inside a Sandbox; nothing is committed. */
-  run(ref: BranchRef, options: RunOptions): Promise<ExecutionResult>
   /** Write the commit's tree as a `.tar.gz` under `directory` and return its path. */
   exportTree(ref: BranchRef, directory: string): Promise<string>
   close(): Promise<void>
@@ -82,8 +91,10 @@ export interface ExecutionRequest extends RunOptions {
 
 /**
  * Where commands run. An executor owns queueing (one request at a time per
- * environment that cannot run two), isolation (a fresh directory per request)
- * and timeouts (the process is stopped, not only abandoned).
+ * environment), isolation (a fresh copy of the commit per request) and
+ * timeouts (the process is stopped, not only abandoned). A caller that aborts
+ * stops waiting at once; the next request starts only after the command has
+ * ended, so it never shares the environment with a leftover run.
  */
 export interface ExecutorBackend {
   readonly name: string

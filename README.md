@@ -5,7 +5,7 @@ Evidence-scored research batches for [DeepSeek Harness](https://github.com/deeps
 One `subagent_auto_research` call runs one **batch**. Every research state is a LayerFS commit, and the plan's evaluator scores each one.
 
 - **Explore** forks the leader's commit into new branches, each with a fresh worker.
-- **Continue** resumes the leader's own worker session on the leader's branch.
+- **Continue** forks the leader's commit once more and gives it a worker seeded with the leader worker's own session. No branch changes after its turn.
 - **Selection** keeps the best valid score.
 
 The coordinator model, not this plugin, owns the objective, the metrics and the decision to run another batch.
@@ -18,7 +18,7 @@ This repository is a pnpm workspace. Each package is one Cordis plugin:
 | --- | --- | --- |
 | `dsh-auto-research` | `packages/core/auto-research` | The bundle and the runner. Registers the `auto-research` SubagentProvider and the workers' `research_run` tool, and provides the `ctx.researchExecutor` registry and `ctx.researchWorkers`. |
 | `dsh-auto-research-api` | `packages/core/api` | The contract: `BranchRef`, `Workspace`, `ExecutorBackend`, factories, and the skill registration the prompt packages share. |
-| `dsh-auto-research-workspace-layerfs` | `packages/workspace/workspace-layerfs` | Everything LayerFS. Provides `ctx.researchWorkspace` (forks branches of the conversation's project, reads heads, runs a command on a commit in its own Sandbox, exports a commit as a tarball) and registers that Sandbox as the `sandbox` executor, priority 0. |
+| `dsh-auto-research-workspace-layerfs` | `packages/workspace/workspace-layerfs` | Everything LayerFS. Provides `ctx.researchWorkspace` (forks branches of the conversation's project, reads heads, exports a commit as a tarball) and registers its Sandbox as the `sandbox` executor, priority 0, which runs one command at a time. |
 | `dsh-auto-research-coordinator` | `packages/skill/coordinator` | Prompts only: the `auto-research` coordinator skill. |
 | `dsh-auto-research-worker` | `packages/skill/worker` | Prompts only: `worker.md`, injected with `ctx.systemPrompt.context` into the prompt of every running worker (the core's `ctx.researchWorkers`) and of no other session. |
 | `dsh-auto-research-executor-colab` | `packages/executor/executor-colab` | Runs commands on a Google Colab GPU over ssh through the signed-in Colab CLI's proxy, with its skill. Priority 100 when configured. |
@@ -108,7 +108,7 @@ AutoResearchProvider.start
  ④ each round
     ├ explore: fork the leader's commit into `branches` branches; startActivation(spawn, cwd = a scratch folder)
     │          interrupt at the deadline; evaluate each branch head; choose
-    ├ continue: startActivation(auto-research-continue, seed = the leader worker's completed turns) on the leader's branch;
+    ├ continue: fork the leader's commit; copy its folder; startActivation(auto-research-continue, seed = the leader worker's completed turns);
     │          interrupt at the deadline; evaluate; choose
     └ stall clock: reset on a gain above meaningful_gain
  ⑤ write DASHBOARD.json, LEADER.json, RESULT.json, LATEST.json

@@ -18,11 +18,13 @@ export declare function buildWorkerPrompt({ plan, branch, scratch, seconds, port
     /** Set on RSI-top explore branches. */
     portfolioSize: number | null;
 }): string;
-/** The message that continues a leader's worker session for one more turn. */
-export declare function buildContinueMessage({ plan, leader, head, seconds }: {
+/** The first message of a continue worker, after the leader worker's own turns. */
+export declare function buildContinueMessage({ plan, leader, ref, scratch, seconds }: {
     plan: ResearchPlan;
     leader: TrajectoryRow;
-    head: BranchRef;
+    /** The new branch, forked from the leader's commit. */
+    ref: BranchRef;
+    scratch: string;
     seconds: number;
 }): string;
 //# sourceMappingURL=prompts.d.ts.map
