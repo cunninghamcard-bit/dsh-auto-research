@@ -7,6 +7,8 @@
  * - `ctx.researchExecutor` ({@link BackendRegistry} of executor factories):
  *   where commands run. The core provides the registry; the LayerFS Sandbox
  *   and Colab plugins register on it.
+ * - `ctx.researchWorkers` ({@link WorkersService}): which sessions are running
+ *   branch workers. The core provides it; the worker prompt package reads it.
  */
 export { registerSkillDirectory } from './skills.js';
 export type { SkillsService } from './skills.js';
@@ -88,6 +90,11 @@ export interface ExecutorBackendFactory {
         logger?: Logger;
     }): Promise<ExecutorBackend | null>;
 }
+/** `ctx.researchWorkers`. */
+export interface WorkersService {
+    /** Whether `session` is a branch worker of a running batch. */
+    has(session: string): boolean;
+}
 /** `ctx.researchExecutor`. */
 export interface BackendRegistry<F> {
     register(factory: F): () => void;
@@ -105,6 +112,7 @@ export interface PluginContext {
     inject: (deps: string[], callback: (ctx: PluginContext) => void) => unknown;
     researchWorkspace?: WorkspaceService;
     researchExecutor?: BackendRegistry<ExecutorBackendFactory>;
+    researchWorkers?: WorkersService;
     logger?: Logger;
     [service: string]: unknown;
 }

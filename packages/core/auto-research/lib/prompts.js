@@ -1,11 +1,10 @@
 /**
  * Model-facing messages: a fresh worker's prompt and the message that
- * continues a worker's session. The skills themselves are the prompt packages
- * `dsh-auto-research-coordinator` and `dsh-auto-research-worker`.
+ * continues a worker's session. The standing instructions are the prompt
+ * packages: the coordinator skill, and the worker context that
+ * `dsh-auto-research-worker` injects into every running worker's prompt.
  */
 import { join } from 'node:path';
-/** The worker skill, from `dsh-auto-research-worker`. */
-export const WORKER_SKILL = 'auto-research-worker';
 /** The branch's parameters, in the worker's scratch folder. */
 export function branchFile(scratch) {
     return join(scratch, 'BRANCH.json');
@@ -19,7 +18,6 @@ export function buildWorkerPrompt({ plan, project, branch, scratch, seconds, por
         `Your branch: LayerFS project ${project}, branch ${branch}. Work and commit only on this branch.`,
         `Your folder for notes and scratch files: ${scratch} (the current directory). It is not part of the project.`,
         `Time: ${Math.round(seconds / 60)} minutes. Commit your best state before then; only committed work is evaluated.`,
-        `Before anything else, load the skill \`${WORKER_SKILL}\`.`,
         `This branch's parameters: ${branchFile(scratch)}`,
         ...(portfolioSize === null ? [] : [
             `This is an RSI-top branch. Before you change any file, write ${join(scratch, 'PORTFOLIO.json')}: a JSON array of exactly ${portfolioSize} objects, each with non-empty strings bottleneck, mechanism, expected_effect, lineage and a number verbalized_probability in [0, 1], with distinct bottleneck/mechanism/expected_effect triples. Base it on the metric_view in the parameters file. The branch is scored either way; the portfolio is recorded with it.`,

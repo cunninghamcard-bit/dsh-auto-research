@@ -1,8 +1,8 @@
 /**
  * Cordis entry of the `dsh-auto-research` bundle.
  *
- * Provides the `ctx.researchExecutor` registry and registers the
- * `auto-research` SubagentProvider and the workers' `research_run` tool. The
+ * Provides the `ctx.researchExecutor` registry and `ctx.researchWorkers`, and
+ * registers the `auto-research` SubagentProvider and the workers' `research_run` tool. The
  * workspace (`ctx.researchWorkspace`), the executors and the prompts are other
  * packages of the bundle; the `subagent_auto_research` tool comes from
  * `@deepseek-ai/dsh-tool-subagent`. All are rows of `cordis.patch.yml`.
@@ -42,6 +42,7 @@ export function apply(ctx: PluginContext, config: ProviderConfig = {}): void {
     ...(ctx.logger ? { logger: ctx.logger } : {}),
   }
   const provider = new AutoResearchProvider(host, config, executors)
+  ctx.provide('researchWorkers', provider.workers)
   // Only running workers' steps see `research_run`.
   ctx.inject(['tools'], inner => {
     const tools = inner.tools as {

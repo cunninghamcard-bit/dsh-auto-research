@@ -7,6 +7,8 @@
  * - `ctx.researchExecutor` ({@link BackendRegistry} of executor factories):
  *   where commands run. The core provides the registry; the LayerFS Sandbox
  *   and Colab plugins register on it.
+ * - `ctx.researchWorkers` ({@link WorkersService}): which sessions are running
+ *   branch workers. The core provides it; the worker prompt package reads it.
  */
 export { registerSkillDirectory } from './skills.js';
 //# sourceMappingURL=index.js.map

@@ -16,11 +16,11 @@ This repository is a pnpm workspace. Each package is one Cordis plugin:
 
 | Package | Path | Role |
 | --- | --- | --- |
-| `dsh-auto-research` | `packages/core/auto-research` | The bundle and the runner. Registers the `auto-research` SubagentProvider and the workers' `research_run` tool, and provides the `ctx.researchExecutor` registry. |
+| `dsh-auto-research` | `packages/core/auto-research` | The bundle and the runner. Registers the `auto-research` SubagentProvider and the workers' `research_run` tool, and provides the `ctx.researchExecutor` registry and `ctx.researchWorkers`. |
 | `dsh-auto-research-api` | `packages/core/api` | The contract: `BranchRef`, `Workspace`, `ExecutorBackend`, factories, and the skill registration the prompt packages share. |
 | `dsh-auto-research-workspace-layerfs` | `packages/workspace/workspace-layerfs` | Everything LayerFS. Provides `ctx.researchWorkspace` (forks branches of the conversation's project, reads heads, runs a command on a commit in its own Sandbox, exports a commit as a tarball) and registers that Sandbox as the `sandbox` executor, priority 0. |
 | `dsh-auto-research-coordinator` | `packages/skill/coordinator` | Prompts only: the `auto-research` coordinator skill. |
-| `dsh-auto-research-worker` | `packages/skill/worker` | Prompts only: the `auto-research-worker` skill. |
+| `dsh-auto-research-worker` | `packages/skill/worker` | Prompts only: `worker.md`, injected with `ctx.systemPrompt.context` into the prompt of every running worker (the core's `ctx.researchWorkers`) and of no other session. |
 | `dsh-auto-research-executor-colab` | `packages/executor/executor-colab` | Runs commands on a Google Colab GPU over ssh through the signed-in Colab CLI's proxy, with its skill. Priority 100 when configured. |
 
 ```bash

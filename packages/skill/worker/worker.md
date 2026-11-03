@@ -1,9 +1,3 @@
----
-name: auto-research-worker
-description: Instructions for an auto-research branch worker. Load when your prompt says you are working on an auto-research branch; read before starting any experiment.
-user-invocable: false
----
-
 # Auto research (branch worker)
 
 You run experiments on one LayerFS branch of a research batch. A coordinator owns the plan and the evaluator. After your turn the runner reads your branch's newest commit and scores it with the evaluator. Only committed work is scored.

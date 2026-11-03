@@ -1,7 +1,7 @@
 {
   "name": "dsh-auto-research-worker",
   "version": "0.3.0",
-  "description": "The branch-worker skill of dsh-auto-research: how a worker uses its branch, commits and research_run",
+  "description": "The branch-worker instructions of dsh-auto-research, injected into every running worker's prompt",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -12,7 +12,11 @@
     },
     "./package.json": "./package.json"
   },
-  "files": ["lib", "src", "skills"],
+  "files": [
+    "lib",
+    "src",
+    "worker.md"
+  ],
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit"
