@@ -1,16 +1,16 @@
 /**
  * `dsh-auto-research-executor-colab`: run a command on a commit on a Google
- * Colab GPU through the signed-in Colab CLI.
+ * Colab GPU, over ssh through the signed-in Colab CLI's proxy.
  *
- * A Colab kernel runs one request at a time and shares its state, CUDA
- * context and `/content` across requests, so this executor keeps one queue
- * per session, gives each request its own directory and a fresh process
- * group, kills that group at the timeout, and restarts the kernel when the
- * CLI itself gave up waiting. Sessions cost compute units: by default only
- * sessions named in the configuration are used.
+ * Each request streams the commit as a tarball into a fresh directory on the
+ * VM, runs the command there under `timeout`, and removes the directory. One
+ * ssh connection per session is kept open and reused. Requests on one
+ * session run one at a time, so runs do not share the GPU. Sessions cost
+ * compute units: by default only sessions named in the configuration are used.
  */
 
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
+import { createReadStream } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
@@ -41,51 +41,42 @@ export interface ColabConfig {
   maxSessions?: number
 }
 
-/** Marks the result line among the kernel's output. */
-const RESULT_MARK = '__AUTO_RESEARCH_RESULT__'
+/** The ssh key the Colab proxy installs on the VM; created on first use. */
+const KEY = join(homedir(), '.cache', 'dsh-auto-research', 'ssh', 'id_ed25519')
 
-/** Extra seconds the CLI waits beyond the command's own timeout (setup, extraction, cleanup). */
-const CLI_SLACK_SECONDS = 120
+/** Control sockets of the reused connections; a Unix socket path must stay short. */
+const CONTROL_DIR = join(homedir(), '.cache', 'arssh')
 
-/** The Python run on the Colab kernel for one request. */
-function remoteScript(id: string, files: ReadonlyArray<{ name: string; text: string }>, argv: readonly string[], seconds: number): string {
-  const payload = Buffer.from(JSON.stringify({
-    id,
-    files: files.map(file => [file.name, Buffer.from(file.text, 'utf8').toString('base64')]),
-    argv,
-    seconds,
-  })).toString('base64')
-  return `
-import base64, json, os, shutil, signal, subprocess, tarfile
-spec = json.loads(base64.b64decode(${JSON.stringify(payload)}))
-root = '/content/auto-research/' + spec['id']
-archive = root + '.tar.gz'
-result = {'code': None, 'timedOut': False, 'stdout': '', 'stderr': ''}
-try:
-    os.makedirs(root, exist_ok=True)
-    with tarfile.open(archive) as tar:
-        tar.extractall(root, filter='data')
-    for name, data in spec['files']:
-        path = os.path.join(root, name)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'wb') as handle:
-            handle.write(base64.b64decode(data))
-    child = subprocess.Popen(spec['argv'], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-    try:
-        out, err = child.communicate(timeout=spec['seconds'])
-    except subprocess.TimeoutExpired:
-        os.killpg(child.pid, signal.SIGKILL)
-        out, err = child.communicate()
-        result['timedOut'] = True
-    result.update(code=child.returncode, stdout=out[-1000000:], stderr=err[-200000:])
-except Exception as error:
-    result['stderr'] = 'auto-research Colab setup failed: ' + repr(error)
-finally:
-    shutil.rmtree(root, ignore_errors=True)
-    if os.path.exists(archive):
-        os.remove(archive)
-print(${JSON.stringify(RESULT_MARK)} + json.dumps(result))
-`
+/** Output kept per stream: the tail. */
+const OUTPUT_BYTES = 1_000_000
+
+function quote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+function run(file: string, args: string[], timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolveRun, reject) => {
+    execFile(file, args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) reject(Object.assign(error, { stdout, stderr }))
+      else resolveRun({ stdout, stderr })
+    })
+  })
+}
+
+/** The shell command run on the VM, reading the commit tarball on stdin. */
+function remoteCommand(id: string, files: ReadonlyArray<{ name: string; text: string }>, argv: readonly string[], seconds: number): string {
+  const dir = `/content/auto-research/${id}`
+  const writes = files.map(file => {
+    const path = `${dir}/${file.name}`
+    return `mkdir -p "$(dirname ${quote(path)})" && printf %s ${quote(Buffer.from(file.text, 'utf8').toString('base64'))} | base64 -d > ${quote(path)}`
+  })
+  return [
+    // an ssh login lacks the container's environment the notebook kernel has (CUDA and node on PATH, PYTHONPATH)
+    `while IFS= read -r -d '' kv; do case "$kv" in [A-Za-z_]*=*) export "$kv";; esac; done < /proc/1/environ`,
+    `mkdir -p ${quote(dir)} && tar -xzf - -C ${quote(dir)}`,
+    ...writes,
+    `cd ${quote(dir)} && timeout -k 10 ${seconds} ${argv.map(quote).join(' ')}; code=$?; rm -rf ${quote(dir)}; exit $code`,
+  ].join(' && ')
 }
 
 export class ColabExecutor implements ExecutorBackend {
@@ -95,18 +86,34 @@ export class ColabExecutor implements ExecutorBackend {
   private readonly queues = new Map<string, Promise<unknown>>()
   private readonly pending = new Map<string, number>()
   private readonly created: string[] = []
+  private readonly used = new Set<string>()
+  private key: Promise<void> | null = null
 
   constructor(readonly config: ColabConfig, readonly logger: Logger | null = null) {
     this.cli = config.cli ?? join(homedir(), '.local', 'bin', 'colab')
   }
 
-  private colab(args: string[], timeoutMs: number): Promise<{ stdout: string; stderr: string }> {
-    return new Promise((resolveRun, reject) => {
-      execFile(this.cli, args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }, (error, stdout, stderr) => {
-        if (error) reject(Object.assign(error, { stdout, stderr }))
-        else resolveRun({ stdout, stderr })
-      })
-    })
+  private sshOptions(session: string): string[] {
+    return [
+      '-i', KEY,
+      '-o', `ProxyCommand=${this.cli} ssh --proxy-mode -s ${session} -i ${KEY}`,
+      '-o', 'StrictHostKeyChecking=no',
+      '-o', 'UserKnownHostsFile=/dev/null',
+      '-o', 'LogLevel=ERROR',
+      '-o', 'ControlMaster=auto',
+      '-o', `ControlPath=${join(CONTROL_DIR, '%C')}`,
+      '-o', 'ControlPersist=600',
+    ]
+  }
+
+  private ensureKey(): Promise<void> {
+    return this.key ??= (async () => {
+      await fsp.mkdir(join(KEY, '..'), { recursive: true, mode: 0o700 })
+      await fsp.mkdir(CONTROL_DIR, { recursive: true, mode: 0o700 })
+      if (!await fsp.access(KEY).then(() => true, () => false)) {
+        await run('ssh-keygen', ['-q', '-t', 'ed25519', '-N', '', '-C', 'dsh-auto-research-colab', '-f', KEY], 30_000)
+      }
+    })()
   }
 
   /** Sessions to use; creates them on first use when allowed. */
@@ -116,7 +123,7 @@ export class ColabExecutor implements ExecutorBackend {
       const count = this.config.maxSessions ?? 1
       for (let index = 0; index < count; index += 1) {
         const session = `auto-research-${randomUUID().slice(0, 8)}`
-        await this.colab(['new', '-s', session, ...(this.config.gpu ? ['--gpu', this.config.gpu] : [])], 15 * 60_000)
+        await run(this.cli, ['new', '-s', session, ...(this.config.gpu ? ['--gpu', this.config.gpu] : [])], 15 * 60_000)
         this.created.push(session)
       }
     }
@@ -144,41 +151,44 @@ export class ColabExecutor implements ExecutorBackend {
 
   private async runOn(session: string, request: ExecutionRequest): Promise<ExecutionResult> {
     request.signal?.throwIfAborted()
-    const id = randomUUID()
+    await this.ensureKey()
+    this.used.add(session)
     const local = await fsp.mkdtemp(join(tmpdir(), 'auto-research-colab-'))
     const environment = `colab:${this.config.gpu ?? session}`
+    const seconds = Math.max(1, Math.ceil(request.timeoutMs / 1000))
     try {
       const archive = await request.workspace.exportTree(request.ref, local)
-      await this.colab(['upload', '-s', session, archive, `/content/auto-research/${id}.tar.gz`], 30 * 60_000)
-      const seconds = Math.max(1, Math.ceil(request.timeoutMs / 1000))
-      const script = join(local, 'run.py')
-      await fsp.writeFile(script, remoteScript(id, request.files ?? [], request.argv, seconds))
-      let stdout: string
-      try {
-        stdout = (await this.colab(
-          ['exec', '-s', session, '-f', script, '--timeout', String(seconds + CLI_SLACK_SECONDS)],
-          (seconds + CLI_SLACK_SECONDS + 60) * 1000,
-        )).stdout
-      } catch (error) {
-        // The CLI stopped waiting, but the kernel keeps running the request:
-        // restart it so the next request does not queue behind it.
-        await this.colab(['restart-kernel', '-s', session], 120_000).catch(() => {})
-        const detail = (error as { stderr?: string }).stderr ?? (error as Error).message
-        return { code: null, timedOut: true, stdout: '', stderr: `Colab exec failed: ${detail}`, environment }
-      }
-      const line = stdout.split('\n').reverse().find(entry => entry.startsWith(RESULT_MARK))
-      if (!line) return { code: null, timedOut: false, stdout, stderr: 'Colab run printed no result', environment }
-      const result = JSON.parse(line.slice(RESULT_MARK.length)) as { code: number | null; timedOut: boolean; stdout: string; stderr: string }
-      return { ...result, environment }
+      const command = remoteCommand(randomUUID(), request.files ?? [], request.argv, seconds)
+      return await new Promise<ExecutionResult>((resolveRun, reject) => {
+        const child = spawn('ssh', [...this.sshOptions(session), `root@colab-${session}`, command], { stdio: ['pipe', 'pipe', 'pipe'] })
+        let stdout = ''
+        let stderr = ''
+        child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout = (stdout + chunk).slice(-OUTPUT_BYTES) })
+        child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr = (stderr + chunk).slice(-OUTPUT_BYTES) })
+        createReadStream(archive).pipe(child.stdin)
+        // The remote `timeout` ends the command; this ends a connection that hangs past it.
+        const guard = setTimeout(() => child.kill('SIGKILL'), (seconds + 60) * 1000)
+        const abort = (): void => { child.kill('SIGKILL') }
+        request.signal?.addEventListener('abort', abort, { once: true })
+        child.on('error', reject)
+        child.on('close', code => {
+          clearTimeout(guard)
+          request.signal?.removeEventListener('abort', abort)
+          resolveRun({ code, timedOut: code === 124 || code === 137 || code === null, stdout, stderr, environment })
+        })
+      })
     } finally {
       await fsp.rm(local, { recursive: true, force: true })
     }
   }
 
-  /** Stop only the sessions this executor created. */
+  /** Close the reused connections; stop only the sessions this executor created. */
   async close(): Promise<void> {
+    for (const session of this.used) {
+      await run('ssh', [...this.sshOptions(session), '-O', 'exit', `root@colab-${session}`], 10_000).catch(() => {})
+    }
     for (const session of this.created.splice(0)) {
-      await this.colab(['stop', '-s', session], 120_000).catch((error: unknown) => {
+      await run(this.cli, ['stop', '-s', session], 120_000).catch((error: unknown) => {
         this.logger?.warn?.(`[auto-research] colab stop ${session} failed: ${(error as Error).message}`)
       })
     }

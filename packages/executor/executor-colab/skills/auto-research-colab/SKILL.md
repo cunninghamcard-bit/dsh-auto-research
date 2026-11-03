@@ -9,13 +9,12 @@ With `"options": { "executor": "colab" }` in the plan, every candidate commit is
 
 How a request runs:
 
-1. The candidate commit is exported from LayerFS as a tarball and uploaded to the session.
-2. On the Colab VM it is extracted into its own directory, with the evaluator at `.auto-research/<name>`.
-3. The evaluator runs as a new process group from that directory, and is killed at `evaluation_seconds`.
-4. The directory is removed. One request runs at a time per session; others wait in the executor's queue.
+1. The candidate commit is exported from LayerFS as a tarball and streamed over ssh (through `colab ssh --proxy-mode`) into its own directory on the Colab VM, with the evaluator at `.auto-research/<name>`.
+2. The command runs from that directory under `timeout`, killed at `evaluation_seconds`.
+3. The directory is removed. One request runs at a time per session; others wait in the executor's queue. The ssh connection stays open and is reused.
 
 Write the evaluator for the Colab VM: it runs with the VM's `python3`, its CUDA and the packages installed there. Install what it needs inside the evaluator or once in the session beforehand.
 
 Sessions cost compute units. The executor uses only the sessions named in its configuration unless `createSessions` is set; ask the user before a batch that would create or keep sessions running.
 
-A score measured on one GPU is not comparable with one from another: the batch frontier is keyed by evaluator and executor, so after switching executor the last leader is evaluated again as the new baseline.
+A score measured on one GPU is not comparable with one from another. Every batch scores its starting leader again on its own executor, so switching executor needs nothing else.

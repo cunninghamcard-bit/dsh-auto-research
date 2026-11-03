@@ -1,13 +1,12 @@
 /**
  * `dsh-auto-research-executor-colab`: run a command on a commit on a Google
- * Colab GPU through the signed-in Colab CLI.
+ * Colab GPU, over ssh through the signed-in Colab CLI's proxy.
  *
- * A Colab kernel runs one request at a time and shares its state, CUDA
- * context and `/content` across requests, so this executor keeps one queue
- * per session, gives each request its own directory and a fresh process
- * group, kills that group at the timeout, and restarts the kernel when the
- * CLI itself gave up waiting. Sessions cost compute units: by default only
- * sessions named in the configuration are used.
+ * Each request streams the commit as a tarball into a fresh directory on the
+ * VM, runs the command there under `timeout`, and removes the directory. One
+ * ssh connection per session is kept open and reused. Requests on one
+ * session run one at a time, so runs do not share the GPU. Sessions cost
+ * compute units: by default only sessions named in the configuration are used.
  */
 import type { ExecutionRequest, ExecutionResult, ExecutorBackend, ExecutorBackendFactory, Logger, PluginContext } from 'dsh-auto-research-api';
 export declare const name = "dsh-auto-research-executor-colab";
@@ -33,15 +32,18 @@ export declare class ColabExecutor implements ExecutorBackend {
     private readonly queues;
     private readonly pending;
     private readonly created;
+    private readonly used;
+    private key;
     constructor(config: ColabConfig, logger?: Logger | null);
-    private colab;
+    private sshOptions;
+    private ensureKey;
     /** Sessions to use; creates them on first use when allowed. */
     private sessions;
     /** The session with the fewest queued requests. */
     private pick;
     run(request: ExecutionRequest): Promise<ExecutionResult>;
     private runOn;
-    /** Stop only the sessions this executor created. */
+    /** Close the reused connections; stop only the sessions this executor created. */
     close(): Promise<void>;
 }
 export declare class ColabExecutorFactory implements ExecutorBackendFactory {
