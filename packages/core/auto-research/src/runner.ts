@@ -17,7 +17,6 @@ import type {
   Logger,
   WorkspaceBackend,
 } from 'dsh-auto-research-api'
-import { scoreValue } from './plan.js'
 import type { WorkerRunHandler, WorkerRuns } from './research-run.js'
 import { sampleMetricViews, validatePortfolio } from './protocols.js'
 import { branchFile, buildContinueMessage, buildWorkerPrompt } from './skills.js'
@@ -25,7 +24,6 @@ import type {
   BatchResult,
   ContentBlock,
   EvaluationResult,
-  Frontier,
   Latest,
   MetricDiagnostic,
   MetricView,
@@ -50,21 +48,18 @@ export class ResearchStoppedError extends Error {
 /** How long a worker may take to settle after it is interrupted. */
 const WORKER_GRACE_MS = 30_000
 
-/** Workers of running batches, for the skill catalog and the recursion guard. */
+/** Working folders of running workers, for the skill catalog. */
 export class ActiveWorkers {
   readonly cwds = new Set<string>()
-  readonly sessions = new Set<string>()
   onChange: () => void = () => {}
 
-  add(cwd: string, session: string | null): void {
+  add(cwd: string): void {
     this.cwds.add(cwd)
-    if (session) this.sessions.add(session)
     this.onChange()
   }
 
-  remove(cwd: string, session: string | null): void {
+  remove(cwd: string): void {
     this.cwds.delete(cwd)
-    if (session) this.sessions.delete(session)
     this.onChange()
   }
 
@@ -86,7 +81,6 @@ export interface RunnerDeps {
   workspace: WorkspaceBackend
   executor: ExecutorBackend
   evaluatorText: string
-  evaluatorSha256: string
   subagents: SubagentsService
   /** The coordinator agent: parent of every worker. */
   parent: unknown
@@ -205,38 +199,29 @@ export class Runner {
   }
 
   /**
-   * The batch's starting state: the previous batch's leader when its frontier
-   * was scored by the same evaluator on the same executor, else a fresh
-   * branch at `plan.base`, which must evaluate as valid.
+   * The batch's starting state, scored now by this batch's evaluator and
+   * executor: the previous batch's leader, else a fresh branch at `plan.base`.
    */
   private async baseline(): Promise<TrajectoryRow> {
     const latest = this.deps.latest
-    const frontier = latest?.frontier
-    if (latest && frontier?.evaluator_sha256 === this.deps.evaluatorSha256 && frontier.executor === this.deps.executor.name) {
-      this.anchor = frontier.anchor_score
-      this.stalledWorkSeconds = frontier.stalled_work_seconds
-      this.rows.push(latest.leader)
-      return latest.leader
-    }
-    const ref = await this.deps.workspace.fork(latest?.leader.ref ?? this.plan.base, this.branchName('initial'))
     const folder = join(this.deps.output, 'initial')
-    await fsp.mkdir(folder, { recursive: true })
-    const initial: TrajectoryRow = {
-      id: 'initial',
-      parent: null,
-      ref,
-      session: null,
-      scratch: null,
-      completed: true,
-      evaluation: await this.evaluate(ref, folder),
-      time: Date.now(),
-    }
-    this.rows.push(initial)
-    if (!initial.evaluation.valid) {
-      throw new Error(`The starting commit failed evaluation; no worker started: ${initial.evaluation.reason ?? 'unknown reason'}`)
-    }
-    this.anchor = initial.evaluation.score ?? null
-    return initial
+    const start: TrajectoryRow = latest
+      ? latest.leader
+      : {
+          id: 'initial',
+          parent: null,
+          ref: await this.deps.workspace.fork(this.plan.base, this.branchName('initial')),
+          session: null,
+          scratch: null,
+          completed: true,
+          evaluation: { valid: false },
+          time: Date.now(),
+        }
+    const row = { ...start, evaluation: await this.evaluate(start.ref, folder) }
+    this.stalledWorkSeconds = latest?.stalled_work_seconds ?? 0
+    this.anchor = row.evaluation.score ?? null
+    this.rows.push(row)
+    return row
   }
 
   /** Fork the leader's commit into `branches` fresh branches, one new worker each. */
@@ -383,7 +368,7 @@ export class Runner {
   }): Promise<TrajectoryRow> {
     const { activation } = turn
     this.live.add(activation)
-    this.deps.workers.add(turn.scratch, activation.childId)
+    this.deps.workers.add(turn.scratch)
     let timedOut = false
     let result: SubagentResult
     try {
@@ -391,7 +376,7 @@ export class Runner {
     } finally {
       turn.unregister()
       this.live.delete(activation)
-      this.deps.workers.remove(turn.scratch, activation.childId)
+      this.deps.workers.remove(turn.scratch)
     }
     this.checkStopped()
     const head = await this.deps.workspace.head(turn.ref.branch)
@@ -486,8 +471,7 @@ export class Runner {
           throw new Error(`Write ${file} before running experiments (${problem}). It must be a JSON array of exactly ${this.plan.portfolio_size} objects, each with non-empty strings bottleneck, mechanism, expected_effect, lineage and a number verbalized_probability in [0, 1]; the bottleneck/mechanism/expected_effect triples must be distinct. Without it the branch is rejected.`)
         })
       }
-      const left = Math.floor((deadline - Date.now()) / 1000)
-      if (left < 5) throw new Error('the turn has no time left for another run')
+      const left = Math.max(1, Math.floor((deadline - Date.now()) / 1000))
       const ref = await this.deps.workspace.head(branch)
       const started = Date.now()
       const result = await this.deps.executor.run({
@@ -536,20 +520,11 @@ export class Runner {
   }
 
   private parseEvaluation(value: unknown): EvaluationResult {
-    if (value === null || typeof value !== 'object') throw new Error('the last line is not a JSON object')
-    const output = value as Record<string, unknown>
-    if (output.valid !== true) {
-      return { valid: false, reason: typeof output.reason === 'string' ? output.reason.slice(0, 500) : 'the evaluator rejected the candidate' }
-    }
-    const score = scoreValue(output.score)
-    const metrics = (output.metrics ?? {}) as Record<string, number | string>
-    if (typeof metrics !== 'object' || Array.isArray(metrics)) throw new Error('metrics must be an object')
-    for (const spec of this.plan.metrics) {
-      if (spec.optional === true && !Object.hasOwn(metrics, spec.name)) continue
-      scoreValue(metrics[spec.name], `metric ${spec.name}`)
-    }
-    for (const spec of this.plan.selection_metrics) scoreValue(metrics[spec.name], `selection metric ${spec.name}`)
-    return { valid: true, score, metrics }
+    const output = value as { valid?: unknown; reason?: unknown; score?: unknown; metrics?: Record<string, number | string> }
+    if (output.valid !== true) return { valid: false, reason: String(output.reason ?? 'the evaluator rejected the candidate').slice(0, 500) }
+    const score = Number(output.score)
+    if (!Number.isFinite(score)) return { valid: false, reason: `score is not a number: ${String(output.score)}` }
+    return { valid: true, score, metrics: output.metrics ?? {} }
   }
 
   /** The best valid state among the incumbent and the candidates. */
@@ -559,7 +534,7 @@ export class Runner {
       let primary = row.evaluation.score as number
       if (this.plan.direction === 'minimize') primary = -primary
       const progress = this.plan.selection_metrics.map(spec => {
-        const value = scoreValue(row.evaluation.metrics?.[spec.name])
+        const value = Number(row.evaluation.metrics?.[spec.name] ?? 0)
         return spec.direction === 'maximize' ? value : -value
       })
       return [primary, ...progress, row.id === 'initial' ? 0 : 1, row.time]
@@ -609,15 +584,6 @@ export class Runner {
     })
   }
 
-  private frontier(): Frontier {
-    return {
-      evaluator_sha256: this.deps.evaluatorSha256,
-      executor: this.deps.executor.name,
-      anchor_score: this.anchor,
-      stalled_work_seconds: this.stalledWorkSeconds,
-    }
-  }
-
   private async writeState(leader: TrajectoryRow): Promise<void> {
     await writeJson(join(this.deps.output, 'DASHBOARD.json'), {
       metrics: this.plan.metrics,
@@ -626,7 +592,7 @@ export class Runner {
       trajectories: this.rows,
     })
     await writeJson(join(this.deps.output, 'LEADER.json'), leader)
-    const latest: Latest = { leader, frontier: this.frontier(), run: this.deps.output, updated_at: new Date().toISOString() }
+    const latest: Latest = { leader, stalled_work_seconds: this.stalledWorkSeconds, run: this.deps.output, updated_at: new Date().toISOString() }
     await writeJson(this.deps.latestFile, latest)
   }
 
@@ -637,7 +603,6 @@ export class Runner {
       stop_reason: 'configured_batch_complete',
       leader,
       result_file: join(this.deps.output, 'RESULT.json'),
-      evaluator_sha256: this.deps.evaluatorSha256,
       trajectories: this.rows.length,
     }
     await writeJson(result.result_file, result)

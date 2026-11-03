@@ -49,7 +49,7 @@ The values are schema examples, not defaults. Choose each from task evidence.
 - With `rsiTop`: `stall_seconds`, `metric_subset`, `portfolio_size` (≥ 2) and a positive `meaningful_gain` are required.
 - `options` overrides the installed configuration for this batch: `rounds`, `branches` (≥ 2), `explorationMinutes`, `exploitationMinutes`, `rsiTop`, `forkAndFlush`, `executor`, `workerModel`.
 
-The plan is fixed for the batch. Revise metrics or the evaluator between batches, never mid-batch. Each batch continues from the last leader in `LATEST.json`; after the evaluator or the executor changed, that leader is evaluated again as the new baseline, and scores from the old evaluator are not compared with new ones.
+The plan is fixed for the batch. Revise metrics or the evaluator between batches, never mid-batch. Each batch continues from the last leader in `LATEST.json` and first scores it again with the batch's evaluator and executor.
 
 ## Evaluator contract
 

@@ -20,7 +20,7 @@ This repository is a pnpm workspace. Each package is one Cordis plugin:
 | `dsh-auto-research-api` | `packages/core/api` | Types only: `BranchRef`, `WorkspaceBackend`, `ExecutorBackend`, factories. Implementation packages depend on it alone. |
 | `dsh-auto-research-workspace-layerfs` | `packages/workspace/workspace-layerfs` | Branches of the conversation's LayerFS project. Forks branches, reads branch heads, runs a command on a commit in its own Sandbox, and exports a commit as a tarball. |
 | `dsh-auto-research-executor-local` | `packages/executor/executor-local` | Runs commands in the workspace's LayerFS Sandbox (CPU). Priority 0. |
-| `dsh-auto-research-executor-colab` | `packages/executor/executor-colab` | Runs commands on a Google Colab GPU through the signed-in Colab CLI. Priority 100 when configured. |
+| `dsh-auto-research-executor-colab` | `packages/executor/executor-colab` | Runs commands on a Google Colab GPU over ssh through the signed-in Colab CLI's proxy. Priority 100 when configured. |
 
 ```bash
 pnpm install
@@ -81,11 +81,11 @@ A plan overrides any of these in `options`.
 }
 ```
 
-`base` is the LayerFS ref the first batch starts from. Later batches start from the leader in `LATEST.json`. When the evaluator or the executor changed, that leader is evaluated again as the new baseline and the stall clock restarts; scores from different evaluators or GPUs are never compared.
+`base` is the LayerFS ref the first batch starts from. Later batches start from the leader in `LATEST.json`. Every batch first scores its starting commit again with its own evaluator and executor, so a changed evaluator or GPU needs no special handling.
 
 ## Evaluator contract
 
-The evaluator is a file on the host. The runner reads it once per batch and records its SHA-256. For each candidate commit, the executor:
+The evaluator is a file on the host. The runner reads it once per batch. For each candidate commit, the executor:
 
 1. places the evaluator at `.auto-research/<name>` in a fresh copy of the commit;
 2. runs `<interpreter> .auto-research/<name> .` from the branch root;
@@ -103,7 +103,7 @@ Workers cannot change the evaluator. It lives outside every branch, and each wor
 AutoResearchProvider.start
  ① validate the plan, read the evaluator, pick the worker provider and model
  ② workspace = researchWorkspace.select(), executor = researchExecutor.select()
- ③ baseline: the LATEST.json leader as is (same evaluator and executor), else a fork of that leader (or of plan.base) evaluated again
+ ③ baseline: score the LATEST.json leader (or a fork of plan.base) again with this batch's evaluator and executor
  ④ each round
     ├ explore: fork the leader's commit into `branches` branches; startActivation(spawn, cwd = a scratch folder)
     │          interrupt at the deadline; evaluate each branch head; choose
@@ -125,7 +125,7 @@ Under `.auto-research-methods/runs/<run>/`:
 - `LEADER.json`, `RESULT.json`
 - Per branch: `RESULT.json` (branch, commit, session, evaluation), `worker-output.md`, `evaluation.log`, `scratch/`.
 
-`.auto-research-methods/LATEST.json` holds the leader and the frontier for the next batch. Nothing is merged or published.
+`.auto-research-methods/LATEST.json` holds the leader and the RSI-top stall clock for the next batch. Nothing is merged or published.
 
 ## Limitations
 

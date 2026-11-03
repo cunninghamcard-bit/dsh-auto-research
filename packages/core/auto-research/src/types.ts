@@ -150,22 +150,14 @@ export interface BatchResult {
   stop_reason: string
   leader: TrajectoryRow
   result_file: string
-  evaluator_sha256: string
   trajectories: number
-}
-
-/** Stall state carried across batches in `LATEST.json`. */
-export interface Frontier {
-  evaluator_sha256: string
-  executor: string
-  anchor_score: number | null
-  stalled_work_seconds: number
 }
 
 /** `LATEST.json`: where the next batch starts. */
 export interface Latest {
   leader: TrajectoryRow
-  frontier: Frontier
+  /** RSI-top stall clock carried to the next batch. */
+  stalled_work_seconds: number
   run: string
   updated_at: string
 }

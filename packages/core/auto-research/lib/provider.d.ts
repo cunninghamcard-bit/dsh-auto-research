@@ -2,7 +2,7 @@
  * The `auto-research` SubagentProvider: one activation runs one batch.
  *
  * Setup failures reject `start()`; after the run is returned, every outcome
- * settles through `result`, never a rejection.
+ * settles through `result`.
  */
 import type { Config } from './plan.js';
 import type { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js';
@@ -32,13 +32,6 @@ export declare class AutoResearchProvider implements SubagentProvider {
     readonly workers: ActiveWorkers;
     readonly runs: WorkerRuns;
     constructor(ctx: ProviderContext, config: ProviderConfig, workspaces: ResearchWorkspaceRegistry, executors: ResearchExecutorRegistry);
-    /**
-     * The worker provider: one whose children can be continued (an in-process
-     * dsh agent), so the continue phase resumes the leader's own session.
-     */
-    workerProviderName(requested?: string): string;
-    /** Resolve a worker model by id or display name against the live `ctx.llm` catalog. */
-    private resolveModel;
     start(request: SubagentStartRequest): Promise<SubagentRun>;
 }
 //# sourceMappingURL=provider.d.ts.map

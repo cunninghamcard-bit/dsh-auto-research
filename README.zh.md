@@ -20,7 +20,7 @@
 | `dsh-auto-research-api` | `packages/core/api` | 只有类型：`BranchRef`、`WorkspaceBackend`、`ExecutorBackend` 和工厂接口；实现包只依赖它 |
 | `dsh-auto-research-workspace-layerfs` | `packages/workspace/workspace-layerfs` | 对话所绑定 LayerFS 项目的分支：fork 分支、读取分支 head、在自己的 Sandbox 里对某个提交执行命令、把提交导出为 tarball |
 | `dsh-auto-research-executor-local` | `packages/executor/executor-local` | 在 workspace 的 LayerFS Sandbox 里执行命令（CPU），优先级 0 |
-| `dsh-auto-research-executor-colab` | `packages/executor/executor-colab` | 通过已登录的 Colab CLI 在 Google Colab GPU 上执行命令，配置后优先级 100 |
+| `dsh-auto-research-executor-colab` | `packages/executor/executor-colab` | 经已登录 Colab CLI 的 ssh 代理在 Google Colab GPU 上执行命令，配置后优先级 100 |
 
 ```bash
 pnpm install
@@ -85,11 +85,11 @@ plan 的 `options` 可以覆盖以上任何一项。
 
 - `base` 是第一个批次的起点，填一个 LayerFS ref。
 - 之后的批次从 `LATEST.json` 记录的 leader 继续。
-- 评估器或执行器任一变化时，先用新的评估器对这个 leader 重新打分，作为新的基线，停滞计时清零。不同评估器或不同 GPU 上的分数之间不做比较。
+- 每个批次开始时都用本批的评估器和执行器重新给起点打分，所以换评估器或换 GPU 不需要特殊处理。
 
 ## 评估器约定
 
-评估器是宿主机上的一个文件。runner 每个批次读取一次，并记录它的 SHA-256。对每个候选提交，执行器：
+评估器是宿主机上的一个文件。runner 每个批次读取一次。对每个候选提交，执行器：
 
 1. 取该提交的一份新副本，把评估器放到 `.auto-research/<name>`；
 2. 在分支根目录执行 `<interpreter> .auto-research/<name> .`；
@@ -107,7 +107,7 @@ worker 改不到评估器：评估器在所有分支之外，每个 worker 只�
 AutoResearchProvider.start
  ① 校验 plan，读取评估器，确定 worker provider 和模型
  ② workspace = researchWorkspace.select()，executor = researchExecutor.select()
- ③ 基线：评估器和执行器都相同时直接沿用 LATEST.json 中的 leader；否则 fork 这个 leader（没有时 fork plan.base）并重新评估
+ ③ 基线：用本批的评估器和执行器重新评估 LATEST.json 中的 leader（没有时 fork plan.base）
  ④ 每一轮
     ├ explore：从 leader 的提交 fork 出 branches 个分支；startActivation(spawn, cwd = 草稿目录)
     │          到时 interrupt；评估各分支 head；选择
@@ -134,7 +134,7 @@ AutoResearchProvider.start
   - `worker-output.md`、`evaluation.log`；
   - `scratch/`。
 
-`.auto-research-methods/LATEST.json` 记录 leader 和前沿，供下一个批次使用。插件不会合并或发布任何内容。
+`.auto-research-methods/LATEST.json` 记录 leader 和 RSI-top 的停滞计时，供下一个批次使用。插件不会合并或发布任何内容。
 
 ## 限制
 

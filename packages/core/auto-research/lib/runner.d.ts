@@ -14,13 +14,12 @@ import type { BatchResult, EvaluationResult, Latest, MetricDiagnostic, ResearchO
 export declare class ResearchStoppedError extends Error {
     constructor(message?: string);
 }
-/** Workers of running batches, for the skill catalog and the recursion guard. */
+/** Working folders of running workers, for the skill catalog. */
 export declare class ActiveWorkers {
     readonly cwds: Set<string>;
-    readonly sessions: Set<string>;
     onChange: () => void;
-    add(cwd: string, session: string | null): void;
-    remove(cwd: string, session: string | null): void;
+    add(cwd: string): void;
+    remove(cwd: string): void;
     ownsCwd(cwd: string): boolean;
 }
 export interface RunnerDeps {
@@ -35,7 +34,6 @@ export interface RunnerDeps {
     workspace: WorkspaceBackend;
     executor: ExecutorBackend;
     evaluatorText: string;
-    evaluatorSha256: string;
     subagents: SubagentsService;
     /** The coordinator agent: parent of every worker. */
     parent: unknown;
@@ -68,9 +66,8 @@ export declare class Runner {
     branchName(id: string): string;
     run(): Promise<BatchResult>;
     /**
-     * The batch's starting state: the previous batch's leader when its frontier
-     * was scored by the same evaluator on the same executor, else a fresh
-     * branch at `plan.base`, which must evaluate as valid.
+     * The batch's starting state, scored now by this batch's evaluator and
+     * executor: the previous batch's leader, else a fresh branch at `plan.base`.
      */
     private baseline;
     /** Fork the leader's commit into `branches` fresh branches, one new worker each. */
@@ -115,7 +112,6 @@ export declare class Runner {
     private recordProgress;
     metricDiagnostics(): MetricDiagnostic[];
     private views;
-    private frontier;
     private writeState;
     private finish;
 }
