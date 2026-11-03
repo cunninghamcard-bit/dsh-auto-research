@@ -5,7 +5,7 @@
 #   project) and the `sandbox` executor;
 # - the coordinator and worker skills (prompts only);
 # - the `subagent_auto_research` tool, one batch per call. Provider-managed
-#   depth keeps it visible to the coordinator.
+#   depth keeps it visible to the coordinator; the core removes it from workers.
 # Insert `dsh-auto-research-executor-colab` with its sessions for a Colab GPU.
 - insert:
     - id: subagent-auto-research

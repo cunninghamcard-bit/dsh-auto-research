@@ -121,6 +121,7 @@ AutoResearchProvider.start
 - 项目本身是 worker 的 LayerFS 分支，worker 用 `layerfs` 命令修改它。
 - worker 在自己的回合里想在评估硬件上试跑（例如在 Colab GPU 上测 kernel），先提交，再调用 `research_run` 工具（`{ command, timeout_seconds }`）。命令会在分支 head 上通过本批次的执行器运行，和评估排在同一个队列里。
 - `research_run` 注册时带 `when` 条件：只有本批次正在运行的 worker 会话能看到它，协调者和其他会话看不到。
+- worker 的 agent 创建时就拿掉了 `subagent_auto_research` 工具，worker 无法启动批次。
 - 每次调用都会记录到该分支目录的 `research-runs.jsonl`。
 
 ## 产物

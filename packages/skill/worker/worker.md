@@ -28,7 +28,6 @@ It runs the command with `bash -c` from the root of your branch's newest commit,
 - Change only your own branch. Never fork, merge into or publish to another branch or `main`.
 - Commit after every step that changes files, with a message naming the step and its result. Before your time runs out, make sure your best state is the branch head.
 - Unmount every Workspace before you end your turn.
-- Never call `subagent_auto_research` and never start other batches.
 - Do not modify the evaluator or weaken any check to make a candidate pass. Do not fabricate results or passing checks.
 - End your turn before `deadline_unix`. Do not start a command likely to overrun it. When the time is up the turn is interrupted; what you committed is still scored.
 - Keep `NOTES.md` in your current directory current: results, failed approaches with the reason, and the next step. A continued session reads it again.
