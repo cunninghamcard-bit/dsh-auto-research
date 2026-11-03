@@ -23,6 +23,18 @@ async function walkFiles(directory: string): Promise<string[]> {
   return files
 }
 
+describe('README install examples', () => {
+  it('reproduce cordis.patch.yml verbatim in both languages', async () => {
+    const patch = (await readFile(join(root, 'cordis.patch.yml'), 'utf8'))
+      .split('\n').filter(line => !line.startsWith('#')).join('\n').trim()
+    for (const [file, heading] of [['README.md', '## Install'], ['README.zh.md', '## 安装']] as const) {
+      const text = await readFile(join(root, file), 'utf8')
+      const start = text.indexOf('```yaml\n', text.indexOf(heading)) + '```yaml\n'.length
+      assert.equal(text.slice(start, text.indexOf('```', start)).trim(), patch, file)
+    }
+  })
+})
+
 describe('package metadata', () => {
   it('declares the compiled ESM bundle, icon, locale exports, and build scripts', async () => {
     const pkg = await json('package.json')
@@ -37,8 +49,12 @@ describe('package metadata', () => {
     assert.equal(pkg.scripts.test, 'npm run typecheck && npm run build && node --test tests/*.test.ts')
     assert.equal(pkg.dsh.bundle.patch, './cordis.patch.yml')
     assert.deepEqual(pkg.exports['.'], { types: './lib/index.d.ts', default: './lib/index.js' })
+    for (const entry of ['api', 'layerfs', 'snapshot', 'local']) {
+      assert.deepEqual(pkg.exports[`./${entry}`], { types: `./lib/${entry}.d.ts`, default: `./lib/${entry}.js` })
+    }
+    assert.deepEqual(pkg.exports['./colab'], { types: './lib/colab/index.d.ts', default: './lib/colab/index.js' })
     assert.equal(pkg.exports['./package.json'], './package.json')
-    assert.equal(pkg.exports['./src/*'], './src/*')
+    assert.equal(pkg.exports['./src/*'], undefined)
     assert.equal(pkg.exports['./lib/*'], './lib/*')
     assert.equal(pkg.exports['./cordis.patch.yml'], './cordis.patch.yml')
     assert.equal(pkg.exports['./locale/*.json'], './locale/*.json')
@@ -63,10 +79,15 @@ describe('package metadata', () => {
     assert.match(svg, /<title>Auto Research<\/title>/)
   })
 
-  it('declares both bundle rows in the Cordis patch', async () => {
+  it('declares the core, backend and tool rows in the Cordis patch', async () => {
     const patch = await readFile(join(root, 'cordis.patch.yml'), 'utf8')
     assert.match(patch, /id: subagent-auto-research/)
     assert.match(patch, /name: 'dsh-auto-research'/)
+    assert.match(patch, /name: 'dsh-auto-research\/layerfs'/)
+    assert.match(patch, /name: 'dsh-auto-research\/snapshot'/)
+    assert.match(patch, /name: 'dsh-auto-research\/local'/)
+    // Colab needs an endpoint; users insert its row themselves.
+    assert.doesNotMatch(patch, /name: 'dsh-auto-research\/colab'/)
     assert.match(patch, /id: tool-subagent-auto-research/)
     assert.match(patch, /name: '@deepseek-ai\/dsh-tool-subagent'/)
     assert.match(patch, /provider: auto-research/)
@@ -82,7 +103,18 @@ describe('package metadata', () => {
       'layerfs-workspace.ts',
       'evaluator.ts',
       'protocols.ts',
-      'policies.ts',
+      'skills.ts',
+      'registry.ts',
+      'api.ts',
+      'layerfs.ts',
+      'snapshot.ts',
+      'local.ts',
+      'colab/index.ts',
+      'colab/client.ts',
+      'colab/cli.ts',
+      'colab/server-script.ts',
+      'colab/benchmarks.ts',
+      'colab/types.ts',
       'types.ts',
     ]
     for (const name of sources) {
@@ -108,7 +140,7 @@ describe('package metadata', () => {
     assert.equal(tsconfig.compilerOptions.rootDir, 'src')
     assert.equal(tsconfig.compilerOptions.outDir, 'lib')
     assert.match(tsconfig.compilerOptions.target, /^es2024$/i)
-    for (const test of ['protocols', 'evaluator', 'workspace', 'runner', 'provider', 'policies', 'package']) {
+    for (const test of ['protocols', 'evaluator', 'workspace', 'runner', 'provider', 'skills', 'registry', 'colab', 'package']) {
       assert.equal((await stat(join(root, `tests/${test}.test.ts`))).isFile(), true, test)
     }
     const testFiles = await readdir(join(root, 'tests'))
@@ -201,24 +233,12 @@ describe('package metadata', () => {
   })
 })
 
-describe('source policies', () => {
-  it('contains the ported policies verbatim and the dsh addendum', async () => {
-    const {
-      RESEARCH_POLICY,
-      RESEARCH_METHODS_POLICY,
-      CONTINUE_POLICY,
-      SHARED_CONTEXT_POLICY,
-      DSH_COORDINATOR_ADDENDUM,
-    } = await import('../lib/policies.js')
-    assert.match(RESEARCH_POLICY, /^You are the research agent inside Auto Research/)
-    assert.match(RESEARCH_POLICY, /RESEARCH_STATUS: needs_input/)
-    assert.match(RESEARCH_METHODS_POLICY, /^# Optional research methods/)
-    assert.match(RESEARCH_METHODS_POLICY, /## Collaborative evidence sharing/)
-    assert.match(CONTINUE_POLICY, /^Continue the research from this session's evidence/)
-    assert.match(CONTINUE_POLICY, /phase_budget_reached/)
-    assert.match(SHARED_CONTEXT_POLICY, /compact checkpoints verbatim/)
-    assert.match(SHARED_CONTEXT_POLICY, /Do not invent a successful result/)
-    assert.match(DSH_COORDINATOR_ADDENDUM, /subagent_auto_research/)
-    assert.match(DSH_COORDINATOR_ADDENDUM, /\.auto-research-methods\/plan\.json/)
+describe('packaged skills', () => {
+  it('ships both SKILL.md files in the published package', async () => {
+    const pkg = await json('package.json')
+    assert.ok(pkg.files.includes('skills'))
+    for (const name of ['auto-research', 'auto-research-worker', 'auto-research-colab']) {
+      assert.equal((await stat(join(root, 'skills', name, 'SKILL.md'))).isFile(), true, name)
+    }
   })
 })

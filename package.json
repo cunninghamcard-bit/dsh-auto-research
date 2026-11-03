@@ -11,8 +11,27 @@
       "types": "./lib/index.d.ts",
       "default": "./lib/index.js"
     },
+    "./api": {
+      "types": "./lib/api.d.ts",
+      "default": "./lib/api.js"
+    },
+    "./layerfs": {
+      "types": "./lib/layerfs.d.ts",
+      "default": "./lib/layerfs.js"
+    },
+    "./snapshot": {
+      "types": "./lib/snapshot.d.ts",
+      "default": "./lib/snapshot.js"
+    },
+    "./local": {
+      "types": "./lib/local.d.ts",
+      "default": "./lib/local.js"
+    },
+    "./colab": {
+      "types": "./lib/colab/index.d.ts",
+      "default": "./lib/colab/index.js"
+    },
     "./package.json": "./package.json",
-    "./src/*": "./src/*",
     "./lib/*": "./lib/*",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./locale/*.json": "./locale/*.json"
@@ -23,6 +42,7 @@
     "icon.svg",
     "cordis.patch.yml",
     "locale",
+    "skills",
     "README.md",
     "README.zh.md",
     "LICENSE",

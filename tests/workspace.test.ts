@@ -1,12 +1,12 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { chmod, lstat, mkdir, readFile, symlink, writeFile } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
+import { chmod, lstat, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   LayerFSBackend,
   SnapshotBackend,
   WorkspaceManager,
-  createWorkspaceManager,
   digestFile,
   freeBytes,
   inventory,
@@ -23,7 +23,7 @@ import {
   snapshot,
   writeJsonAtomic,
 } from '../lib/layerfs-workspace.js'
-import { withTemp, writeWorkspace } from './helpers.ts'
+import { withTemp, writeWorkspace, snapshotManager } from './helpers.ts'
 
 describe('inventory and snapshot', () => {
   it('hashes regular files and omits runtime, provider, env and shared-method state', async () => {
@@ -47,11 +47,68 @@ describe('inventory and snapshot', () => {
     })
   })
 
-  it('rejects symlinks and non-regular entries', async () => {
+  it('records symlinks by their text without following them', async () => {
     await withTemp(async root => {
       await writeWorkspace(root)
-      await symlink(join(root, 'notes.md'), join(root, 'link.md'))
-      await assert.rejects(inventory(root), /materializing symlinks/)
+      await mkdir(join(root, 'pkg'), { recursive: true })
+      await writeFile(join(root, 'pkg', 'cli.js'), 'run\n')
+      await mkdir(join(root, 'node_modules', '.bin'), { recursive: true })
+      await symlink('../../pkg/cli.js', join(root, 'node_modules', '.bin', 'cli'))
+      // A directory link (venv lib64 -> lib) is one entry, not a second tree.
+      await symlink('pkg', join(root, 'lib64'))
+      await symlink('/etc/hosts', join(root, '.env'))
+      const files = await inventory(root)
+      assert.equal(files['node_modules/.bin/cli'], 'symlink:../../pkg/cli.js')
+      assert.equal(files['lib64'], 'symlink:pkg')
+      assert.equal(files['lib64/cli.js'], undefined)
+      assert.equal(files['.env'], undefined, 'an env-looking link stays omitted')
+
+      const copy = join(root, '..', 'copy-' + Date.now())
+      try {
+        assert.deepEqual(await snapshot(root, copy), files)
+        assert.equal((await lstat(join(copy, 'node_modules', '.bin', 'cli'))).isSymbolicLink(), true)
+        assert.deepEqual(await inventory(copy), files)
+      } finally {
+        await rm(copy, { recursive: true, force: true })
+      }
+    })
+  })
+
+  it('rejects non-regular entries other than symlinks', async () => {
+    await withTemp(async root => {
+      await writeWorkspace(root)
+      const fifo = join(root, 'pipe')
+      execFileSync('mkfifo', [fifo])
+      await assert.rejects(inventory(root), /Non-regular workspace entry/)
+    })
+  })
+
+  it('keeps symlinks out of checkpoint objects and recreates them on restore', async () => {
+    await withTemp(async root => {
+      const workspace = join(root, 'workspace')
+      await writeWorkspace(workspace)
+      await mkdir(join(workspace, 'node_modules', '.bin'), { recursive: true })
+      await symlink('../pkg/cli.js', join(workspace, 'node_modules', '.bin', 'cli'))
+      const output = join(root, 'out')
+      const before = await inventory(workspace)
+      const checkpoint = await retainCompletedState(output, {
+        id: 'b1',
+        workspace,
+        evaluation: { valid: true, workspace_manifest_sha256: jsonDigest(before), evidence: {} },
+      } as any)
+      const saved = JSON.parse(await readFile(checkpoint, 'utf8'))
+      assert.deepEqual(saved.links, { 'node_modules/.bin/cli': '../pkg/cli.js' })
+      assert.equal(saved.files['node_modules/.bin/cli'], undefined)
+      const restored = await restoreCompletedState(output, checkpoint, { id: 'b1-epoch-2', workspace } as any)
+      assert.deepEqual(await inventory(restored.workspace), before)
+
+      // A checkpoint from before links were recorded restores without them.
+      delete saved.links
+      saved.row.evaluation.workspace_manifest_sha256 = jsonDigest(Object.fromEntries(
+        Object.entries(before).filter(([name]) => name !== 'node_modules/.bin/cli'),
+      ))
+      await writeFile(checkpoint, JSON.stringify(saved))
+      await restoreCompletedState(output, checkpoint, { id: 'b1-epoch-3', workspace } as any)
     })
   })
 
@@ -262,7 +319,7 @@ describe('LayerFS configuration', () => {
 
   it('falls back to the snapshot backend without a project', async () => {
     await withTemp(async root => {
-      const manager = await createWorkspaceManager({ output: join(root, 'out'), runId: 'r', env: {} })
+      const manager = snapshotManager({ output: join(root, 'out'), runId: 'r', env: {} })
       assert.equal(manager.kind, 'snapshot')
     })
   })
@@ -301,13 +358,17 @@ describe('selectPlanWorkspace', () => {
     })
   })
 
-  it('rejects absolute paths, traversal, runtime directories and symlinks', async () => {
+  it('rejects absolute paths, traversal, runtime directories and links that leave the checkout', async () => {
     await withTemp(async root => {
-      await mkdir(join(root, 'real'), { recursive: true })
-      await symlink(join(root, 'real'), join(root, 'link'))
-      for (const workspace of ['/absolute', '../up', '.auto-research-methods', 'a/../b', 'link', '.']) {
-        await assert.rejects(selectPlanWorkspace(root, { workspace }), /Plan workspace|symlink/)
+      const checkout = join(root, 'checkout')
+      await mkdir(join(checkout, 'real'), { recursive: true })
+      await mkdir(join(root, 'outside'), { recursive: true })
+      await symlink(join(checkout, 'real'), join(checkout, 'link'))
+      await symlink(join(root, 'outside'), join(checkout, 'away'))
+      for (const workspace of ['/absolute', '../up', '.auto-research-methods', 'a/../b', 'away', '.']) {
+        await assert.rejects(selectPlanWorkspace(checkout, { workspace }), /Plan workspace/)
       }
+      assert.equal(await selectPlanWorkspace(checkout, { workspace: 'link' }), await realpath(join(checkout, 'real')))
     })
   })
 })

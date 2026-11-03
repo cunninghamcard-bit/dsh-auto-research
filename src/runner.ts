@@ -16,7 +16,6 @@ import {
   digestFile,
   freeBytes,
   inventory,
-  inventoryBytes,
   jsonDigest,
   publicRow,
   writeJsonAtomic,
@@ -32,7 +31,7 @@ import {
   validatePortfolio,
   writeSharedContextAtomic,
 } from './protocols.js'
-import { buildWorkerPrompt, workerPolicy } from './policies.js'
+import { buildWorkerPrompt, materializeWorkerFiles, removeWorkerFiles } from './skills.js'
 import type {
   BatchResult,
   Clock,
@@ -87,6 +86,28 @@ const DEFAULT_CLOCK: Clock = {
   }),
 }
 
+/**
+ * Stall state carried across batches in `LATEST.json`.
+ *
+ * The coordinator delegates one batch at a time, so a per-batch clock would
+ * never reach `stall_seconds` with `rounds: 1`. Only phase work time counts;
+ * the time between batches does not.
+ */
+export interface Frontier {
+  evaluator_sha256: string | null
+  anchor_score: string | null
+  stalled_work_seconds: number
+}
+
+/** One row of {@link Runner.states}. */
+export interface StateEntry {
+  id: string
+  parent: string | null
+  workspace: string
+  active: boolean
+  released: boolean
+}
+
 /** How long a worker activation may take to settle after its signal aborts. */
 const DEFAULT_WORKER_GRACE_MS = 2000
 
@@ -98,21 +119,17 @@ export function normalizeOptions(
   const overrides: PlanOptions = plan.options && typeof plan.options === 'object'
     ? plan.options as PlanOptions
     : {}
-  const topRounds = typeof plan.rounds === 'number' ? plan.rounds : undefined
-  const topBranches = typeof plan.branches === 'number'
-    ? plan.branches
-    : typeof plan.parallelism === 'number'
-      ? plan.parallelism
-      : undefined
   return {
-    rounds: overrides.rounds ?? topRounds ?? config.rounds ?? 1,
-    branches: overrides.branches ?? overrides.parallelism ?? topBranches ?? config.branches ?? config.parallelism ?? 4,
+    rounds: overrides.rounds ?? config.rounds ?? 1,
+    branches: overrides.branches ?? overrides.parallelism ?? config.branches ?? config.parallelism ?? 4,
     explorationMinutes: overrides.explorationMinutes ?? config.explorationMinutes ?? 30,
     exploitationMinutes: overrides.exploitationMinutes ?? config.exploitationMinutes ?? 30,
     rsiTop: overrides.rsiTop ?? config.rsiTop ?? false,
     forkAndFlush: overrides.forkAndFlush ?? config.forkAndFlush ?? false,
     shareContext: overrides.shareContext ?? config.shareContext ?? false,
     sharingIntervalMinutes: overrides.sharingIntervalMinutes ?? config.sharingIntervalMinutes ?? 10,
+    workspaceBackend: overrides.workspaceBackend ?? config.workspaceBackend ?? 'auto',
+    executor: overrides.executor ?? config.executor ?? 'auto',
   }
 }
 
@@ -120,59 +137,35 @@ function nonEmptyTrimmed(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
 }
 
-/** Merge config-level, plan-level, and request-level child LLM selection options. */
+/**
+ * Merge the child LLM selection: the request's `agentOptions`, then
+ * `plan.options`, then the plugin configuration. Within a layer,
+ * `workerAgentOptions` wins over the single `worker*` fields.
+ */
 export function resolveWorkerAgentOptions(
   config: Config = {},
   plan: ResearchPlanInput = {},
   override?: WorkerAgentOptions | null,
 ): WorkerAgentOptions | null {
-  const planOptions = plan.options && typeof plan.options === 'object'
-    ? plan.options as Record<string, unknown>
-    : {}
-  const cfgOpts = config.workerAgentOptions && typeof config.workerAgentOptions === 'object'
-    ? config.workerAgentOptions
-    : {}
-  const planOpts = (plan.worker_agent_options && typeof plan.worker_agent_options === 'object'
-    ? plan.worker_agent_options
-    : plan.workerAgentOptions && typeof plan.workerAgentOptions === 'object'
-      ? plan.workerAgentOptions
-      : planOptions.workerAgentOptions && typeof planOptions.workerAgentOptions === 'object'
-        ? planOptions.workerAgentOptions
-        : {}) as Record<string, unknown>
-  const reqOpts = override && typeof override === 'object' ? override : {}
-
-  const provider = nonEmptyTrimmed(reqOpts.provider)
-    ?? nonEmptyTrimmed(planOpts.provider)
-    ?? nonEmptyTrimmed(plan.worker_llm_provider)
-    ?? nonEmptyTrimmed(plan.workerLlmProvider)
-    ?? nonEmptyTrimmed(planOptions.workerLlmProvider)
-    ?? nonEmptyTrimmed(cfgOpts.provider)
-    ?? nonEmptyTrimmed(config.workerLlmProvider)
-
-  const model = nonEmptyTrimmed(reqOpts.model)
-    ?? nonEmptyTrimmed(planOpts.model)
-    ?? nonEmptyTrimmed(plan.worker_model)
-    ?? nonEmptyTrimmed(plan.workerModel)
-    ?? nonEmptyTrimmed(planOptions.workerModel)
-    ?? nonEmptyTrimmed(cfgOpts.model)
-    ?? nonEmptyTrimmed(config.workerModel)
-
-  const reasoningEffort = nonEmptyTrimmed(reqOpts.reasoningEffort)
-    ?? nonEmptyTrimmed(planOpts.reasoningEffort)
-    ?? nonEmptyTrimmed(plan.worker_reasoning_effort)
-    ?? nonEmptyTrimmed(plan.workerReasoningEffort)
-    ?? nonEmptyTrimmed(planOptions.workerReasoningEffort)
-    ?? nonEmptyTrimmed(cfgOpts.reasoningEffort)
-    ?? nonEmptyTrimmed(config.workerReasoningEffort)
-
-  const maxTokens = typeof reqOpts.maxTokens === 'number' && Number.isFinite(reqOpts.maxTokens) && reqOpts.maxTokens > 0
-    ? reqOpts.maxTokens
-    : typeof planOpts.maxTokens === 'number' && Number.isFinite(planOpts.maxTokens) && planOpts.maxTokens > 0
-      ? planOpts.maxTokens
-      : typeof cfgOpts.maxTokens === 'number' && Number.isFinite(cfgOpts.maxTokens) && cfgOpts.maxTokens > 0
-        ? cfgOpts.maxTokens
-        : undefined
-
+  const options = (plan.options ?? {}) as PlanOptions
+  const fields = (source: Config | PlanOptions): Record<string, unknown> => ({
+    provider: source.workerLlmProvider,
+    model: source.workerModel,
+    reasoningEffort: source.workerReasoningEffort,
+  })
+  const layers: Array<Record<string, unknown>> = [
+    override ?? {},
+    options.workerAgentOptions ?? {},
+    fields(options),
+    config.workerAgentOptions ?? {},
+    fields(config),
+  ]
+  const pick = (key: 'provider' | 'model' | 'reasoningEffort'): string | undefined =>
+    layers.map(layer => nonEmptyTrimmed(layer[key])).find(value => value !== undefined)
+  const provider = pick('provider')
+  const model = pick('model')
+  const reasoningEffort = pick('reasoningEffort')
+  const maxTokens = layers.map(layer => layer.maxTokens).find(finitePositive)
   const merged: WorkerAgentOptions = {
     ...(provider !== undefined ? { provider } : {}),
     ...(model !== undefined ? { model } : {}),
@@ -283,35 +276,6 @@ export function validatePlan(plan: unknown, options: ResearchOptions): ResearchP
   return normalized
 }
 
-/** Port of `provider_outcome`: transport diagnostics are not turn failures. */
-export function providerOutcome(
-  events: unknown[] = [],
-  rc: number | null,
-  timedOut: boolean,
-): ProviderOutcome {
-  let terminal: string | null = null
-  let session: string | null = null
-  const diagnostics: unknown[] = []
-  for (const event of events) {
-    if (!event || typeof event !== 'object') continue
-    const record = event as Record<string, unknown>
-    const kind = record.type
-    if (kind === 'thread.started' && typeof record.thread_id === 'string') session = record.thread_id
-    if (typeof record.session_id === 'string') session = record.session_id
-    if (kind === 'turn.completed') terminal = 'completed'
-    else if (kind === 'turn.failed') terminal = 'failed'
-    else if (kind === 'result') {
-      terminal = record.subtype === 'success' && !record.is_error ? 'completed' : 'failed'
-    } else if (kind === 'error' || record.is_error) diagnostics.push(event)
-  }
-  return {
-    completed: terminal === 'completed' && rc === 0 && !timedOut,
-    provider_session: session,
-    terminal,
-    diagnostic_count: diagnostics.length,
-  }
-}
-
 function combineSignals(signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
   const active = signals.filter((signal): signal is AbortSignal => signal !== undefined)
   if (active.length === 0) return undefined
@@ -343,10 +307,8 @@ function mergeEnv(
   layerfsEnv: Record<string, unknown> = {},
 ): Record<string, string> {
   const result: Record<string, string> = {}
-  const secret = /(token|key|secret|password|credential)/i
   for (const [key, value] of Object.entries({ ...layerfsEnv, ...configured })) {
     if (value === undefined || value === null) continue
-    if (secret.test(key)) continue
     result[key] = String(value)
   }
   return result
@@ -409,16 +371,21 @@ export class Runner {
   readonly selections: Array<Record<string, unknown>> = []
   peerBundle: string | null = null
   readonly peerSlots: Record<string, PeerSlot> = {}
-  bestTime: number
+  /** Phase work seconds since the last meaningful gain, across batches. */
+  stalledWorkSeconds = 0
+  readonly savedFrontier: Frontier | null
   anchor: number | null = null
   cancelled = false
   readonly abort = new AbortController()
   timedOutRows: TrajectoryRow[] = []
   readonly abandoned: TrajectoryRow[] = []
-  readonly activeStates = new Map<WorkspaceState, { id: string; parent: string | null; workspace: string }>()
-  /** Every state a backend created, from the moment it was returned. */
-  readonly trackedStates = new Map<WorkspaceState, { id: string; parent: string | null; workspace: string }>()
-  readonly releasedStates = new Set<WorkspaceState>()
+  /**
+   * Every state a backend created or this batch adopted, from the moment it
+   * was returned. `active` marks a branch whose worker is still running (or a
+   * stopped branch the result must still report); `released` is set once the
+   * backend confirmed the unmount.
+   */
+  readonly states = new Map<WorkspaceState, StateEntry>()
   readonly workerGraceMs: number
   private managerClosed = false
 
@@ -429,6 +396,7 @@ export class Runner {
     output,
     originalManifest = null,
     selectionFile = null,
+    frontier = null,
     deps,
   }: {
     config?: Config
@@ -437,6 +405,7 @@ export class Runner {
     output: string
     originalManifest?: Record<string, string> | null
     selectionFile?: string | null
+    frontier?: Frontier | null
     deps: RunnerDeps
   }) {
     this.config = config
@@ -448,17 +417,13 @@ export class Runner {
     this.manager = deps.workspaceManager
     if (!this.manager) throw new Error('Runner requires a workspace manager')
     this.subagents = deps.subagents
-    if (!this.subagents?.startActivation) throw new Error('Runner requires ctx.subagents.startActivation')
     this.clock = deps.clock ?? DEFAULT_CLOCK
     this.rng = deps.rng ?? Math.random
     this.logger = deps.logger ?? console
     this.workerProvider = deps.workerProvider
     if (!this.workerProvider) throw new Error('Runner requires a worker provider')
-    this.workerAgentOptions = resolveWorkerAgentOptions(
-      config,
-      plan as ResearchPlanInput,
-      deps.workerAgentOptions,
-    )
+    // The provider resolves worker model options once.
+    this.workerAgentOptions = deps.workerAgentOptions ?? null
     this.parent = deps.parent
     this.signal = deps.signal
     this.workerEnv = mergeEnv(deps.workerEnv ?? config.workerEnv ?? {}, deps.layerfsEnv ?? {})
@@ -466,10 +431,16 @@ export class Runner {
     this.parentSessionId = typeof deps.parentSessionId === 'string' && deps.parentSessionId.length > 0
       ? deps.parentSessionId
       : null
-    this.evaluator = (deps.evaluator ?? new FrozenEvaluator({ plan: this.plan, output, logger: this.logger ?? null })) as RunnerDeps['evaluator'] & { hash: string | null }
+    if (!deps.evaluator && !deps.executor) throw new Error('Runner needs an evaluator or an executor to build one')
+    this.evaluator = (deps.evaluator ?? new FrozenEvaluator({
+      plan: this.plan,
+      output,
+      executor: deps.executor!,
+      logger: this.logger ?? null,
+    })) as RunnerDeps['evaluator'] & { hash: string | null }
     this.originalManifest = originalManifest
     this.selectionFile = selectionFile
-    this.bestTime = this.clock.now()
+    this.savedFrontier = frontier
     this.runId = deps.runId ?? basename(output)
     const grace = Number(deps.workerGraceMs)
     this.workerGraceMs = Number.isFinite(grace) && grace > 0 ? grace : DEFAULT_WORKER_GRACE_MS
@@ -505,52 +476,25 @@ export class Runner {
 
   /** Whether the configured worker provider accepts `request.agentOptions`. */
   private workerProviderAcceptsAgentOptions(): boolean {
-    const service = this.subagents
-    const registry = service.providers
-    let entry: { capabilities?: Record<string, unknown> } | null | undefined = null
-    if (registry && typeof registry === 'object') {
-      entry = registry instanceof Map
-        ? registry.get(this.workerProvider)
-        : (registry as Record<string, { capabilities?: Record<string, unknown> }>)[this.workerProvider]
-    }
-    if (!entry) {
-      for (const method of ['getProvider', 'get', 'describe'] as const) {
-        const fn = service[method]
-        if (typeof fn === 'function') {
-          try {
-            const candidate = fn.call(service, this.workerProvider) as { capabilities?: Record<string, unknown> } | null | undefined
-            if (candidate && typeof candidate === 'object') {
-              entry = candidate
-              break
-            }
-          } catch {
-            // Try the next introspection method.
-          }
-        }
-      }
-    }
-    if (entry && entry.capabilities && entry.capabilities.agentOptions === false) {
-      return false
-    }
-    return true
+    return this.subagents.getProvider(this.workerProvider)?.capabilities.agentOptions === true
   }
 
   signalForWork(): AbortSignal {
     return combineSignals([this.abort.signal, this.signal]) ?? this.abort.signal
   }
 
-  /** Remember a created state so a failed sibling or cohort cannot leak it. */
-  private trackState(
-    state: WorkspaceState | null | undefined,
-    info: { id: string; parent?: string | null },
-  ): void {
-    if (!state) return
-    if (this.trackedStates.has(state)) return
-    this.trackedStates.set(state, {
-      id: info.id,
-      parent: info.parent ?? null,
-      workspace: state.path,
-    })
+  /** The table entry of `state`, created on first sight. */
+  private track(state: WorkspaceState, id: string, parent: string | null): StateEntry {
+    let entry = this.states.get(state)
+    if (!entry) {
+      entry = { id, parent, workspace: state.path, active: false, released: false }
+      this.states.set(state, entry)
+    }
+    return entry
+  }
+
+  private isReleased(state: WorkspaceState): boolean {
+    return this.states.get(state)?.released === true
   }
 
   /**
@@ -568,87 +512,71 @@ export class Runner {
 
   /** Clear the row handles that point at a state whose release succeeded. */
   private markReleased(state: WorkspaceState): void {
-    for (const row of this.rows) {
-      if (row._state !== state) continue
-      row._state = null
-      row._released = true
-    }
-    for (const row of this.abandoned) {
-      if (row._state !== state) continue
-      row._state = null
-      row._released = true
+    for (const row of [...this.rows, ...this.abandoned]) {
+      if (row._state === state) row._state = null
     }
   }
 
   /**
-   * Release one state. The handle is retained when the backend refuses, so a
-   * later `releaseAll()` can retry and `pendingWorkspaces()` still reports it.
+   * Commit `state` with `message`, then release it. A refused commit is
+   * logged and the release still runs; a refused release keeps the handle, so
+   * `releaseAll()` retries it and `pendingWorkspaces()` still reports it.
    */
-  private async releaseTracked(
+  private async commitAndRelease(
     state: WorkspaceState,
-    discard: boolean,
-    label: string,
+    id: string,
+    message: string,
     keepReported = false,
   ): Promise<boolean> {
     try {
-      await this.manager.release(state, { discard })
+      await this.manager.commit(state, { message })
     } catch (error) {
-      this.logger?.warn?.(`[auto-research] ${label} release failed: ${(error as Error).message}`)
+      this.logger?.warn?.(`[auto-research] commit of ${id} failed: ${(error as Error).message}`)
+    }
+    try {
+      await this.manager.release(state, { discard: false })
+    } catch (error) {
+      this.logger?.warn?.(`[auto-research] release of ${id} failed: ${(error as Error).message}`)
       return false
     }
-    this.releasedStates.add(state)
-    if (!keepReported) this.activeStates.delete(state)
+    const entry = this.track(state, id, null)
+    entry.released = true
+    if (!keepReported) entry.active = false
     this.markReleased(state)
     return true
   }
 
   /**
-   * Await a worker activation, but never past a short grace after its signal
-   * aborts. A provider that ignores abort gets disposed and the batch moves on.
+   * Await a worker activation, then dispose it. One `workerGraceMs` window,
+   * opened by the abort (or by the result when there was none), bounds both
+   * the result and the disposal: a provider that ignores abort is left behind.
    */
-  private async awaitActivationResult(
-    activation: SubagentRun,
-    signal: AbortSignal | undefined,
-    dispose: () => Promise<void>,
-  ): Promise<SubagentResult> {
-    if (!signal) return activation.result
-    if (signal.aborted) {
-      void dispose()
-      throw new ResearchStoppedError('Worker activation aborted before it started')
-    }
-    return new Promise<SubagentResult>((resolvePromise, rejectPromise) => {
-      let settled = false
-      let grace: NodeJS.Timeout | undefined
-      const finish = (callback: () => void): void => {
-        if (settled) return
-        settled = true
-        clearTimeout(grace)
-        signal.removeEventListener('abort', onAbort)
-        callback()
-      }
-      const onAbort = (): void => {
-        void dispose()
-        grace = setTimeout(() => {
-          finish(() => rejectPromise(new ResearchStoppedError('Worker activation ignored abort; bounded wait expired')))
-        }, this.workerGraceMs)
-      }
-      signal.addEventListener('abort', onAbort, { once: true })
-      activation.result.then(
-        value => finish(() => resolvePromise(value)),
-        (error: unknown) => finish(() => rejectPromise(error)),
-      )
+  private async awaitActivation(activation: SubagentRun, signal: AbortSignal | undefined): Promise<SubagentResult> {
+    let disposal: Promise<void> | undefined
+    const dispose = (): Promise<void> => disposal ??= Promise.resolve().then(() => activation.dispose()).catch((error: unknown) => {
+      this.logger?.warn?.(`[auto-research] worker dispose failed: ${(error as Error).message}`)
     })
-  }
-
-  /** Wait for a disposal, but do not let a stuck provider hold the batch. */
-  private async disposeWithin(disposal: Promise<void>): Promise<void> {
     let timer: NodeJS.Timeout | undefined
-    const grace = new Promise<void>(resolvePromise => {
-      timer = setTimeout(resolvePromise, this.workerGraceMs)
-    })
+    let expire: () => void = () => {}
+    const expired = new Promise<'expired'>(resolvePromise => { expire = () => resolvePromise('expired') })
+    const openGrace = (): void => { timer ??= setTimeout(expire, this.workerGraceMs) }
+    const onAbort = (): void => {
+      void dispose()
+      openGrace()
+    }
     try {
-      await Promise.race([disposal, grace])
+      if (signal?.aborted) {
+        onAbort()
+        throw new ResearchStoppedError('Worker activation aborted before it started')
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      const result = await Promise.race([activation.result, expired])
+      if (result === 'expired') throw new ResearchStoppedError('Worker activation ignored abort; bounded wait expired')
+      return result
     } finally {
+      signal?.removeEventListener('abort', onAbort)
+      openGrace()
+      await Promise.race([dispose(), expired])
       clearTimeout(timer)
     }
   }
@@ -680,12 +608,9 @@ export class Runner {
     }
   }
 
-  async checkDisk(workspace: string, count: number): Promise<void> {
-    // Both backends materialize a host copy per branch (the snapshot backend
-    // duplicates the tree, the LayerFS backend stages Sandbox mounts), so the
-    // free-space check applies to both.
-    const files = await inventory(workspace)
-    const required = (await inventoryBytes(workspace, files)) * count
+  async checkDisk(parent: WorkspaceState, count: number): Promise<void> {
+    const required = await this.manager.estimateForkBytes(parent, count)
+    if (required === 0) return
     const free = await freeBytes(this.output)
     if (required >= free) {
       throw new Error('Insufficient space for this cohort; existing research preserved')
@@ -744,57 +669,30 @@ export class Runner {
     return rows
   }
 
-  async run(): Promise<BatchResult> {
-    try {
-      return await this.runBatch()
-    } catch (error) {
-      if (this.intentionalStop()) {
-        await this.writeStoppedResult().catch(() => {})
-      }
-      throw error
-    }
-  }
-
-  /** Persist the honest cancellation artifact (idempotent). */
-  async writeStoppedResult(): Promise<Record<string, unknown>> {
-    const result = {
-      status: 'STOPPED',
-      stop_reason: 'stopped',
-      pending_workspaces: this.pendingWorkspaces(),
-      artifacts_preserved: true,
-    }
-    await writeJsonAtomic(join(this.output, 'RESULT.json'), result)
-    return result
+  run(): Promise<BatchResult> {
+    return this.runBatch()
   }
 
   /** Live branches that have not been committed/unmounted yet. */
   pendingWorkspaces(): Array<Record<string, unknown>> {
     const pending = new Map<string, Record<string, unknown>>()
     for (const row of [...this.rows, ...this.abandoned]) {
-      if (!row._state || row._released || row.id === 'initial') continue
+      if (!row._state || row.id === 'initial') continue
       pending.set(row.workspace, {
         id: row.id,
         workspace: row.workspace,
         branch: row._state.branch ?? null,
       })
     }
-    for (const [state, active] of this.activeStates) {
-      pending.set(active.workspace, {
-        id: active.id,
-        parent: active.parent,
-        workspace: active.workspace,
-        branch: state.branch ?? null,
-      })
-    }
-    // States created for a sibling that never produced a row (or whose row
-    // release failed) still hold a mount and must be reported.
-    for (const [state, info] of this.trackedStates) {
-      if (this.releasedStates.has(state) || info.id === 'initial') continue
-      if (pending.has(info.workspace)) continue
-      pending.set(info.workspace, {
-        id: info.id,
-        parent: info.parent,
-        workspace: info.workspace,
+    // A running (or stopped) branch, and a state created for a sibling that
+    // never produced a row (or whose row release failed), still hold a mount.
+    for (const [state, entry] of this.states) {
+      if (entry.id === 'initial') continue
+      if (!entry.active && (entry.released || pending.has(entry.workspace))) continue
+      pending.set(entry.workspace, {
+        id: entry.id,
+        parent: entry.parent,
+        workspace: entry.workspace,
         branch: state.branch ?? null,
       })
     }
@@ -813,7 +711,7 @@ export class Runner {
     const baseState = this.deps.initialState
       ? { ...this.deps.initialState, id: 'initial' }
       : await this.manager.baseline(this.workspace, 'initial')
-    this.trackState(baseState, { id: 'initial', parent: null })
+    this.track(baseState, 'initial', null)
     const baseManifest = await inventory(baseState.path)
     await writeJsonAtomic(join(initialFolder, 'INPUT-MANIFEST.json'), baseManifest)
     const initial: TrajectoryRow = {
@@ -832,29 +730,30 @@ export class Runner {
     this.rows.push(initial)
     if (initial.evaluation.valid !== true) {
       const reason = initial.evaluation.reason ?? 'unknown evaluation failure'
-      await writeJsonAtomic(join(this.output, 'RESULT.json'), {
-        status: 'FAILED',
-        error: 'Initial candidate failed frozen evaluation; no research workers started: ' + reason,
-        artifacts_preserved: true,
-      })
       throw new Error('Initial candidate failed frozen evaluation; no research workers started: ' + reason)
     }
     this.anchor = scoreValue(initial.evaluation.score)
-    this.bestTime = this.now()
+    // A frontier frozen against a different evaluator is not comparable.
+    const saved = this.savedFrontier
+    if (saved && saved.evaluator_sha256 === this.evaluator.hash && typeof saved.anchor_score === 'string') {
+      this.anchor = scoreValue(saved.anchor_score, 'frontier anchor_score')
+      this.stalledWorkSeconds = Number(saved.stalled_work_seconds) || 0
+    }
 
     let leader: TrajectoryRow = initial
     for (let roundNumber = 1; roundNumber <= options.rounds; roundNumber += 1) {
       this.checkCancelled()
-      const stalled = Boolean(options.rsiTop
-        && (this.plan.stall_seconds ?? Number.POSITIVE_INFINITY) > 0
-        && (this.now() - this.bestTime) / 1000 >= (this.plan.stall_seconds ?? Number.POSITIVE_INFINITY))
-      const explore = Boolean(options.forkAndFlush || (options.rsiTop && stalled))
+      const stalled = options.rsiTop
+        && this.plan.stall_seconds !== null
+        && this.stalledWorkSeconds >= this.plan.stall_seconds
+      const explore = options.forkAndFlush || stalled
       const phases: Phase[] = explore ? ['explore', 'continue'] : ['continue']
       for (const phase of phases) {
         this.checkCancelled()
+        const phaseStart = this.now()
         await writeJsonAtomic(join(this.output, 'DASHBOARD.json'), this.dashboard())
         const count = phase === 'explore' ? options.branches : 1
-        await this.checkDisk(leader.workspace, count)
+        await this.checkDisk(leader._state as WorkspaceState, count)
         const views = this.views(count)
         let candidates: TrajectoryRow[]
         if (options.shareContext) {
@@ -876,6 +775,7 @@ export class Runner {
         if (!candidates.some(candidate => candidate.completed)) {
           const budget = (candidates.length === 0 || candidates.every(candidate => candidate.timed_out))
           if (leader.evaluation?.valid === true && budget) {
+            this.stalledWorkSeconds += (this.now() - phaseStart) / 1000
             this.timedOutRows = candidates
             return this.finish(leader, 'phase_budget_reached', candidates)
           }
@@ -899,7 +799,9 @@ export class Runner {
         if (gain !== null && this.plan.direction === 'minimize') gain = -gain
         if (this.anchor === null || (gain !== null && gain > this.plan.meaningful_gain)) {
           this.anchor = current
-          this.bestTime = this.now()
+          this.stalledWorkSeconds = 0
+        } else {
+          this.stalledWorkSeconds += (this.now() - phaseStart) / 1000
         }
         await writeJsonAtomic(join(this.output, 'LEADER.json'), publicRow(leader))
         await this.writeSelection(leader)
@@ -917,6 +819,11 @@ export class Runner {
       original_manifest: this.originalManifest,
       run: this.output,
       updated_at: new Date().toISOString(),
+      frontier: {
+        evaluator_sha256: this.evaluator.hash,
+        anchor_score: this.anchor === null ? null : String(this.anchor),
+        stalled_work_seconds: this.stalledWorkSeconds,
+      } satisfies Frontier,
     })
   }
 
@@ -1031,8 +938,7 @@ export class Runner {
       })
       const incomplete = candidates.some(row => !row.completed
         || row.evaluation?.valid !== true
-        || row.collaboration_failed
-        || !row.provider_session)
+        || row.collaboration_failed)
       if (incomplete) {
         const restored: TrajectoryRow[] = []
         for (let index = 0; index < candidates.length; index += 1) {
@@ -1043,9 +949,7 @@ export class Runner {
           if (checkpoint && broken) {
             await this.preserveUnverified(row)
             const restoredRow = await this.manager.restoreCompletedState(checkpoint, publicRow(row))
-            if (restoredRow._state) {
-              this.trackState(restoredRow._state, { id: restoredRow.id, parent: restoredRow.parent })
-            }
+            if (restoredRow._state) this.track(restoredRow._state, restoredRow.id, restoredRow.parent)
             restored.push(restoredRow)
           } else {
             restored.push(row)
@@ -1121,8 +1025,8 @@ export class Runner {
         ownsState = true
       }
       const checkout = state.path
-      this.trackState(state, { id: basename(folder), parent: parent.id })
-      this.activeStates.set(state, { id: basename(folder), parent: parent.id, workspace: checkout })
+      const entry = this.track(state, basename(folder), parent.id)
+      entry.active = true
       const manifest = await inventory(checkout)
       await writeJsonAtomic(join(folder, 'INPUT-MANIFEST.json'), manifest)
 
@@ -1170,14 +1074,10 @@ export class Runner {
         sharedContextPath = targetFile
       }
 
-      let handoff: { from: string; text: string; path?: string } | null = null
+      let handoff: { from: string; text: string } | null = null
       if ((phase === 'continue' || resume) && typeof parent.last_output === 'string' && parent.last_output.trim() !== '') {
-        const handoffPath = join(checkout, '.auto-research-methods-handoff.md')
-        await fsp.writeFile(handoffPath, parent.last_output, { mode: 0o600 })
-        handoff = { from: parent.id, text: parent.last_output, path: handoffPath }
-      }
-      if (state.staging) {
-        state.prelaunchInventory = await inventory(checkout)
+        handoff = { from: parent.id, text: parent.last_output }
+        await fsp.writeFile(join(folder, 'HANDOFF.md'), parent.last_output, { mode: 0o600 })
       }
 
       const branchEnv: Record<string, string> = { ...this.workerEnv }
@@ -1190,28 +1090,13 @@ export class Runner {
       if (state.sandboxPath) branchEnv.DSH_AUTO_RESEARCH_SANDBOX_PATH = state.sandboxPath
       branchEnv.DSH_AUTO_RESEARCH_CHECKOUT = checkout
 
-      const prompt = buildWorkerPrompt({
-        plan: this.plan,
-        parent: publicRow(parent),
-        checkout,
-        phase,
-        view,
-        options: this.options,
-        cooperation: cooperation
-          ? { index, count: cooperation.count, target, seconds }
-          : null,
-        peer,
-        env: branchEnv,
-        provider: this.workerProvider,
-        policy: workerPolicy({ cooperation: Boolean(cooperation) }),
-        seconds,
-        handoff,
-        sharedContext: sharedContextPath,
-      })
+      const prompt = buildWorkerPrompt({ plan: this.plan, checkout })
       await writeJsonAtomic(join(folder, 'LAUNCH.json'), {
         phase,
         parent: parent.id,
-        fresh_context: !session,
+        // The subagent seam cannot resume a provider session; continuity is
+        // the handoff note plus the worker's own RESEARCH_HANDOFF.md.
+        continuation: handoff ? 'handoff' : 'none',
         provider_session: session,
         seconds,
         metric_view: view,
@@ -1222,7 +1107,7 @@ export class Runner {
         worker_agent_options: this.workerAgentOptions,
         environment: Object.keys(branchEnv),
         handoff_from: handoff?.from ?? null,
-        handoff_path: handoff?.path ?? null,
+        handoff_path: handoff ? join(folder, 'HANDOFF.md') : null,
         shared_context: sharedContextPath,
         workspace_branch: state.branch,
         sandbox_path: state.sandboxPath,
@@ -1234,6 +1119,41 @@ export class Runner {
       })
       if (providerSeconds <= 0) {
         throw new Error('No provider window remains after reserving evaluation')
+      }
+
+      const unixNow = Date.now() / 1000
+      const rsiTop = this.options.rsiTop && phase === 'explore'
+      const workerFiles = await materializeWorkerFiles(checkout, {
+        branch: {
+          schema: 1,
+          run_id: this.runId,
+          branch_id: basename(folder),
+          phase,
+          parent: parent.id,
+          checkout,
+          layerfs_branch: state.branch ?? null,
+          sandbox_path: state.sandboxPath ?? null,
+          deadline_unix: Math.floor(unixNow + providerSeconds),
+          provider_seconds: providerSeconds,
+          evaluation_reserve_seconds: cooperation ? this.plan.evaluation_seconds : 0,
+          share_target_unix: cooperation ? Math.floor(unixNow + target) : null,
+          handoff: handoff ? { from: handoff.from, path: '.auto-research-methods/HANDOFF.md' } : null,
+          rsi_top: rsiTop ? { portfolio_size: this.plan.portfolio_size, metric_view: view } : null,
+          cooperation: cooperation
+            ? {
+              index,
+              count: cooperation.count,
+              peer_evidence: peer ? { path: peer.path, sha256: peer.digest, peer_ids: peer.ids } : null,
+              shared_context: sharedContextPath,
+            }
+            : null,
+          environment: Object.keys(branchEnv),
+        },
+        marker: { run_id: this.runId, branch_id: basename(folder), created_at: new Date().toISOString() },
+        handoff: handoff?.text ?? null,
+      })
+      if (state.staging) {
+        state.prelaunchInventory = await inventory(checkout)
       }
 
       const started = Date.now()
@@ -1275,33 +1195,17 @@ export class Runner {
         })
         childId = activation.childId ?? null
         if (childId) workerRegistration?.setChildSession(childId)
-        let disposal: Promise<void> | null = null
-        const disposeOnce = (): Promise<void> => {
-          if (!disposal) {
-            disposal = (async () => {
-              try {
-                await activation.dispose()
-              } catch (error) {
-                this.logger?.warn?.(`[auto-research] worker dispose failed: ${(error as Error).message}`)
-              }
-            })()
-          }
-          return disposal
-        }
-        try {
-          result = await this.awaitActivationResult(activation, signal, disposeOnce)
-        } finally {
-          // An abort may have started disposal already; never await it past the
-          // same short grace, so a provider that ignores abort cannot hang.
-          await this.disposeWithin(disposeOnce())
-        }
+        result = await this.awaitActivation(activation, signal)
       } finally {
         clearTimeout(timer)
         workerRegistration?.dispose()
+        // Runner-written files never reach evaluation or a LayerFS commit.
+        await removeWorkerFiles(checkout, workerFiles)
       }
       // A Sandbox-internal worker edits `/workspaces/<n>`, not the host
-      // staging copy: fold its committed overlay back before evaluating.
-      if (typeof this.manager.reconcile === 'function') await this.manager.reconcile(state)
+      // staging copy: fold its overlay back, or refuse a branch whose two
+      // views both changed.
+      const reconciliation = await this.manager.reconcile(state)
       this.checkCancelled()
       const assistantText = outputText(result?.output)
       providerEvents.push({
@@ -1341,8 +1245,14 @@ export class Runner {
         provider_outcome: outcome,
         time: Date.now(),
         last_output: assistantText,
-        ...(handoff?.path ? { handoff_path: handoff.path } : {}),
-        evaluation: completed
+        ...(handoff ? { handoff_path: join(folder, 'HANDOFF.md') } : {}),
+        evaluation: reconciliation.outcome === 'conflict'
+          ? {
+            valid: false,
+            reason: 'workspace conflict: host and sandbox both modified'
+              + (reconciliation.conflicts.length > 0 ? ': ' + reconciliation.conflicts.join(', ') : ''),
+          }
+          : completed
           ? await this.evaluator.evaluate(checkout, folder, {
             ...(cooperation ? { deadline: cooperation.deadline } : {}),
             signal: this.signalForWork(),
@@ -1377,7 +1287,7 @@ export class Runner {
         }
       }
       await writeJsonAtomic(join(folder, 'RESULT.json'), publicRow(row))
-      this.activeStates.delete(state)
+      entry.active = false
       return { ...row, _state: state, _ownsState: ownsState }
     } catch (error) {
       if ((ownsState || resume) && state) {
@@ -1399,19 +1309,13 @@ export class Runner {
           completed: false,
           _state: state,
           _ownsState: true,
-          _released: false,
         }
         this.abandoned.push(orphan)
         // Cancellation and an unexpected provider error both preserve the
         // branch: its partial evidence is committed and the mount is released
         // without discarding, so a reviewer can inspect what the worker did.
-        try {
-          await this.manager.commit(state, { message: `auto-research: unverified ${orphan.id}` })
-        } catch (commitError) {
-          this.logger?.warn?.(`[auto-research] branch commit failed: ${(commitError as Error).message}`)
-        }
-        // A stop still reports the pending path in RESULT.json before cleanup.
-        await this.releaseTracked(state, false, 'branch', stopped)
+        // A stop still reports the pending path in RESULT.json.
+        await this.commitAndRelease(state, orphan.id, `auto-research: unverified ${orphan.id}`, stopped)
       }
       throw error
     }
@@ -1443,60 +1347,34 @@ export class Runner {
   async recycle(candidates: TrajectoryRow[], leader: TrajectoryRow, previous?: TrajectoryRow): Promise<void> {
     for (const row of candidates) {
       if (!row._ownsState || !row._state) continue
-      if (this.releasedStates.has(row._state)) {
+      const state = row._state
+      if (this.isReleased(state)) {
         row._state = null
-        row._released = true
         continue
       }
-      const state = row._state
       if (row.id === leader.id) {
         try {
           await this.manager.commit(state, { message: `auto-research: verified ${row.id}` })
         } catch (error) {
-          this.logger?.warn?.(`[auto-research] commit failed: ${(error as Error).message}`)
+          this.logger?.warn?.(`[auto-research] commit of ${row.id} failed: ${(error as Error).message}`)
         }
         // The leader stays mounted: the next phase continues from this exact
         // workspace, and `releaseAll()` commits/unmounts it at batch end.
         continue
       }
-      {
-        const valid = row.evaluation?.valid === true
-        const completed = row.completed === true
-        const label = valid ? 'verified' : completed ? 'rejected' : 'unverified'
-        try {
-          await this.manager.commit(state, { message: `auto-research: ${label} ${row.id}` })
-        } catch (error) {
-          this.logger?.warn?.(`[auto-research] commit failed: ${(error as Error).message}`)
-        }
-      }
-      // Mark released only after the backend confirms it; a failed release
-      // keeps the handle for `releaseAll()` and `pendingWorkspaces()`.
-      await this.releaseTracked(state, false, 'release')
+      const label = row.evaluation?.valid === true ? 'verified' : row.completed === true ? 'rejected' : 'unverified'
+      await this.commitAndRelease(state, row.id, `auto-research: ${label} ${row.id}`)
     }
     // A defeated leader (the baseline, or an earlier round's leader) is no
     // longer the working branch. Commit and unmount it now instead of holding
     // its Sandbox mount for the rest of the batch.
-    await this.releaseSuperseded(previous, leader)
-  }
-
-  /** Commit and release the state of a leader that lost the selection. */
-  private async releaseSuperseded(previous: TrajectoryRow | undefined, leader: TrajectoryRow): Promise<void> {
-    if (!previous) return
-    if (previous.id === leader.id) return
-    const state = previous._state
-    if (!state) return
-    if (state === leader._state) return
-    if (this.releasedStates.has(state)) {
+    const superseded = previous && previous.id !== leader.id ? previous._state : null
+    if (!previous || !superseded || superseded === leader._state) return
+    if (this.isReleased(superseded)) {
       previous._state = null
-      previous._released = true
       return
     }
-    try {
-      await this.manager.commit(state, { message: `auto-research: release ${previous.id}` })
-    } catch (error) {
-      this.logger?.warn?.(`[auto-research] superseded commit failed: ${(error as Error).message}`)
-    }
-    await this.releaseTracked(state, false, 'release')
+    await this.commitAndRelease(superseded, previous.id, `auto-research: release ${previous.id}`)
   }
 
   async finish(
@@ -1542,31 +1420,20 @@ export class Runner {
 
   /** Release every mounted workspace at the end of a batch. */
   async releaseAll(): Promise<void> {
-    const rows = [...this.rows, ...this.abandoned]
     const byState = new Map<WorkspaceState, TrajectoryRow>()
-    for (const row of rows) {
+    for (const row of [...this.rows, ...this.abandoned]) {
       if (row._state) byState.set(row._state, row)
     }
-    const states = new Set<WorkspaceState>([...this.trackedStates.keys(), ...byState.keys()])
     let incomplete = false
-    for (const state of states) {
-      if (this.releasedStates.has(state)) {
+    for (const state of new Set([...this.states.keys(), ...byState.keys()])) {
+      if (this.isReleased(state)) {
         this.markReleased(state)
         continue
       }
       const row = byState.get(state)
-      const valid = row?.evaluation?.valid === true
-      const completed = row?.completed === true
-      const id = row?.id ?? this.trackedStates.get(state)?.id ?? ''
-      try {
-        if (valid) await this.manager.commit(state, { message: `auto-research: retained ${id}` })
-        else if (completed) await this.manager.commit(state, { message: `auto-research: rejected ${id}` })
-        else await this.manager.commit(state, { message: `auto-research: unverified ${id}` })
-      } catch (error) {
-        this.logger?.warn?.(`[auto-research] final commit failed: ${(error as Error).message}`)
-      }
-      const released = await this.releaseTracked(state, false, 'final')
-      if (!released) incomplete = true
+      const id = row?.id ?? this.states.get(state)?.id ?? ''
+      const label = row?.evaluation?.valid === true ? 'retained' : row?.completed === true ? 'rejected' : 'unverified'
+      if (!await this.commitAndRelease(state, id, `auto-research: ${label} ${id}`)) incomplete = true
     }
     // Keep the manager (and its LayerFS client) open while a state is still
     // mounted, so a later releaseAll() can retry.
@@ -1582,17 +1449,11 @@ export class Runner {
   /** Keep an unverified workspace available for independent review. */
   async preserveUnverified(row: TrajectoryRow): Promise<void> {
     const state = row._state
-    if (!state || this.releasedStates.has(state)) {
+    if (!state || this.isReleased(state)) {
       row._state = null
-      row._released = true
       return
     }
-    try {
-      await this.manager.commit(state, { message: `auto-research: unverified ${row.id}` })
-    } catch (error) {
-      this.logger?.warn?.(`[auto-research] unverified commit failed: ${(error as Error).message}`)
-    }
-    await this.releaseTracked(state, false, 'unverified')
+    await this.commitAndRelease(state, row.id, `auto-research: unverified ${row.id}`)
   }
 }
 

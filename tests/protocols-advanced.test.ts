@@ -10,8 +10,8 @@ import {
   sampleMetricViews,
   seededRandom,
   writeSharedContextAtomic,
+  SHARED_CONTEXT_PREAMBLE,
 } from '../lib/protocols.js'
-import { SHARED_CONTEXT_POLICY } from '../lib/policies.js'
 import { withTemp } from './helpers.ts'
 
 describe('RSI metric-view sampling at scale', () => {
@@ -64,7 +64,7 @@ describe('shared-context fidelity', () => {
         },
       }],
     })
-    assert.ok(text.startsWith(SHARED_CONTEXT_POLICY))
+    assert.ok(text.startsWith(SHARED_CONTEXT_PREAMBLE))
     assert.match(text, /# Shared research context/)
     assert.match(text, /Objective: prove X/)
     assert.match(text, /Checkout: \/cohort\/checkout-1/)

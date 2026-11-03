@@ -25,13 +25,13 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type {
   CompletedState,
-  Config,
   LayerFSBinding,
   LayerFSClient,
   LayerFSMount,
   LayerFSSettings,
   Logger,
-  PluginContext,
+  ShellEnvService,
+  Reconciliation,
   TrajectoryRow,
   WorkspaceBackend,
   WorkspaceBackendCreateOptions,
@@ -46,6 +46,7 @@ export const OMIT = new Set([
   '.method-evaluation',
   '.codex',
   '.claude',
+  '.agents',
   '.aws',
   '.ssh',
   '.azure',
@@ -119,10 +120,19 @@ function omitFile(name: string): boolean {
   return OMIT.has(name) || ENV_FILE.test(name)
 }
 
+/** Manifest value prefix for a symlink: `symlink:<link text>`. */
+export const SYMLINK = 'symlink:'
+
+/** @returns whether a manifest value records a symlink rather than a content hash. */
+export function isLinkEntry(value: string | undefined): boolean {
+  return value !== undefined && value.startsWith(SYMLINK)
+}
+
 /**
  * Snapshot inventory: relative POSIX path -> SHA-256 for every regular,
- * non-omitted file. Symlinks and non-regular entries are rejected instead of
- * being followed, so a snapshot never captures bytes outside the workspace.
+ * non-omitted file, and `symlink:<link text>` for every symlink. Links are
+ * recorded, never followed, so a snapshot never captures bytes outside the
+ * workspace. Other non-regular entries are rejected.
  */
 export async function inventory(root: string): Promise<Record<string, string>> {
   const result: Record<string, string> = {}
@@ -132,7 +142,9 @@ export async function inventory(root: string): Promise<Record<string, string>> {
     for (const entry of entries) {
       const full = join(directory, entry.name)
       if (entry.isSymbolicLink()) {
-        throw new Error('Snapshot requires materializing symlinks first: ' + full)
+        if (omitFile(entry.name) || omitDirectory(directory.split(sep).at(-1), entry.name)) continue
+        result[relativePosix(root, full)] = SYMLINK + await fsp.readlink(full)
+        continue
       }
       if (entry.isDirectory()) {
         if (omitDirectory(directory.split(sep).at(-1), entry.name)) continue
@@ -159,6 +171,17 @@ export async function inventoryBytes(root: string, files: Record<string, string>
     total += stat.size
   }
   return total
+}
+
+/** @returns the sorted paths whose manifest value differs between `before` and `after`. */
+export function changedPaths(before: Record<string, string>, after: Record<string, string>): string[] {
+  const names = new Set([...Object.keys(before), ...Object.keys(after)])
+  return [...names].filter(name => before[name] !== after[name]).sort()
+}
+
+/** @returns the bytes of `count` full host copies of the tree at `path`. */
+export async function hostCopyBytes(path: string, count: number): Promise<number> {
+  return (await inventoryBytes(path, await inventory(path))) * count
 }
 
 /** @returns available bytes of the filesystem holding `path` (or its nearest parent). */
@@ -200,7 +223,8 @@ async function copyTree(sourceRoot: string, destinationRoot: string): Promise<vo
       if (!shouldCopy(sourceRoot, from)) continue
       const to = join(destination, entry.name)
       if (entry.isSymbolicLink()) {
-        throw new Error('Snapshot requires materializing symlinks first: ' + from)
+        await fsp.symlink(await fsp.readlink(from), to)
+        continue
       }
       if (entry.isDirectory()) {
         await walk(from, to)
@@ -270,23 +294,7 @@ export function publicRow(row: TrajectoryRow): TrajectoryRow {
   const copy: TrajectoryRow = { ...row }
   delete copy._state
   delete copy._ownsState
-  delete copy._released
   return copy
-}
-
-async function ensureNoSymlink(root: string, parts: string[]): Promise<void> {
-  let cursor = root
-  for (const part of parts) {
-    cursor = join(cursor, part)
-    let stat
-    try {
-      stat = await fsp.lstat(cursor)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue
-      throw error
-    }
-    if (stat.isSymbolicLink()) throw new Error('Completed checkpoint path may not traverse symlinks')
-  }
 }
 
 /**
@@ -309,6 +317,14 @@ export async function retainCompletedState(output: string, row: TrajectoryRow): 
   const objects = join(output, 'checkpoint-objects')
   await fsp.mkdir(objects, { recursive: true })
   const modes: Record<string, number> = {}
+  // Links are recorded by their text and recreated on restore; only regular
+  // files go into `checkpoint-objects`.
+  const links: Record<string, string> = {}
+  for (const [name, value] of Object.entries(files)) {
+    if (!isLinkEntry(value)) continue
+    links[name] = value.slice(SYMLINK.length)
+    delete files[name]
+  }
   for (const name of Object.keys(files).sort()) {
     const expected = files[name]
     if (expected === undefined) continue
@@ -316,7 +332,6 @@ export async function retainCompletedState(output: string, row: TrajectoryRow): 
     if (isAbsolute(name) || parts.includes('..') || parts.length === 0) {
       throw new Error('Invalid retained checkpoint path')
     }
-    await ensureNoSymlink(workspace, parts)
     const path = join(workspace, name)
     if (!isContained(workspace, path)) throw new Error('Retained checkpoint escapes the workspace')
     const stat = await fsp.lstat(path)
@@ -337,7 +352,7 @@ export async function retainCompletedState(output: string, row: TrajectoryRow): 
     if (await digestFile(object) !== expected) throw new Error('Checkpoint object changed')
   }
   const checkpoint = join(output, `${row.id}-completed-state.json`)
-  const saved: CompletedState = { row: publicRow(row), files, modes }
+  const saved: CompletedState = { row: publicRow(row), files, modes, links }
   await writeJsonAtomic(checkpoint, saved)
   return checkpoint
 }
@@ -376,6 +391,16 @@ export async function restoreCompletedState(
     await fsp.mkdir(dirname(target), { recursive: true })
     await fsp.copyFile(object, target)
     await fsp.chmod(target, saved.modes[name] ?? 0o644)
+  }
+  // Checkpoints written before links were recorded have no `links`.
+  for (const [name, link] of Object.entries(saved.links ?? {})) {
+    const parts = name.split('/')
+    if (isAbsolute(name) || parts.includes('..') || parts.length === 0) {
+      throw new Error('Invalid retained checkpoint path')
+    }
+    const target = join(workspace, name)
+    await fsp.mkdir(dirname(target), { recursive: true })
+    await fsp.symlink(link, target)
   }
   const actual = await inventory(workspace)
   if (jsonDigest(actual) !== row.evaluation?.workspace_manifest_sha256) {
@@ -423,6 +448,10 @@ export class SnapshotBackend implements WorkspaceBackend {
 
   async release(): Promise<void> {}
 
+  async estimateForkBytes(parent: WorkspaceState, count: number): Promise<number> {
+    return hostCopyBytes(parent.path, count)
+  }
+
   async retainCompletedState(row: TrajectoryRow): Promise<string> {
     return retainCompletedState(this.output, row)
   }
@@ -454,19 +483,14 @@ function codedError(message: string, code: string): Error {
 }
 
 /**
- * Whether `fs.read` refused a file because it is not UTF-8 text.
+ * Whether `fs.read` refused a file because it is not UTF-8 text (`Binary`).
  *
  * A binary adopted file has no text representation to stage, but it is not a
  * lost file: `workspace.exec` can copy the exact bytes, or the file is reported
  * as skipped and never removed from the branch.
  */
 export function isSkippableAdoptedFile(error: unknown): boolean {
-  const code = refusalCode(error)
-  if (code === 'Binary' || code === 'BinaryFile' || code === 'NotText') return true
-  const message = error === null || typeof error !== 'object'
-    ? typeof error === 'string' ? error : ''
-    : String((error as { message?: unknown }).message ?? '')
-  return /\bbinary\b|not (?:utf-?8|text)/i.test(message)
+  return refusalCode(error) === 'Binary'
 }
 
 /** Quote a path for a POSIX shell command. */
@@ -475,50 +499,29 @@ function shellQuote(value: string): string {
 }
 
 /**
- * Whether a commit/unmount refusal only means the mount is behind its branch.
+ * Whether a commit/unmount refusal of a staged mount only means its overlay
+ * differs from the branch it was published to.
  *
- * `fs.apply` creates a commit on the branch, so right after publishing the
- * mount handle is one commit behind (`headMovedSinceMount`) or its overlay
- * necessarily differs (`Dirty`); the bytes are already safe on the branch.
+ * `fs.apply` writes the branch directly, so the mount's own overlay then
+ * disagrees with the moved head: `workspace.commit` refuses with `Conflict`
+ * and `workspace.unmount` with `Dirty`. The bytes are already on the branch.
  */
 export function isStaleMountRefusal(error: unknown): boolean {
   const code = refusalCode(error)
-  if (['headMovedSinceMount', 'HeadMovedSinceMount', 'UpToDate', 'AlreadyUpToDate', 'Dirty', 'StaleMount'].includes(code)) {
-    return true
-  }
-  const message = error === null || typeof error !== 'object'
-    ? typeof error === 'string' ? error : ''
-    : String((error as { message?: unknown }).message ?? '')
-  return /head moved since mount|already up[- ]to[- ]date|up[- ]to[- ]date|dirty|stale mount/i.test(message)
+  return code === 'Conflict' || code === 'Dirty'
 }
 
 /**
- * Whether a refusal means the LayerFS project does not exist yet or its `main`
- * branch carries no usable state, so `project.init(source)` can recover.
- *
- * The live and simulated bindings use the same codes (`NoSuchProject`,
- * `NoSuchBranch`, `NoSuchCommit`); message hints cover SDK versions that wrap
- * the refusal. Codes that mean "the project is there but unusable" are never
- * treated as missing.
+ * Whether a refusal means the LayerFS project or its `main` branch does not
+ * exist yet, so `project.init(source)` can recover.
  */
 export function isMissingProjectOrMain(error: unknown): boolean {
-  const code = refusalCode(error)
-  if (['NoSuchProject', 'NoSuchBranch', 'NoSuchCommit', 'NoSuchLayer'].includes(code)) return true
-  if (['Exists', 'ReadOnly', 'Conflict', 'Busy', 'InvalidInput', 'NoSuchPath', 'Unsupported'].includes(code)) return false
-  const message = error === null || typeof error !== 'object'
-    ? ''
-    : String((error as { message?: unknown }).message ?? '')
-  return /project .{0,200}does not exist|\bno (simulated )?(layerfs )?project\b|main (branch )?(does not exist|has no|is empty)|NoSuchProject|NoSuchBranch/i.test(message)
+  return ['NoSuchProject', 'NoSuchBranch', 'NoSuchCommit'].includes(refusalCode(error))
 }
 
 /** Whether `project.init` refused because the project already exists. */
 function isExistingProject(error: unknown): boolean {
-  const code = refusalCode(error)
-  if (code === 'Exists') return true
-  const message = error === null || typeof error !== 'object'
-    ? ''
-    : String((error as { message?: unknown }).message ?? '')
-  return /\bexists\b|already initialized/i.test(message)
+  return refusalCode(error) === 'Exists'
 }
 
 /**
@@ -562,7 +565,6 @@ export function isTransientLayerfsError(error: unknown): boolean {
     || candidate.code === 'EPIPE') return true
   const message = String(candidate.message ?? '')
   if (TRANSIENT_MESSAGE.test(message)) return true
-  if (/busy/i.test(message)) return true
   // A wrapped cause (undici/`node:net` errors) carries the real reason.
   const cause = candidate.cause
   if (cause && cause !== error) return isTransientLayerfsError(cause)
@@ -795,6 +797,15 @@ export class LayerFSBackend implements WorkspaceBackend {
     const directories = new Set<string>()
     for (const name of Object.keys(after).sort()) {
       if (after[name] === before[name]) continue
+      if (isLinkEntry(after[name])) {
+        // The SDK has no call that writes a symlink: keep it on the host copy
+        // and never treat its absence on the branch as a deletion.
+        if (!(state.skippedFiles ?? []).includes(name)) {
+          state.skippedFiles = [...(state.skippedFiles ?? []), name]
+          this.logger?.warn?.(`[auto-research] symlink ${name} stays in the host staging copy; LayerFS fs.apply cannot write links`)
+        }
+        continue
+      }
       const parts = name.split('/')
       for (let depth = 1; depth < parts.length; depth += 1) {
         directories.add(parts.slice(0, depth).join('/'))
@@ -817,6 +828,8 @@ export class LayerFSBackend implements WorkspaceBackend {
       // A binary adopted file without a host copy must never be removed from
       // its branch just because the staging directory cannot represent it.
       if ((state.skippedFiles ?? []).includes(name)) continue
+      // A link was never published, so there is nothing to remove.
+      if (isLinkEntry(before[name])) continue
       writes.push({ op: 'rm', path: '/' + name })
     }
     const fs = this.client.fs
@@ -855,7 +868,7 @@ export class LayerFSBackend implements WorkspaceBackend {
         // by construction). That refusal is not a lost write.
         if (!published || !isStaleMountRefusal(error)) throw error
         this.logger?.info?.(
-          `[auto-research] branch ${branch} already holds the published bytes; skipping the stale mount commit (${refusalCode(error) || 'headMovedSinceMount'})`,
+          `[auto-research] branch ${branch} already holds the published bytes; skipping the stale mount commit (${refusalCode(error)})`,
         )
       }
     }
@@ -870,9 +883,9 @@ export class LayerFSBackend implements WorkspaceBackend {
   ): Promise<string[]> {
     const skipped: string[] = []
     const fs = this.client.fs
+    // An empty listing would read as "the branch deleted every file".
     if (typeof fs?.list !== 'function' || typeof fs?.read !== 'function') {
-      this.logger?.warn?.('[auto-research] cannot materialize a Sandbox-internal adopted branch: client.fs is unavailable')
-      return skipped
+      throw new Error(`cannot materialize LayerFS branch ${branch}: the client has no fs.list/fs.read`)
     }
     const files = await listBranchFiles(fs, branch)
     for (const name of files) {
@@ -1217,92 +1230,135 @@ export class LayerFSBackend implements WorkspaceBackend {
   }
 
   /**
-   * Fold changes made inside a live Sandbox mount back into the host staging
-   * copy before it is evaluated.
+   * Settle a staged branch's two writable views before evaluation.
    *
-   * A worker calls `bash` inside `/workspaces/<n>`; those edits stay in the
-   * Sandbox overlay until they are committed. Host edits take precedence: if
-   * the staging directory changed, `commit()` is the writer and this returns.
+   * The host staging copy is the authoritative writer; the Sandbox mount at
+   * `/workspaces/<n>` is for execution. A worker that edits the Sandbox anyway
+   * leaves changes in its overlay. This commits that overlay into the branch
+   * history first, whatever the host did, so it is never dropped, then compares
+   * both sides with the inventory the staging copy started from:
+   *
+   * - neither changed: `unchanged`
+   * - Sandbox only: fold the branch into the host copy, `folded`
+   * - host only: `host`; `commit()` publishes it
+   * - both: `conflict`; the host diff is still published by `commit()`, so
+   *   both sides stay in the branch history, and the row is invalid because
+   *   the evaluated host copy is not the branch state.
    */
-  async reconcile(state: WorkspaceState): Promise<void> {
-    if (!state?.staging || !state.handle || !state.branch) return
-    const hostAfter = await inventory(state.path)
+  async reconcile(state: WorkspaceState): Promise<Reconciliation> {
+    const unchanged: Reconciliation = { outcome: 'unchanged', conflicts: [] }
+    if (!state?.staging || !state.handle || !state.branch) return unchanged
     const hostBaseline = state.prelaunchInventory ?? state.stagingInventory ?? {}
-    const hostChanged = !jsonEqual(hostAfter, hostBaseline)
-    if (hostChanged) return
+    const hostChanged = changedPaths(hostBaseline, await inventory(state.path))
+    const sandbox = await this.sandboxChanges(state)
+    if (sandbox === null || sandbox.changed.length === 0) {
+      return hostChanged.length > 0 ? { outcome: 'host', conflicts: [] } : unchanged
+    }
+    if (hostChanged.length > 0) {
+      const sandboxChanged = new Set(sandbox.changed)
+      return { outcome: 'conflict', conflicts: hostChanged.filter(name => sandboxChanged.has(name)) }
+    }
+    const baseline = state.stagingInventory ?? {}
+    for (const name of Object.keys(baseline)) {
+      if (Object.hasOwn(sandbox.files, name)) continue
+      if ((state.skippedFiles ?? []).includes(name)) continue
+      // Links are never published, so a branch without one has not deleted it.
+      if (isLinkEntry(baseline[name])) continue
+      await fsp.rm(join(state.path, name), { force: true })
+    }
+    for (const name of Object.keys(sandbox.files).sort()) {
+      const target = join(state.path, name)
+      await fsp.mkdir(dirname(target), { recursive: true })
+      await fsp.copyFile(join(sandbox.directory, name), target)
+    }
+    await fsp.rm(sandbox.directory, { recursive: true, force: true })
+    state.stagingInventory = sandbox.files
+    state.prelaunchInventory = await inventory(state.path)
+    return { outcome: 'folded', conflicts: [] }
+  }
+
+  /**
+   * Commit a dirty Sandbox overlay and report what the branch now holds that
+   * the staging copy did not start from.
+   *
+   * @returns null when the overlay is clean and the branch head has not moved;
+   *   otherwise the changed paths and a materialized copy of the branch (the
+   *   caller removes `directory`).
+   */
+  private async sandboxChanges(state: WorkspaceState): Promise<{
+    changed: string[]
+    files: Record<string, string>
+    directory: string
+  } | null> {
+    const handle = state.handle as LayerFSMount
     const status = this.client.workspace?.status
     if (typeof status === 'function') {
-      let current: unknown
+      let current: unknown = null
       try {
-        current = await this.retry(() => status.call(this.client.workspace, state.handle as LayerFSMount))
+        current = await this.retry(() => status.call(this.client.workspace, handle))
       } catch (error) {
-        this.logger?.warn?.(
-          `[auto-research] workspace.status unavailable for ${state.id}: ${(error as Error).message}`,
-        )
-        current = null
+        this.logger?.warn?.(`[auto-research] workspace.status unavailable for ${state.id}: ${(error as Error).message}`)
       }
       if (current !== null && typeof current === 'object') {
+        // `sandbox.status`: `overlay` is null when the mount has no local state.
         const record = current as {
-          overlay?: { entries?: unknown; inodes?: unknown; pendingMerge?: unknown }
-          dirty?: { entries?: unknown; inodes?: unknown; pendingMerge?: unknown }
-          headMovedSinceMount?: unknown
-          branchHead?: unknown
-          base?: unknown
+          overlay: { entries: number; inodes: number; pendingMerge: boolean } | null
+          headMovedSinceMount: boolean | null
+          branchHead: string | null
+          base: string | null
         }
-        const dirtyEntries = Number(record.overlay?.entries ?? record.dirty?.entries ?? 0)
-        const dirtyInodes = Number(record.overlay?.inodes ?? record.dirty?.inodes ?? 0)
-        const pendingMerge = record.overlay?.pendingMerge === true || record.dirty?.pendingMerge === true
-        const dirtyOverlay = dirtyEntries > 0 || dirtyInodes > 0 || pendingMerge
-        if (dirtyOverlay && typeof this.client.workspace?.commit === 'function') {
-          try {
-            await this.retry(() => this.client.workspace!.commit!(
-              state.handle as LayerFSMount,
-              `auto-research: sandbox ${state.id}`,
-            ))
-          } catch (error) {
-            if (!isStaleMountRefusal(error)) throw error
-          }
-        }
-        const initialBase = (state.handle as { base?: unknown } | null)?.base
+        const overlay = record.overlay
+        const dirtyOverlay = overlay !== null && (overlay.entries > 0 || overlay.inodes > 0 || overlay.pendingMerge)
+        const initialBase = (handle as { base?: unknown } | null)?.base
         const headKnownUnchanged = !dirtyOverlay
           && !record.headMovedSinceMount
           && typeof initialBase === 'string'
           && typeof record.branchHead === 'string'
           && record.branchHead === initialBase
-          && (record.base === undefined || record.base === initialBase)
-        if (headKnownUnchanged) return
+          && record.base === initialBase
+        if (headKnownUnchanged) return null
+        if (dirtyOverlay && typeof this.client.workspace?.commit === 'function') {
+          // A refused commit throws: the overlay is not in the branch history
+          // yet, and the remount below would discard it.
+          await this.retry(() => this.client.workspace!.commit!(handle, `auto-research: sandbox ${state.id}`))
+          // The branch head moved; the later `commit()` needs a current mount.
+          await this.remountStaging(state)
+        }
       }
     }
-    const temporary = join(this.output, `${state.id}-reconcile-${randomUUID()}`)
+    const directory = join(this.output, `${state.id}-reconcile-${randomUUID()}`)
     try {
-      await fsp.mkdir(temporary, { recursive: true })
+      await fsp.mkdir(directory, { recursive: true })
       const skipped = await this.materializeBranch(
-        state.branch,
-        temporary,
+        state.branch as string,
+        directory,
         state.handle as LayerFSMount,
         state.sandboxPath ?? null,
       )
       if (skipped.length > 0) {
         state.skippedFiles = [...new Set([...(state.skippedFiles ?? []), ...skipped])]
       }
-      const branchInv = await inventory(temporary)
-      const branchBaseline = state.stagingInventory ?? {}
-      if (jsonEqual(branchInv, branchBaseline)) return
-      for (const name of Object.keys(branchBaseline)) {
-        if (Object.hasOwn(branchInv, name)) continue
-        if ((state.skippedFiles ?? []).includes(name)) continue
-        await fsp.rm(join(state.path, name), { force: true })
-      }
-      for (const name of Object.keys(branchInv).sort()) {
-        const target = join(state.path, name)
-        await fsp.mkdir(dirname(target), { recursive: true })
-        await fsp.copyFile(join(temporary, name), target)
-      }
-      state.stagingInventory = branchInv
-      state.prelaunchInventory = await inventory(state.path)
-    } finally {
-      await fsp.rm(temporary, { recursive: true, force: true }).catch(() => {})
+      const files = await inventory(directory)
+      const baseline = state.stagingInventory ?? {}
+      // Paths the branch cannot hold (links, unreadable binaries) are not
+      // Sandbox changes.
+      const changed = changedPaths(baseline, files)
+        .filter(name => !isLinkEntry(baseline[name]) && !(state.skippedFiles ?? []).includes(name))
+      if (changed.length === 0) await fsp.rm(directory, { recursive: true, force: true })
+      return { changed, files, directory }
+    } catch (error) {
+      await fsp.rm(directory, { recursive: true, force: true }).catch(() => {})
+      throw error
     }
+  }
+
+  /**
+   * A host-accessible LayerFS mount is copy-on-write and adds nothing up
+   * front; a staged mount (or a non-LayerFS parent) is copied to the host.
+   */
+  async estimateForkBytes(parent: WorkspaceState, count: number): Promise<number> {
+    if (parent.branch && !parent.staging) return 0
+    return hostCopyBytes(parent.path, count)
   }
 
   async commit(state: WorkspaceState, { message = 'auto-research: verified state' }: { message?: string } = {}): Promise<void> {
@@ -1469,9 +1525,13 @@ export class WorkspaceManager implements WorkspaceManagerLike {
     return this.backend.restoreCompletedState(checkpoint, failedRow)
   }
 
-  async reconcile(state: WorkspaceState): Promise<void> {
-    if (typeof this.backend.reconcile !== 'function') return
-    await this.backend.reconcile(state)
+  async reconcile(state: WorkspaceState): Promise<Reconciliation> {
+    if (typeof this.backend.reconcile !== 'function') return { outcome: 'unchanged', conflicts: [] }
+    return this.backend.reconcile(state)
+  }
+
+  async estimateForkBytes(parent: WorkspaceState, count: number): Promise<number> {
+    return this.backend.estimateForkBytes(parent, count)
   }
 
   async close(): Promise<void> {
@@ -1658,90 +1718,17 @@ export function withoutLayerfsTrace(
 }
 
 /**
- * Resolve the environment contributed by `ctx.shellEnv` (the same service
- * `@dsh-layerfs/host` binds). Host versions expose contributors, `resolve`,
- * `snapshot` or a plain `env`; all shapes are handled and merged.
+ * The environment `ctx.shellEnv` (`ShellEnvRegistry.collect`) gives a shell
+ * call of `agent`. `@dsh-layerfs/host` contributes the session's
+ * `DSH_LAYERFS_*` binding here. Contributors read
+ * `execution.rootCallId ?? execution.callId`, so both are set.
  */
-export async function resolveShellEnvironment(
-  ctx: Pick<PluginContext, 'shellEnv' | 'get'>,
+export function resolveShellEnvironment(
+  shellEnv: ShellEnvService | undefined,
   agent?: unknown,
-): Promise<Record<string, string>> {
-  // A Cordis context throws when an un-injected service is read as a
-  // property, so `get(name)` is the only safe lookup; the property form is a
-  // fallback for host snapshots that ignore `inject`.
-  let service: PluginContext['shellEnv']
-  if (typeof ctx.get === 'function') {
-    try {
-      service = ctx.get('shellEnv') as PluginContext['shellEnv']
-    } catch {
-      service = undefined
-    }
-  }
-  if (!service) {
-    try {
-      service = ctx.shellEnv
-    } catch {
-      service = undefined
-    }
-  }
-  if (!service || typeof service !== 'object') return {}
-  // `dsh`'s `ShellEnvRegistry.collect(execution)` is a `ToolExecution`: its
-  // contributors read `execution.rootCallId ?? execution.callId` (for example
-  // `@dsh-layerfs/host` labels the SDK trace step with it). A malformed
-  // execution would publish `DSH_LAYERFS_TRACE_STEP: "undefined"`, so a
-  // complete synthetic execution is always supplied.
-  const execution = { agent, callId: SHELL_ENV_CALL_ID, rootCallId: SHELL_ENV_CALL_ID }
-  const merged: Record<string, unknown> = {}
-  const absorb = (value: unknown): void => {
-    if (!value || typeof value !== 'object') return
-    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-      if (typeof entry === 'string') merged[key] = entry
-      else if (entry === null || entry === undefined) delete merged[key]
-    }
-  }
-  if (service.env && typeof service.env === 'object') absorb(service.env)
-  for (const method of ['collect', 'resolve', 'snapshot'] as const) {
-    const fn = service[method]
-    if (typeof fn === 'function') {
-      try {
-        absorb(await fn.call(service, execution))
-      } catch {
-        // A host without this contributor style simply contributes nothing.
-      }
-    }
-  }
-  const contributors = service.contributors ?? service.sources
-  if (Array.isArray(contributors)) {
-    for (const contributor of contributors) {
-      if (typeof contributor === 'function') {
-        try {
-          absorb(await contributor(execution))
-        } catch {
-          // Ignore a contributor that cannot resolve for this agent.
-        }
-        continue
-      }
-      if (!contributor || typeof contributor !== 'object') continue
-      absorb(contributor)
-      for (const method of ['contribute', 'resolve', 'snapshot', 'env'] as const) {
-        const fn = (contributor as Record<string, unknown>)[method]
-        if (typeof fn === 'function') {
-          try {
-            absorb(await fn.call(contributor, execution))
-          } catch {
-            // Ignore a contributor that cannot resolve for this agent.
-          }
-        } else if (method === 'env' && fn && typeof fn === 'object') {
-          absorb(fn)
-        }
-      }
-    }
-  }
-  const result: Record<string, string> = {}
-  for (const [key, value] of Object.entries(merged)) {
-    if (typeof value === 'string') result[key] = value
-  }
-  return result
+): Record<string, string> {
+  if (!shellEnv) return {}
+  return { ...shellEnv.collect({ agent, callId: SHELL_ENV_CALL_ID, rootCallId: SHELL_ENV_CALL_ID }) }
 }
 
 /** The synthetic tool-call id used for a session-wide environment snapshot. */
@@ -2005,25 +1992,14 @@ export async function loadLayerfs(
 }
 
 /**
- * Concrete `WorkspaceBackendFactory` for full-copy snapshot branches.
- */
-export class SnapshotWorkspaceFactory implements WorkspaceBackendFactory {
-  readonly name = 'snapshot'
-
-  async create({ output, runId }: WorkspaceBackendCreateOptions): Promise<SnapshotBackend> {
-    return new SnapshotBackend({ output, runId })
-  }
-}
-
-/**
  * Concrete `WorkspaceBackendFactory` for LayerFS copy-on-write branches.
  *
- * Returns `null` when LayerFS is explicitly opted out (`config.layerfs: false`),
- * when another backend is explicitly requested, or when no LayerFS project/SDK
- * is bound and `config.workspaceBackend` is not `'layerfs'`.
+ * Returns `null` when LayerFS is opted out (`config.layerfs: false`) or no
+ * LayerFS project/SDK is bound.
  */
 export class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
   readonly name = 'layerfs'
+  readonly priority = 100
 
   async create({
     output,
@@ -2033,9 +2009,6 @@ export class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
     layerfs = undefined,
   }: WorkspaceBackendCreateOptions): Promise<LayerFSBackend | null> {
     if (config.layerfs === false) return null
-    if (config.workspaceBackend !== undefined && config.workspaceBackend !== 'auto' && config.workspaceBackend !== 'layerfs') {
-      return null
-    }
     const configured = config.layerfs && typeof config.layerfs === 'object' ? config.layerfs : null
     if (layerfs?.client) {
       return new LayerFSBackend({
@@ -2063,95 +2036,13 @@ export class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
         activateEnvironment: loaded.activate,
       })
     }
-    if (config.workspaceBackend === 'layerfs') {
-      throw new Error("workspaceBackend is 'layerfs' but no LayerFS project or SDK is configured")
-    }
     return null
   }
 }
 
 /**
- * Cordis plugin that registers `SnapshotWorkspaceFactory` on `ctx.autoResearch`.
- */
-export const snapshotWorkspacePlugin = Object.freeze({
-  name: 'dsh-auto-research-workspace-snapshot',
-  inject: ['autoResearch'] as const,
-  apply(ctx: PluginContext): void {
-    const factory = new SnapshotWorkspaceFactory()
-    const dispose = ctx.autoResearch?.registerWorkspaceBackend(factory)
-    if (typeof dispose === 'function') {
-      ctx.effect?.(() => () => dispose())
-    }
-  },
-})
-
-/**
- * Cordis plugin that registers `LayerFSWorkspaceFactory` on `ctx.autoResearch`.
- */
-export const layerfsWorkspacePlugin = Object.freeze({
-  name: 'dsh-auto-research-workspace-layerfs',
-  inject: ['autoResearch'] as const,
-  apply(ctx: PluginContext): void {
-    const factory = new LayerFSWorkspaceFactory()
-    const dispose = ctx.autoResearch?.registerWorkspaceBackend(factory)
-    if (typeof dispose === 'function') {
-      ctx.effect?.(() => () => dispose())
-    }
-  },
-})
-
-/**
- * Build the workspace manager from registered `WorkspaceBackendFactory` providers
- * (defaulting to `[LayerFSWorkspaceFactory, SnapshotWorkspaceFactory]`), preferring
- * LayerFS when bound.
- */
-export async function createWorkspaceManager({
-  output,
-  runId,
-  config = {},
-  env = process.env,
-  layerfs = undefined,
-  backends = undefined,
-}: WorkspaceBackendCreateOptions & {
-  backends?: WorkspaceBackendFactory[]
-}): Promise<WorkspaceManager> {
-  const registered = backends && backends.length > 0
-    ? backends
-    : [new LayerFSWorkspaceFactory(), new SnapshotWorkspaceFactory()]
-
-  // `config.layerfs: false` is an explicit opt-out: it must win over a
-  // host-injected binding and over ambient DSH_LAYERFS_* variables.
-  const requested = config.layerfs === false
-    ? 'snapshot'
-    : config.workspaceBackend && config.workspaceBackend !== 'auto'
-      ? config.workspaceBackend
-      : null
-
-  if (requested !== null) {
-    const match = registered.find(candidate => candidate.name === requested)
-    if (match) {
-      const backend = await match.create({ output, runId, config, env, ...(layerfs ? { layerfs } : {}) })
-      if (backend) return new WorkspaceManager(backend, { output })
-    }
-    if (requested === 'layerfs') {
-      throw new Error("workspaceBackend is 'layerfs' but no LayerFS project or SDK is configured")
-    }
-    if (requested === 'snapshot') {
-      return new WorkspaceManager(new SnapshotBackend({ output, runId }), { output })
-    }
-    throw new Error(`workspaceBackend "${requested}" is not registered or could not be initialized`)
-  }
-
-  for (const factory of registered) {
-    const backend = await factory.create({ output, runId, config, env, ...(layerfs ? { layerfs } : {}) })
-    if (backend) return new WorkspaceManager(backend, { output })
-  }
-  return new WorkspaceManager(new SnapshotBackend({ output, runId }), { output })
-}
-
-/**
  * Resolve the optional compact research seed named by `plan.workspace`.
- * It must be a regular, symlink-free subdirectory inside `root`.
+ * It must resolve to a directory strictly inside `root`.
  */
 export async function selectPlanWorkspace(root: string, plan: { workspace?: unknown }): Promise<string> {
   const requested = plan?.workspace
@@ -2166,7 +2057,6 @@ export async function selectPlanWorkspace(root: string, plan: { workspace?: unkn
   if (parts.length === 0 || parts.includes('..') || parts.includes('.auto-research-methods')) {
     throw new Error('Plan workspace must be a regular compact subdirectory, not prior runtime')
   }
-  await ensureNoSymlink(root, parts)
   const chosen = await fsp.realpath(join(root, ...parts))
   const realRoot = await fsp.realpath(root)
   if (chosen === realRoot || !isContained(realRoot, chosen)) {

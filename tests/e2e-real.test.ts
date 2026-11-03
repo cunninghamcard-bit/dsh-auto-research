@@ -44,6 +44,9 @@ import {
 } from './e2e-support.ts'
 
 const AUTO_RESEARCH = new URL('../lib/index.js', import.meta.url).href
+const LAYERFS_PLUGIN = new URL('../lib/layerfs.js', import.meta.url).href
+const SNAPSHOT_PLUGIN = new URL('../lib/snapshot.js', import.meta.url).href
+const LOCAL_PLUGIN = new URL('../lib/local.js', import.meta.url).href
 const SHELL_ENV = `${DSH_ROOT}/packages/shell/shell-env/lib/index.js`
 const WORKER_KEYS = ['DSH_AUTO_RESEARCH_WORKER', 'DSH_AUTO_RESEARCH_BRANCH', 'DSH_AUTO_RESEARCH_CHECKOUT', 'DSH_AUTO_RESEARCH_SANDBOX_PATH']
 
@@ -69,7 +72,8 @@ async function dshModules() {
   const cordis = await import(pathToFileURL(`${DSH_ROOT}/vendor/cordis/lib/index.js`).href)
   const testkit = await import(pathToFileURL(`${DSH_ROOT}/packages/test-support/agent-loop-testkit/lib/index.js`).href)
   const subagent = await import(pathToFileURL(`${DSH_ROOT}/packages/subagent/subagent/lib/index.js`).href)
-  return { Context: cordis.Context, testkit, SubagentRuntime: subagent.default }
+  const skill = await import(pathToFileURL(`${DSH_ROOT}/packages/skill/skill/lib/index.js`).href)
+  return { Context: cordis.Context, testkit, SubagentRuntime: subagent.default, SkillRegistry: skill.default }
 }
 
 function digest(text: string | Buffer) {
@@ -122,7 +126,7 @@ function workerProvider(probe: any = null) {
       writePeerReview(request.cwd)
       // `dsh` derives the child session id from the returned run's `id`.
       const childId = `worker-${starts.length}`
-      probe?.(request.cwd, childId)
+      await probe?.(request.cwd, childId)
       return {
         id: childId,
         result: Promise.resolve({
@@ -170,7 +174,8 @@ async function mountDshContext(modules: any) {
   const harness = await modules.testkit.mountAgentLoopTestHarness(ctx)
   const agent = await harness.create('e2e-parent', { provider: 'e2e', model: 'e2e' }, { cwd: tmpdir() })
   await ctx.plugin(modules.SubagentRuntime)
-  return { ctx, agent }
+  await ctx.plugin(modules.SkillRegistry)
+  return { ctx, agent, harness }
 }
 
 /**
@@ -299,17 +304,22 @@ async function scenario(backend: string) {
   const live = backend === 'live' ? await setUpLive(host, root) : null
   const env = live ? live.env : simulatedEnv(root, simulatedProjectName())
   let ctx: any = null
+  let harness: any = null
   /** What each worker's own bash call would receive from `ctx.shellEnv`. */
   const workerEnvironments: any[] = []
-  const worker = workerProvider((cwd: string, childId: string) => {
+  const worker = workerProvider(async (cwd: string, childId: string) => {
+    // A real dsh session whose working directory is the branch checkout: the
+    // provider matches it through `ctx.workingDirectory`.
+    const probe = await harness.create(`probe-${childId}`, { provider: 'e2e', model: 'e2e' }, { cwd })
     workerEnvironments.push({
       cwd,
-      bySession: collectFor(ctx, { session: { header: { id: childId, cwd, origin: 'subagent' } } }),
-      byCwd: collectFor(ctx, { session: { header: { id: `unknown-${childId}`, cwd, parentSession: 'e2e-parent' } } }),
+      collected: collectFor(ctx, probe),
+      skills: ctx.skills.list({ cwd }),
     })
   })
   const mounted = await mountDshContext(modules)
   ctx = mounted.ctx
+  harness = mounted.harness
   const agent = mounted.agent
   try {
     await mountShellEnv(ctx, env)
@@ -318,6 +328,11 @@ async function scenario(backend: string) {
       inject: ['subagents'],
       apply(context: any) { context.subagents.registerProvider(worker) },
     })
+    // The backend plugins load before the core: Cordis holds them until the
+    // core provides `researchWorkspace`.
+    await ctx.plugin(await import(LAYERFS_PLUGIN))
+    const snapshotFiber = await ctx.plugin(await import(SNAPSHOT_PLUGIN))
+    await ctx.plugin(await import(LOCAL_PLUGIN))
     const plugin = await import(AUTO_RESEARCH)
     await ctx.plugin(plugin, {
       providerName: 'auto-research',
@@ -348,14 +363,16 @@ async function scenario(backend: string) {
     // coordinator's calls stay clean.
     assert.ok(workerEnvironments.length > 0, 'workers were probed')
     for (const entry of workerEnvironments) {
-      for (const collected of [entry.bySession, entry.byCwd]) {
-        assert.equal(collected.DSH_AUTO_RESEARCH_WORKER, '1', 'a worker bash call receives DSH_AUTO_RESEARCH_WORKER')
-        assert.match(String(collected.DSH_AUTO_RESEARCH_BRANCH), /^ar-[a-z0-9-]+$/)
-        assert.equal(collected.DSH_AUTO_RESEARCH_CHECKOUT, entry.cwd)
-      }
+      const { collected } = entry
+      assert.equal(collected.DSH_AUTO_RESEARCH_WORKER, '1', 'a worker bash call receives DSH_AUTO_RESEARCH_WORKER')
+      assert.match(String(collected.DSH_AUTO_RESEARCH_BRANCH), /^ar-[a-z0-9-]+$/)
+      assert.equal(collected.DSH_AUTO_RESEARCH_CHECKOUT, entry.cwd)
       // The session's LayerFS facts are still contributed to the same call.
-      assert.ok(entry.bySession.DSH_LAYERFS_PROJECT, 'the LayerFS contributor still publishes the project')
+      assert.ok(collected.DSH_LAYERFS_PROJECT, 'the LayerFS contributor still publishes the project')
+      // The real skill registry shows a running worker its own skill only.
+      assert.deepEqual((await entry.skills).map((skill: any) => skill.name).filter((name: string) => name.startsWith('auto-research')), ['auto-research-worker'])
     }
+    assert.deepEqual((await ctx.skills.list({ cwd: workspace })).map((skill: any) => skill.name).filter((name: string) => name.startsWith('auto-research')), ['auto-research'])
     const coordinatorEnv = collectFor(ctx, agent)
     assert.equal(coordinatorEnv.DSH_AUTO_RESEARCH_WORKER, undefined, 'the coordinator gets no worker flag')
     assert.ok(coordinatorEnv.DSH_LAYERFS_PROJECT, 'the coordinator still receives the LayerFS facts')
@@ -393,6 +410,13 @@ async function scenario(backend: string) {
     assert.equal(adopted.workspace.includes(leaderWorkspace), false, 'the deleted checkout was replaced by the adopted branch')
     const secondResult = readJson(join(latest2.run, 'RESULT.json'))
     assert.equal(secondResult.status, 'COMPLETED')
+
+    assert.deepEqual(ctx.researchExecutor.list().map((factory: any) => factory.name), ['local'])
+
+    // Unloading a backend plugin removes its factory.
+    assert.deepEqual(ctx.researchWorkspace.list().map((factory: any) => factory.name), ['layerfs', 'snapshot'])
+    await snapshotFiber.dispose()
+    assert.deepEqual(ctx.researchWorkspace.list().map((factory: any) => factory.name), ['layerfs'])
     return { root, latest, latest2, worker }
   } finally {
     await ctx.fiber?.dispose?.()

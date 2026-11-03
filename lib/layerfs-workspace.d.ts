@@ -17,7 +17,7 @@
  * is allowed to inspect) and the retained / restored completed-state objects
  * used by cooperative cohorts.
  */
-import type { LayerFSBinding, LayerFSClient, LayerFSSettings, Logger, PluginContext, TrajectoryRow, WorkspaceBackend, WorkspaceBackendCreateOptions, WorkspaceBackendFactory, WorkspaceManagerLike, WorkspaceState } from './types.js';
+import type { LayerFSBinding, LayerFSClient, LayerFSSettings, Logger, ShellEnvService, Reconciliation, TrajectoryRow, WorkspaceBackend, WorkspaceBackendCreateOptions, WorkspaceBackendFactory, WorkspaceManagerLike, WorkspaceState } from './types.js';
 /** Harness and provider state that never enters an inventory or a branch. */
 export declare const OMIT: Set<string>;
 /** @returns the lowercase hexadecimal SHA-256 of `data`. */
@@ -34,14 +34,23 @@ export declare function jsonEqual(a: unknown, b: unknown): boolean;
 export declare function isContained(root: string, target: string): boolean;
 /** @returns the path relative to `root`, using POSIX separators. */
 export declare function relativePosix(root: string, target: string): string;
+/** Manifest value prefix for a symlink: `symlink:<link text>`. */
+export declare const SYMLINK = "symlink:";
+/** @returns whether a manifest value records a symlink rather than a content hash. */
+export declare function isLinkEntry(value: string | undefined): boolean;
 /**
  * Snapshot inventory: relative POSIX path -> SHA-256 for every regular,
- * non-omitted file. Symlinks and non-regular entries are rejected instead of
- * being followed, so a snapshot never captures bytes outside the workspace.
+ * non-omitted file, and `symlink:<link text>` for every symlink. Links are
+ * recorded, never followed, so a snapshot never captures bytes outside the
+ * workspace. Other non-regular entries are rejected.
  */
 export declare function inventory(root: string): Promise<Record<string, string>>;
 /** @returns total regular-file bytes represented by `files` under `root`. */
 export declare function inventoryBytes(root: string, files: Record<string, string>): Promise<number>;
+/** @returns the sorted paths whose manifest value differs between `before` and `after`. */
+export declare function changedPaths(before: Record<string, string>, after: Record<string, string>): string[];
+/** @returns the bytes of `count` full host copies of the tree at `path`. */
+export declare function hostCopyBytes(path: string, count: number): Promise<number>;
 /** @returns available bytes of the filesystem holding `path` (or its nearest parent). */
 export declare function freeBytes(path: string): Promise<number>;
 /**
@@ -82,13 +91,14 @@ export declare class SnapshotBackend implements WorkspaceBackend {
     fork(parent: WorkspaceState, id: string): Promise<WorkspaceState>;
     commit(): Promise<void>;
     release(): Promise<void>;
+    estimateForkBytes(parent: WorkspaceState, count: number): Promise<number>;
     retainCompletedState(row: TrajectoryRow): Promise<string>;
     restoreCompletedState(checkpoint: string, failedRow: TrajectoryRow): Promise<TrajectoryRow>;
 }
 /** Sanitize a value into a Docker/LayerFS-safe name fragment. */
 export declare function branchSafe(value: unknown, max?: number): string;
 /**
- * Whether `fs.read` refused a file because it is not UTF-8 text.
+ * Whether `fs.read` refused a file because it is not UTF-8 text (`Binary`).
  *
  * A binary adopted file has no text representation to stage, but it is not a
  * lost file: `workspace.exec` can copy the exact bytes, or the file is reported
@@ -96,21 +106,17 @@ export declare function branchSafe(value: unknown, max?: number): string;
  */
 export declare function isSkippableAdoptedFile(error: unknown): boolean;
 /**
- * Whether a commit/unmount refusal only means the mount is behind its branch.
+ * Whether a commit/unmount refusal of a staged mount only means its overlay
+ * differs from the branch it was published to.
  *
- * `fs.apply` creates a commit on the branch, so right after publishing the
- * mount handle is one commit behind (`headMovedSinceMount`) or its overlay
- * necessarily differs (`Dirty`); the bytes are already safe on the branch.
+ * `fs.apply` writes the branch directly, so the mount's own overlay then
+ * disagrees with the moved head: `workspace.commit` refuses with `Conflict`
+ * and `workspace.unmount` with `Dirty`. The bytes are already on the branch.
  */
 export declare function isStaleMountRefusal(error: unknown): boolean;
 /**
- * Whether a refusal means the LayerFS project does not exist yet or its `main`
- * branch carries no usable state, so `project.init(source)` can recover.
- *
- * The live and simulated bindings use the same codes (`NoSuchProject`,
- * `NoSuchBranch`, `NoSuchCommit`); message hints cover SDK versions that wrap
- * the refusal. Codes that mean "the project is there but unusable" are never
- * treated as missing.
+ * Whether a refusal means the LayerFS project or its `main` branch does not
+ * exist yet, so `project.init(source)` can recover.
  */
 export declare function isMissingProjectOrMain(error: unknown): boolean;
 /**
@@ -237,14 +243,36 @@ export declare class LayerFSBackend implements WorkspaceBackend {
     fork(parent: WorkspaceState, id: string): Promise<WorkspaceState>;
     adopt(branch: string, id: string): Promise<WorkspaceState>;
     /**
-     * Fold changes made inside a live Sandbox mount back into the host staging
-     * copy before it is evaluated.
+     * Settle a staged branch's two writable views before evaluation.
      *
-     * A worker calls `bash` inside `/workspaces/<n>`; those edits stay in the
-     * Sandbox overlay until they are committed. Host edits take precedence: if
-     * the staging directory changed, `commit()` is the writer and this returns.
+     * The host staging copy is the authoritative writer; the Sandbox mount at
+     * `/workspaces/<n>` is for execution. A worker that edits the Sandbox anyway
+     * leaves changes in its overlay. This commits that overlay into the branch
+     * history first, whatever the host did, so it is never dropped, then compares
+     * both sides with the inventory the staging copy started from:
+     *
+     * - neither changed: `unchanged`
+     * - Sandbox only: fold the branch into the host copy, `folded`
+     * - host only: `host`; `commit()` publishes it
+     * - both: `conflict`; the host diff is still published by `commit()`, so
+     *   both sides stay in the branch history, and the row is invalid because
+     *   the evaluated host copy is not the branch state.
      */
-    reconcile(state: WorkspaceState): Promise<void>;
+    reconcile(state: WorkspaceState): Promise<Reconciliation>;
+    /**
+     * Commit a dirty Sandbox overlay and report what the branch now holds that
+     * the staging copy did not start from.
+     *
+     * @returns null when the overlay is clean and the branch head has not moved;
+     *   otherwise the changed paths and a materialized copy of the branch (the
+     *   caller removes `directory`).
+     */
+    private sandboxChanges;
+    /**
+     * A host-accessible LayerFS mount is copy-on-write and adds nothing up
+     * front; a staged mount (or a non-LayerFS parent) is copied to the host.
+     */
+    estimateForkBytes(parent: WorkspaceState, count: number): Promise<number>;
     commit(state: WorkspaceState, { message }?: {
         message?: string;
     }): Promise<void>;
@@ -274,7 +302,8 @@ export declare class WorkspaceManager implements WorkspaceManagerLike {
     }): Promise<void>;
     retainCompletedState(row: TrajectoryRow): Promise<string>;
     restoreCompletedState(checkpoint: string, failedRow: TrajectoryRow): Promise<TrajectoryRow>;
-    reconcile(state: WorkspaceState): Promise<void>;
+    reconcile(state: WorkspaceState): Promise<Reconciliation>;
+    estimateForkBytes(parent: WorkspaceState, count: number): Promise<number>;
     close(): Promise<void>;
 }
 /** Every `DSH_LAYERFS_*` name a `dsh` session may publish. */
@@ -310,11 +339,12 @@ export declare const LAYERFS_TRACE_KEYS: readonly ['DSH_LAYERFS_TRACE', 'DSH_LAY
  */
 export declare function withoutLayerfsTrace(environment: Record<string, string>): Record<string, string>;
 /**
- * Resolve the environment contributed by `ctx.shellEnv` (the same service
- * `@dsh-layerfs/host` binds). Host versions expose contributors, `resolve`,
- * `snapshot` or a plain `env`; all shapes are handled and merged.
+ * The environment `ctx.shellEnv` (`ShellEnvRegistry.collect`) gives a shell
+ * call of `agent`. `@dsh-layerfs/host` contributes the session's
+ * `DSH_LAYERFS_*` binding here. Contributors read
+ * `execution.rootCallId ?? execution.callId`, so both are set.
  */
-export declare function resolveShellEnvironment(ctx: Pick<PluginContext, 'shellEnv' | 'get'>, agent?: unknown): Promise<Record<string, string>>;
+export declare function resolveShellEnvironment(shellEnv: ShellEnvService | undefined, agent?: unknown): Record<string, string>;
 /** The synthetic tool-call id used for a session-wide environment snapshot. */
 export declare const SHELL_ENV_CALL_ID = "auto-research-env";
 /**
@@ -367,50 +397,19 @@ export declare function loadLayerfs(settings: LayerFSSettings): Promise<{
     activate: () => void;
 }>;
 /**
- * Concrete `WorkspaceBackendFactory` for full-copy snapshot branches.
- */
-export declare class SnapshotWorkspaceFactory implements WorkspaceBackendFactory {
-    readonly name = "snapshot";
-    create({ output, runId }: WorkspaceBackendCreateOptions): Promise<SnapshotBackend>;
-}
-/**
  * Concrete `WorkspaceBackendFactory` for LayerFS copy-on-write branches.
  *
- * Returns `null` when LayerFS is explicitly opted out (`config.layerfs: false`),
- * when another backend is explicitly requested, or when no LayerFS project/SDK
- * is bound and `config.workspaceBackend` is not `'layerfs'`.
+ * Returns `null` when LayerFS is opted out (`config.layerfs: false`) or no
+ * LayerFS project/SDK is bound.
  */
 export declare class LayerFSWorkspaceFactory implements WorkspaceBackendFactory {
     readonly name = "layerfs";
+    readonly priority = 100;
     create({ output, runId, config, env, layerfs, }: WorkspaceBackendCreateOptions): Promise<LayerFSBackend | null>;
 }
 /**
- * Cordis plugin that registers `SnapshotWorkspaceFactory` on `ctx.autoResearch`.
- */
-export declare const snapshotWorkspacePlugin: Readonly<{
-    name: "dsh-auto-research-workspace-snapshot";
-    inject: readonly ["autoResearch"];
-    apply(ctx: PluginContext): void;
-}>;
-/**
- * Cordis plugin that registers `LayerFSWorkspaceFactory` on `ctx.autoResearch`.
- */
-export declare const layerfsWorkspacePlugin: Readonly<{
-    name: "dsh-auto-research-workspace-layerfs";
-    inject: readonly ["autoResearch"];
-    apply(ctx: PluginContext): void;
-}>;
-/**
- * Build the workspace manager from registered `WorkspaceBackendFactory` providers
- * (defaulting to `[LayerFSWorkspaceFactory, SnapshotWorkspaceFactory]`), preferring
- * LayerFS when bound.
- */
-export declare function createWorkspaceManager({ output, runId, config, env, layerfs, backends, }: WorkspaceBackendCreateOptions & {
-    backends?: WorkspaceBackendFactory[];
-}): Promise<WorkspaceManager>;
-/**
  * Resolve the optional compact research seed named by `plan.workspace`.
- * It must be a regular, symlink-free subdirectory inside `root`.
+ * It must resolve to a directory strictly inside `root`.
  */
 export declare function selectPlanWorkspace(root: string, plan: {
     workspace?: unknown;

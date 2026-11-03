@@ -5,25 +5,16 @@
  * `start()` before publication; after the handle is returned, every terminal
  * outcome settles through `result` (never a rejection), as the seam requires.
  */
-import type { AutoResearchService, Config, PluginContext, ResearchPlanInput, ResolvedConfig, SubagentProvider, SubagentRun, SubagentStartRequest, WorkspaceBackendFactory } from './types.js';
+import type { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js';
+import type { Config, ProviderContext, ResearchPlanInput, ResolvedConfig, SubagentProvider, SubagentRun, SubagentStartRequest } from './types.js';
 /** Out-of-process capability advertisement: forwards child `agentOptions` to worker branches. */
 export declare const NO_START_CAPABILITIES: Record<string, unknown>;
 /** Normalize plugin config (also used by the Cordis standard schema). */
 export declare function resolveConfig(input?: unknown): ResolvedConfig;
-/** Extract the standalone user text from a `ContentBlock[]` or string. */
-export declare function extractPromptText(prompt: unknown): string;
-/**
- * Find a plan object embedded in a delegation prompt: a fenced JSON block, a
- * `PLAN_JSON:` line, or a prompt that is itself the JSON object.
- */
-export declare function parsePlanFromPrompt(text: string): ResearchPlanInput | null;
-/**
- * Resolve the plan from config, the plan file, or the delegation prompt.
- */
-export declare function resolvePlan({ cwd, config, promptText, }: {
+/** The plan from `config.plan`, else the file at `config.planPath`. */
+export declare function resolvePlan({ cwd, config, }: {
     cwd: string;
     config: ResolvedConfig;
-    promptText: string;
 }): Promise<{
     plan: ResearchPlanInput;
     source: string;
@@ -40,29 +31,14 @@ export interface RunnerLock {
     release: () => Promise<void>;
 }
 /**
- * Refuse a runtime root that is a symlink escaping the workspace.
- *
- * `.auto-research-methods` holds every branch artifact and the runner lock, so
- * a planted symlink would redirect those writes outside the assigned
- * checkout. A missing runtime root is fine (it is created later).
+ * Acquire `<runtimeRoot>/runner.lock` so two batches on one checkout fail
+ * loud instead of racing on `LATEST.json`. The lock is created with `wx`; an
+ * existing lock whose pid is gone is removed and the create retried once.
  */
-export declare function assertRuntimeRootContained(workspaceRoot: string, runtimeRoot: string): Promise<void>;
-/**
- * Acquire `<runtimeRoot>/runner.lock` so two `subagent_auto_research`
- * invocations on one checkout fail loud instead of racing on `LATEST.json`.
- *
- * The payload is written to a unique sibling first and then hard-linked into
- * place, so a lock file is never observable empty or half-written. A stale
- * lock is reclaimed only when its owning PID is gone; an unparsable lock that
- * is younger than {@link LOCK_WRITE_GRACE_MS} is treated as live rather than
- * unlinked, which closes the remaining creation window.
- */
-export declare function acquireRunnerLock(runtimeRoot: string, runId: string, { cwd, pid, alive, now, writeGraceMs, }?: {
+export declare function acquireRunnerLock(runtimeRoot: string, runId: string, { cwd, pid, alive }?: {
     cwd?: string;
     pid?: number;
     alive?: (pid: number) => boolean;
-    now?: () => number;
-    writeGraceMs?: number;
 }): Promise<RunnerLock>;
 /** The worker environment keys this plugin owns in a `dsh` shell registry. */
 export declare const AUTO_RESEARCH_ENV_KEYS: readonly ['DSH_AUTO_RESEARCH_WORKER', 'DSH_AUTO_RESEARCH_BRANCH', 'DSH_AUTO_RESEARCH_CHECKOUT', 'DSH_AUTO_RESEARCH_SANDBOX_PATH'];
@@ -87,6 +63,8 @@ export interface WorkerEnvRegistration {
 export declare class WorkerEnvRegistry {
     private readonly entries;
     private nextKey;
+    /** Called whenever a worker starts or stops (the skill catalog depends on it). */
+    onChange: (() => void) | null;
     private readonly resolveCwd;
     constructor(options?: {
         /** Resolve the per-session assigned checkout (`ctx.workingDirectory.get`). */
@@ -95,6 +73,8 @@ export declare class WorkerEnvRegistry {
     get size(): number;
     /** @returns every checkout that currently has a live worker. */
     checkouts(): string[];
+    /** Whether `sessionId` is the child session of a live worker. */
+    hasChildSession(sessionId: string): boolean;
     /** Whether `path` is one of the live worker checkouts (or inside it). */
     ownsCheckout(path: string): boolean;
     register({ id, checkout, parentSessionId, childSessionId, env, }: {
@@ -111,8 +91,6 @@ export declare class WorkerEnvRegistry {
 }
 /** The runtime session id of a live agent, when the host exposes one. */
 export declare function sessionIdOf(agent: unknown): string | null;
-/** Whether `path` sits inside a `.auto-research-methods/runs/` runtime tree. */
-export declare function isInsideRuntimeRuns(path: string): boolean;
 /** `dsh`-owned names that a plugin contributor may never claim. */
 export declare const DSH_RESERVED_ENV_KEYS: Set<string>;
 /**
@@ -127,29 +105,23 @@ export declare const DSH_RESERVED_ENV_KEYS: Set<string>;
 export declare function declaredWorkerEnvKeys(workerEnv?: Record<string, unknown> | null): Record<string, {
     description: string;
 }>;
-/**
- * Concrete registry implementation of `ctx.autoResearch` (`AutoResearchService`).
- *
- * Pre-seeded with `[LayerFSWorkspaceFactory, SnapshotWorkspaceFactory]`, while
- * allowing workspace backend plugins (`layerfsWorkspacePlugin`,
- * `snapshotWorkspacePlugin`, or custom workspace plugins) to register or
- * override backends.
- */
-export declare class AutoResearchServiceImpl implements AutoResearchService {
-    private readonly backends;
-    registerWorkspaceBackend(factory: WorkspaceBackendFactory): () => void;
-    getWorkspaceBackend(name: string): WorkspaceBackendFactory | undefined;
-    listWorkspaceBackends(): WorkspaceBackendFactory[];
+export interface ProviderOptions {
+    ctx: ProviderContext;
+    config?: Config;
+    workspaces: ResearchWorkspaceRegistry;
+    executors: ResearchExecutorRegistry;
 }
 /** One provider instance, normally created by the Cordis plugin entry. */
 export declare class AutoResearchProvider implements SubagentProvider {
-    readonly ctx: PluginContext;
+    readonly ctx: ProviderContext;
     readonly config: ResolvedConfig;
     readonly name: string;
     readonly capabilities: Record<string, unknown>;
     readonly inheritsParentContext: boolean;
-    /** Capability registry exposed on `ctx.autoResearch`. */
-    readonly service: AutoResearchService;
+    /** Workspace backends registered by `ctx.researchWorkspace` plugins. */
+    readonly workspaces: ResearchWorkspaceRegistry;
+    /** Evaluator executors registered by `ctx.researchExecutor` plugins. */
+    readonly executors: ResearchExecutorRegistry;
     /** Branch environments of the workers that are running right now. */
     readonly workerEnvs: WorkerEnvRegistry;
     /**
@@ -163,27 +135,7 @@ export declare class AutoResearchProvider implements SubagentProvider {
     readonly workerEnvKeys: Readonly<Record<string, {
         description: string;
     }>>;
-    /** Batches whose runner is still alive (used to reject recursive delegation). */
-    activeBatches: number;
-    private disposeShellEnv;
-    constructor({ ctx, config }: {
-        ctx: PluginContext;
-        config?: Config;
-    });
-    /** The `ctx.subprocess` service (`@deepseek-ai/dsh-subprocess`), read safely. */
-    private subprocessService;
-    /** Existing `ctx.autoResearch` service if already provided on `ctx`. */
-    private autoResearchService;
-    /** Release the shell-env registration (the Cordis fiber normally owns it). */
-    dispose(): void;
-    /** The `ctx.shellEnv` service, read without tripping Cordis's inject guard. */
-    private shellEnvService;
-    /**
-     * Register the branch `shellEnv` contributor once a `dsh` shell registry is
-     * available. The registry may be injected after this provider is built, so
-     * `ctx.inject` is used when the service is not there yet.
-     */
-    private installShellEnvContributor;
+    constructor({ ctx, config, workspaces, executors }: ProviderOptions);
     /** The contributor handed to `ctx.shellEnv.register`. */
     workerEnvContributor(): {
         name: string;
@@ -199,22 +151,17 @@ export declare class AutoResearchProvider implements SubagentProvider {
      * {@link WorkerEnvRegistry.match}); a coordinator's call gets nothing.
      */
     workerEnvFor(execution: unknown): Record<string, string>;
-    private providerInfo;
     private isRecursiveWorker;
     /**
      * Refuse `subagent_auto_research` from a branch worker.
      *
      * A worker already owns one branch of a running batch: delegating another
-     * batch from inside it would recurse forever, race the runner lock of its own
-     * checkout, and corrupt `plan.json`. A delegation whose cwd is a live worker
-     * checkout or any `runs/` runtime tree is rejected the same way.
+     * batch from inside it would recurse and race the runner lock. Two signals,
+     * either sufficient: the cwd is inside a checkout carrying the runner's
+     * `.auto-research-methods/WORKER.json` marker, or the caller's session is a
+     * live worker's child session.
      */
     private assertNotRecursive;
-    /**
-     * The assigned checkout of one session, when the host exposes
-     * `ctx.workingDirectory.get(session)`.
-     */
-    private sessionWorkingDirectory;
     /**
      * Choose the worker provider. Explicit configuration wins (after validation);
      * a plan-level override is honored when registered; otherwise external/non-inheriting
@@ -227,12 +174,14 @@ export declare class AutoResearchProvider implements SubagentProvider {
      * model ID or display name (e.g. `glm-5.3-flash` or `GLM Flash`) without
      * hardcoding the internal provider adapter ID.
      */
+    /**
+     * Resolve the worker model against the live `ctx.llm` catalog: an exact,
+     * case-insensitive match of a model `id` or `name`, in the named provider,
+     * else the parent's provider first, then every other provider.
+     */
     private resolveLiveWorkerAgentOptions;
     start(request: SubagentStartRequest): Promise<SubagentRun>;
 }
 /** @returns a provider for the Cordis entry point. */
-export declare function createProvider(options: {
-    ctx: PluginContext;
-    config?: Config;
-}): AutoResearchProvider;
+export declare function createProvider(options: ProviderOptions): AutoResearchProvider;
 //# sourceMappingURL=provider.d.ts.map

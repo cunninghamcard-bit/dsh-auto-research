@@ -8,7 +8,6 @@ import {
   WorkspaceManager,
   layerfsEnvironment,
   resolveLayerfsConfig,
-  resolveShellEnvironment,
   withBusyRetry,
 } from '../lib/layerfs-workspace.js'
 import { setState, withTemp, writeWorkspace } from './helpers.ts'
@@ -217,6 +216,15 @@ describe('Sandbox-internal mounting bridge', () => {
       assert.equal(state.staging, true)
       assert.equal(await readFile(join(state.path, 'state.json'), 'utf8'), '{"score":4}\n')
       assert.equal(await readFile(join(state.path, 'RESEARCH_CONTEXT', 'topic__m__r__verified.md'), 'utf8'), '# topic\n')
+    })
+  })
+
+  it('refuses to adopt a Sandbox branch it cannot list', async () => {
+    await withTemp(async root => {
+      const client = sandboxClient([])
+      delete client.fs.list
+      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'run-4', retryBaseDelayMs: 1 })
+      await assert.rejects(backend.adopt('ar-run-1-leader', 'initial'), /has no fs\.list\/fs\.read/)
     })
   })
 
@@ -435,28 +443,6 @@ describe('LayerFS project initialization', () => {
 })
 
 describe('session environment resolution', () => {
-  it('merges ctx.shellEnv contributors, resolve(), env, and ctx.get fallback', async () => {
-    const service = {
-      env: { A: '1', skip: 42 },
-      async resolve() { return { B: '2' } },
-      contributors: [
-        () => ({ C: '3' }),
-        { contribute: () => ({ D: '4' }) },
-        { env: { E: '5' } },
-        () => { throw new Error('unavailable') },
-      ],
-    }
-    const merged = await resolveShellEnvironment({ shellEnv: service })
-    assert.deepEqual(merged, { A: '1', B: '2', C: '3', D: '4', E: '5' })
-    const viaGet = await resolveShellEnvironment({ get: name => name === 'shellEnv' ? { env: { F: '6' } } : null })
-    assert.deepEqual(viaGet, { F: '6' })
-    const viaCollect = await resolveShellEnvironment({
-      shellEnv: { collect: execution => ({ G: '7', agent: String((execution.agent as any)?.id ?? '') }) },
-    }, { id: 'parent-1' })
-    assert.deepEqual(viaCollect, { G: '7', agent: 'parent-1' })
-    assert.deepEqual(await resolveShellEnvironment({}), {})
-  })
-
   it('includes every DSH_LAYERFS_* name in the worker environment', () => {
     const settings = resolveLayerfsConfig({
       DSH_LAYERFS_PROJECT: 'project',

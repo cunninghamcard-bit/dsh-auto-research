@@ -1,17 +1,16 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, readlink, stat, symlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   ResearchStoppedError,
   Runner,
   normalizeOptions,
-  providerOutcome,
   validatePlan,
 } from '../lib/runner.js'
-import { createWorkspaceManager, inventory } from '../lib/layerfs-workspace.js'
-import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
+import { inventory } from '../lib/layerfs-workspace.js'
+import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, snapshotManager, localExecutor } from './helpers.ts'
 
 const sha256 = (data: any) => createHash('sha256').update(data).digest('hex')
 
@@ -63,7 +62,7 @@ async function setup(root: string, {
   const plan = planFor(root, extraPlan)
   Object.assign(plan.options, options)
   const output = join(root, 'out')
-  const manager = await createWorkspaceManager({ output, runId: 'run', env: {} })
+  const manager = snapshotManager({ output, runId: 'run', env: {} })
   const subagents = fakeSubagents(worker ?? (async (spec: any, index: number) => {
     const target = spec.request.cwd
     await setState(target, { score: 2 + index, metrics: { score: 2 + index } })
@@ -77,6 +76,7 @@ async function setup(root: string, {
     originalManifest: await inventory(workspace),
     selectionFile: join(root, '.auto-research-methods', 'LATEST.json'),
     deps: {
+      executor: localExecutor,
       subagents,
       workspaceManager: manager,
       parent: { id: 'parent' },
@@ -160,18 +160,6 @@ describe('normalizeOptions / validatePlan', () => {
     assert.throws(() => validatePlan({ ...base, portfolio_size: 1 }, { ...options, branches: 2, rsiTop: true, metric_subset: 1, stall_seconds: 1, meaningful_gain: 0 } as any), /RSI/)
   })
 
-  it('ports provider_outcome diagnostics', () => {
-    assert.deepEqual(providerOutcome([{ type: 'thread.started', thread_id: 't' }, { type: 'turn.completed' }], 0, false), {
-      completed: true,
-      provider_session: 't',
-      terminal: 'completed',
-      diagnostic_count: 0,
-    })
-    assert.equal(providerOutcome([{ type: 'turn.failed' }], 0, false).completed, false)
-    assert.equal(providerOutcome([{ type: 'result', subtype: 'success' }], 0, false).completed, true)
-    assert.equal(providerOutcome([{ type: 'result', subtype: 'success', is_error: true }], 0, false).completed, false)
-    assert.equal(providerOutcome([{ type: 'error' }], 1, false).diagnostic_count, 1)
-  })
 })
 
 describe('Runner batches', () => {
@@ -187,12 +175,27 @@ describe('Runner batches', () => {
       assert.equal(subagents.calls[0].provider, 'worker')
       assert.equal(subagents.calls[0].delivery, 'caller')
       assert.match(subagents.calls[0].request.prompt[0].text, /Objective: Improve the fixture score/)
-      assert.match(subagents.calls[0].request.prompt[0].text, /Do not spawn agents/)
+      assert.match(subagents.calls[0].request.prompt[0].text, /load the skill `auto-research-worker`/)
+      assert.equal(subagents.calls[0].branch.branch_id, 'round-1-continue-1')
       assert.equal(JSON.parse(await readFile(join(output, 'RESULT.json'), 'utf8')).leader.id, 'round-1-continue-1')
       assert.equal(JSON.parse(await readFile(join(output, 'LEADER.json'), 'utf8')).id, 'round-1-continue-1')
       assert.equal(JSON.parse(await readFile(join(output, 'SELECTIONS.json'), 'utf8')).length, 1)
       assert.equal((await stat(join(output, 'DASHBOARD.json'))).isFile(), true)
       assert.equal(JSON.parse(await readFile(join(root, '.auto-research-methods', 'LATEST.json'), 'utf8')).leader_workspace, result.leader.workspace)
+      await runner.releaseAll()
+    })
+  })
+
+  it('completes a batch on a workspace with node_modules/.bin symlinks', async () => {
+    await withTemp(async root => {
+      const { runner, workspace } = await setup(root, { options: { forkAndFlush: true } })
+      await mkdir(join(workspace, 'pkg'), { recursive: true })
+      await writeFile(join(workspace, 'pkg', 'cli.js'), 'run\n')
+      await mkdir(join(workspace, 'node_modules', '.bin'), { recursive: true })
+      await symlink('../../pkg/cli.js', join(workspace, 'node_modules', '.bin', 'cli'))
+      const result = await runner.run()
+      assert.equal(result.status, 'COMPLETED')
+      assert.equal(await readlink(join(result.leader.workspace, 'node_modules', '.bin', 'cli')), '../../pkg/cli.js')
       await runner.releaseAll()
     })
   })
@@ -211,41 +214,101 @@ describe('Runner batches', () => {
     })
   })
 
-  it('triggers an RSI-top explore cohort on a stall and enforces portfolios', async () => {
+  it('triggers an RSI-top explore cohort once phase work without gain reaches the stall', async () => {
     await withTemp(async root => {
       let tick = 1000
       const clock = { now: () => { tick += 25; return tick }, sleep: async (ms: number) => { tick += ms } }
       const worker = async (spec: any, index: number) => {
-        const text = spec.request.prompt[0].text
-        await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index, progress: 2 + index } })
-        if (text.includes('RSI-top dashboard view')) await writePortfolio(spec.request.cwd, 2)
+        // The first continuation makes no gain, so its phase time accrues.
+        const score = index === 0 ? 1 : 2 + index
+        await setState(spec.request.cwd, { score, metrics: { score, progress: score } })
+        if (spec.branch.rsi_top) await writePortfolio(spec.request.cwd, 2, 'round-1-continue-1')
         return { output: [], stopReason: 'completed' }
       }
       const { runner, subagents } = await setup(root, {
         clock,
         worker,
         state: { score: 1, metrics: { score: 1, progress: 0 } },
-        options: { rsiTop: true, forkAndFlush: false },
+        options: { rsiTop: true, forkAndFlush: false, rounds: 2 },
         extraPlan: { stall_seconds: 0.001, metrics: [{ name: 'score' }, { name: 'progress', definition: 'p' }], metric_subset: 1 },
       })
       const result = await runner.run()
-      assert.equal(subagents.calls.length, 3)
-      assert.match(subagents.calls[0].request.prompt[0].text, /RSI-top dashboard view/)
+      assert.equal(subagents.calls.length, 4)
+      assert.equal(subagents.calls[0].branch.rsi_top, null)
+      assert.equal(subagents.calls[1].branch.rsi_top.portfolio_size, 2)
       const dashboard = JSON.parse(await readFile(join(runner.output, 'DASHBOARD.json'), 'utf8'))
       const exploreRows = dashboard.trajectories.filter((row: any) => row.phase === 'explore')
       assert.equal(exploreRows.length, 2)
       for (const row of exploreRows) assert.match(row.portfolio_sha256, /^[0-9a-f]{64}$/)
-      assert.equal(result.leader.id, 'round-1-continue-1')
+      assert.equal(result.leader.id, 'round-2-continue-1')
       await runner.releaseAll()
+    })
+  })
+
+  it('carries the stall frontier across batches through LATEST.json', async () => {
+    await withTemp(async root => {
+      let tick = 1000
+      const clock = { now: () => { tick += 25; return tick }, sleep: async (ms: number) => { tick += ms } }
+      const flat = async (spec: any) => {
+        await setState(spec.request.cwd, { score: 1, metrics: { score: 1 } })
+        if (spec.branch.rsi_top) {
+          await writePortfolio(spec.request.cwd, 2)
+        }
+        return { output: [], stopReason: 'completed' }
+      }
+      const first = await setup(root, {
+        clock,
+        worker: flat,
+        options: { rsiTop: true, forkAndFlush: false, rounds: 1 },
+        extraPlan: { stall_seconds: 0.001 },
+      })
+      await first.runner.run()
+      await first.runner.releaseAll()
+      // One batch with one round can never explore on its own.
+      assert.equal(first.subagents.calls.length, 1)
+      const latest = JSON.parse(await readFile(join(root, '.auto-research-methods', 'LATEST.json'), 'utf8'))
+      assert.equal(latest.frontier.evaluator_sha256, first.runner.evaluator.hash)
+      assert.equal(latest.frontier.anchor_score, '1')
+      assert.ok(latest.frontier.stalled_work_seconds >= 0.001)
+
+      const runBatch = async (frontier: any, output: string) => {
+        const manager = snapshotManager({ output, runId: 'run2', env: {} })
+        const subagents = fakeSubagents(flat)
+        const runner = new Runner({
+          plan: first.plan,
+          workspace: first.workspace,
+          output,
+          frontier,
+          deps: {
+            executor: localExecutor,
+            subagents,
+            workspaceManager: manager,
+            parent: { id: 'parent' },
+            workerProvider: 'worker',
+            clock,
+            runId: 'run2',
+            logger: { info() {}, warn() {} },
+          },
+        })
+        await runner.run()
+        await runner.releaseAll()
+        return subagents
+      }
+      const resumed = await runBatch(latest.frontier, join(root, 'out2'))
+      assert.equal(resumed.calls.length, 3)
+      assert.ok(resumed.calls[0].branch.rsi_top)
+
+      // A frontier frozen against another evaluator is discarded.
+      const foreign = await runBatch({ ...latest.frontier, evaluator_sha256: 'other' }, join(root, 'out3'))
+      assert.equal(foreign.calls.length, 1)
     })
   })
 
   it('rejects an invalid explore portfolio without promoting it', async () => {
     await withTemp(async root => {
       const worker = async (spec: any, index: number) => {
-        const text = spec.request.prompt[0].text
         await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index, progress: 2 + index } })
-        if (text.includes('RSI-top dashboard view')) {
+        if (spec.branch.rsi_top) {
           await writeFile(join(spec.request.cwd, 'PORTFOLIO.json'), '[]')
         }
         return { output: [], stopReason: 'completed' }
@@ -270,7 +333,6 @@ describe('Runner batches', () => {
       const { runner, subagents } = await setup(root, { state: { valid: false, score: 0, reason: 'fixture rejects baseline' } })
       await assert.rejects(runner.run(), /Initial candidate failed frozen evaluation/)
       assert.equal(subagents.calls.length, 0)
-      assert.equal(JSON.parse(await readFile(join(runner.output, 'RESULT.json'), 'utf8')).status, 'FAILED')
       await runner.releaseAll()
     })
   })
@@ -370,6 +432,33 @@ describe('cooperative cohorts', () => {
       const reviewed = collaboration.epochs.slice(1).flatMap((epoch: any) => epoch.rows)
       assert.ok(reviewed.some((row: any) => row.peer_review_sha256))
       assert.ok(collaboration.epochs[0].rows.every((row: any) => !row.peer_review_sha256))
+      await runner.releaseAll()
+    })
+  })
+
+  it('runs several epochs when the worker provider reports no child session', async () => {
+    await withTemp(async root => {
+      const worker = async (spec: any, index: number) => {
+        await setState(spec.request.cwd, { score: 2 + index, metrics: { score: 2 + index } })
+        await writeCheckpoint(spec.request.cwd, index)
+        return { output: [], stopReason: 'completed' }
+      }
+      const { runner, subagents } = await setup(root, {
+        worker,
+        options: {
+          shareContext: true,
+          forkAndFlush: true,
+          exploitationMinutes: 0.1,
+          sharingIntervalMinutes: 0.02,
+        },
+        extraPlan: { evaluation_seconds: 0.5 },
+      })
+      const start = subagents.startActivation
+      subagents.startActivation = async (spec: any) => ({ ...(await start(spec)), childId: null })
+      await runner.run()
+      const collaboration = JSON.parse(await readFile(join(runner.output, 'round-1-explore-COLLABORATION.json'), 'utf8'))
+      assert.ok(collaboration.epochs.length >= 2)
+      assert.ok(collaboration.epochs[0].rows.every((row: any) => row.provider_session === null))
       await runner.releaseAll()
     })
   })

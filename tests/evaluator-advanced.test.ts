@@ -6,13 +6,13 @@ import {
   FrozenEvaluator,
   runEvaluatorProcess,
 } from '../lib/evaluator.js'
-import { withTemp, writeWorkspace } from './helpers.ts'
+import { withTemp, writeWorkspace, localExecutor } from './helpers.ts'
 
 describe('extensionless evaluator classification', () => {
   async function freeze(root: string, body: string, name = 'evaluator'): Promise<any> {
     const source = join(root, name)
     await fsp.writeFile(source, body)
-    const evaluator = new FrozenEvaluator({
+    const evaluator = new FrozenEvaluator({ executor: localExecutor,
       plan: { evaluator: source, evaluation_seconds: 1, metrics: [] },
       output: join(root, 'out'),
     })
@@ -118,7 +118,7 @@ describe('frozen evaluator edge cases', () => {
     await withTemp(async root => {
       const source = join(root, 'evaluator.mjs')
       await fsp.writeFile(source, 'process.stdout.write("{}")\n')
-      const evaluator = new FrozenEvaluator({
+      const evaluator = new FrozenEvaluator({ executor: localExecutor,
         plan: { evaluator: source, evaluation_seconds: 1, metrics: [], evaluator_interpreter: ['/custom/python'] },
         output: join(root, 'out'),
       })
@@ -135,7 +135,7 @@ describe('frozen evaluator edge cases', () => {
       await fsp.writeFile(source, 'process.stdout.write("")\n')
       const workspace = join(root, 'workspace')
       await writeWorkspace(workspace)
-      const evaluator = new FrozenEvaluator({
+      const evaluator = new FrozenEvaluator({ executor: localExecutor,
         plan: { evaluator: source, evaluation_seconds: 1, metrics: [] },
         output: join(root, 'out'),
       })

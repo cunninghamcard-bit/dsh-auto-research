@@ -19,7 +19,6 @@ import {
   WorkerEnvRegistry,
   acquireRunnerLock,
   declaredWorkerEnvKeys,
-  isInsideRuntimeRuns,
   resolveConfig,
   sessionIdOf,
 } from '../lib/provider.js'
@@ -32,9 +31,9 @@ import {
 import {
   LAYERFS_ENV_KEYS,
   LayerFSBackend,
+  SnapshotBackend,
   applyEnvironmentPatch,
   applyLayerfsEnvironment,
-  createWorkspaceManager,
   inventory,
   jsonDigest,
   layerfsEnvironment,
@@ -49,7 +48,7 @@ import {
   writeJsonAtomic,
 } from '../lib/layerfs-workspace.js'
 import { FrozenEvaluator, runEvaluatorProcess, scoreValue } from '../lib/evaluator.js'
-import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
+import { fakeClock, fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, testWorkspaces, snapshotManager, testExecutors, localExecutor } from './helpers.ts'
 
 const SANDBOX_PATH = `/workspaces/regression-${process.pid}`
 
@@ -94,7 +93,7 @@ async function setupRunner(root: string, {
   const plan = planFor(root, extraPlan)
   Object.assign(plan.options, options)
   const output = join(root, 'out')
-  const workspaceManager = manager ?? await createWorkspaceManager({ output, runId: 'run', env: {} })
+  const workspaceManager = manager ?? snapshotManager({ output, runId: 'run', env: {} })
   const service = subagents ?? fakeSubagents(worker)
   const runner = new Runner({
     config: {},
@@ -104,6 +103,7 @@ async function setupRunner(root: string, {
     originalManifest: await inventory(workspace),
     selectionFile: join(root, '.auto-research-methods', 'LATEST.json'),
     deps: {
+      executor: localExecutor,
       subagents: service,
       workspaceManager,
       parent: { id: 'parent' },
@@ -198,7 +198,7 @@ async function providerFixture(root: string, { config = {}, shellEnv = null, pla
   })
   const ctx: any = { subagents, logger: { info() {}, warn() {} } }
   if (shellEnv) ctx.shellEnv = shellEnv
-  const provider = new AutoResearchProvider({
+  const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
     ctx,
     config: {
       workerProvider: 'worker',
@@ -230,7 +230,8 @@ export class LayerFS {
         const { cwd, provider, subagents } = await providerFixture(root, {
           config: { layerfs: false },
           shellEnv: {
-            async resolve() {
+            register: () => () => {},
+            collect() {
               return {
                 DSH_LAYERFS_PROJECT: 'ambient-project',
                 DSH_LAYERFS_SDK: sdk,
@@ -245,7 +246,7 @@ export class LayerFS {
         const runs = await readdir(join(cwd, '.auto-research-methods', 'runs'))
         const config = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'runs', runs[0]!, 'CONFIG.json'), 'utf8'))
         assert.equal(config.layerfs, false)
-        assert.doesNotMatch(subagents.calls[0].request.prompt[0].text, /DSH_LAYERFS_PROJECT/)
+        assert.equal(subagents.calls[0].branch.environment.includes('DSH_LAYERFS_PROJECT'), false)
         const latest = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'LATEST.json'), 'utf8'))
         assert.equal(latest.leader_branch, null, 'the snapshot backend has no LayerFS branch')
         await handle.dispose()
@@ -257,22 +258,10 @@ export class LayerFS {
       }
     }
   })
-
-  it('createWorkspaceManager prefers the false opt-out over a bound environment', async () => {
-    await withTemp(async root => {
-      const manager = await createWorkspaceManager({
-        output: join(root, 'out'),
-        runId: 'r',
-        config: { layerfs: false },
-        env: { DSH_LAYERFS_PROJECT: 'p', DSH_LAYERFS_SDK: 'file:///sdk.js' },
-      })
-      assert.equal(manager.kind, 'snapshot')
-    })
-  })
 })
 
-describe('P1-2: atomic runner lock and runtime containment', () => {
-  it('never publishes a partially written lock and cleans its temp sibling', async () => {
+describe('P1-2: runner lock', () => {
+  it('writes the lock exclusively and removes it on release', async () => {
     await withTemp(async root => {
       const lock = await acquireRunnerLock(root, 'run-1', { pid: 111 })
       const names = await readdir(root)
@@ -285,41 +274,19 @@ describe('P1-2: atomic runner lock and runtime containment', () => {
     })
   })
 
-  it('treats a fresh unparsable lock as live and only reclaims an old one', async () => {
+  it('refuses an unparsable lock and leaves it for the user', async () => {
     await withTemp(async root => {
       const path = join(root, 'runner.lock')
       await writeFile(path, '')
       await assert.rejects(
-        acquireRunnerLock(root, 'run-2', { pid: 222, alive: () => false, writeGraceMs: 2000 }),
-        /starting for this checkout/,
+        acquireRunnerLock(root, 'run-2', { pid: 222, alive: () => false }),
+        /pid unknown; delete the file if no batch is running/,
       )
-      assert.equal(existsSync(path), true, 'the live-looking lock was not unlinked')
-      const old = new Date(Date.now() - 10000)
-      await utimes(path, old, old)
-      const lock = await acquireRunnerLock(root, 'run-3', { pid: 333, alive: () => false })
-      assert.equal(JSON.parse(await readFile(path, 'utf8')).runId, 'run-3')
-      await lock.release()
+      assert.equal(existsSync(path), true)
     })
   })
 
-  it('refuses a runtime root symlink that escapes the workspace', async () => {
-    await withTemp(async root => {
-      const cwd = join(root, 'repo')
-      await writeWorkspace(cwd, { score: 1, metrics: { score: 1 } })
-      await writeStateEvaluator(join(cwd, 'evaluator.mjs'))
-      const outside = join(root, 'outside')
-      await mkdir(outside, { recursive: true })
-      await symlink(outside, join(cwd, '.auto-research-methods'))
-      const { provider } = await providerFixture(root)
-      await assert.rejects(
-        provider.start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }),
-        /runtime root is a symlink escaping the workspace/,
-      )
-      assert.deepEqual(await readdir(outside), [], 'nothing was written through the symlink')
-    })
-  })
-
-  it('releases an adopted initial state when Runner construction fails', async () => {
+  it('rejects an invalid plan before adopting the saved LayerFS leader', async () => {
     await withTemp(async root => {
       const actions: any[] = []
       const client = hostClient(root, actions)
@@ -341,11 +308,8 @@ describe('P1-2: atomic runner lock and runtime containment', () => {
         broken.provider.start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }),
         /Plan requires a worker_prompt/,
       )
-      const adopted = actions.slice(before)
-      assert.ok(
-        adopted.some(action => action[0] === 'unmount' && action[2] === false),
-        'the adopted branch was unmounted before the manager closed',
-      )
+      // Validation runs before the lock and before any mount.
+      assert.deepEqual(actions.slice(before), [])
       assert.equal(existsSync(join(cwd, '.auto-research-methods', 'runner.lock')), false)
     })
   })
@@ -440,7 +404,7 @@ describe('P1-3/P1-8: no branch state leaks on sibling or cohort failure', () => 
         return release(state, options)
       }
       await assert.rejects(runner.run(), /retain exploded/)
-      const tracked = runner.trackedStates.size
+      const tracked = runner.states.size
       assert.ok(tracked >= 3, `the baseline and both epoch branches were tracked: ${tracked}`)
       await runner.releaseAll()
       assert.equal(new Set(released).size, tracked, 'releaseAll released every tracked state')
@@ -478,6 +442,34 @@ describe('P1-4: bounded worker termination', () => {
       await assert.rejects(running, error => error instanceof ResearchStoppedError)
       assert.equal(disposed, 1)
       assert.ok(Date.now() - begun < 1000, 'the grace timer bounded the wait')
+    })
+  })
+
+  it('bounds the result and a hanging dispose by one grace window', async () => {
+    await withTemp(async root => {
+      let started: any
+      const startedPromise = new Promise(resolve => { started = resolve })
+      const subagents = {
+        list: () => ['worker'],
+        async startActivation() {
+          started()
+          return { childId: 'child', result: new Promise(() => {}), dispose: () => new Promise<void>(() => {}) }
+        },
+      }
+      const controller = new AbortController()
+      const { runner } = await setupRunner(root, {
+        subagents,
+        deps: { signal: controller.signal, workerGraceMs: 300 },
+      })
+      const running = runner.run()
+      await startedPromise
+      // Abort while the runner is waiting on the result.
+      await new Promise(resolve => setTimeout(resolve, 50))
+      const begun = Date.now()
+      controller.abort()
+      await assert.rejects(running, error => error instanceof ResearchStoppedError)
+      // Two separate windows would take at least 600 ms.
+      assert.ok(Date.now() - begun < 550, `one window, took ${Date.now() - begun} ms`)
     })
   })
 })
@@ -540,12 +532,10 @@ describe('P1-6: a failed release keeps the state retryable', () => {
       await runner.run()
       const failed = runner.rows.find(row => row.id === 'round-1-explore-1')
       assert.ok(failed?._state, 'the handle is retained after the failed release')
-      assert.notEqual(failed._released, true)
       assert.ok(runner.pendingWorkspaces().some(entry => String(entry.workspace).includes('round-1-explore-1')))
       assert.equal(closes, 0, 'the manager stays open while a state is mounted')
       await runner.releaseAll()
       assert.equal(failed._state, null)
-      assert.equal(failed._released, true)
       assert.equal(runner.pendingWorkspaces().length, 0)
       assert.equal(closes, 1)
     })
@@ -843,7 +833,7 @@ describe('R5: worker shell environment injection', () => {
   })
 
   it('filters undeclared keys out of the contributor result', () => {
-    const provider = new AutoResearchProvider({
+    const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
       ctx: {
         subagents: fakeSubagents(async () => ({ output: [], stopReason: 'completed' })),
         logger: {},
@@ -873,29 +863,6 @@ describe('R5: worker shell environment injection', () => {
     }
   })
 
-  it('registers its contributor on the real ctx.shellEnv service shape', () => {
-    let registered: any = null
-    let disposedWith = null
-    const provider = new AutoResearchProvider({
-      ctx: {
-        subagents: fakeSubagents(async () => ({ output: [], stopReason: 'completed' })),
-        logger: {},
-        shellEnv: {
-          register(contributor: any) {
-            registered = contributor
-            return () => { disposedWith = contributor }
-          },
-        },
-      },
-      config: { workerProvider: 'worker' },
-    })
-    assert.ok(registered, 'the constructor registers the contributor')
-    assert.equal(registered.name, 'auto-research')
-    assert.equal(typeof registered.resolve, 'function')
-    provider.dispose()
-    assert.equal(disposedWith, registered)
-  })
-
   it('hands a live branch environment to the worker bash call during a batch', async () => {
     await withTemp(async root => {
       const cwd = join(root, 'repo')
@@ -916,12 +883,8 @@ describe('R5: worker shell environment injection', () => {
         await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
         return { output: [], stopReason: 'completed' }
       })
-      const provider = new AutoResearchProvider({
-        ctx: {
-          subagents,
-          logger: { info() {}, warn() {} },
-          shellEnv: { register(value: any) { contributor = value; return () => {} } },
-        },
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
+        ctx: { subagents, logger: { info() {}, warn() {} } },
         config: {
           workerProvider: 'worker',
           branches: 2,
@@ -930,6 +893,7 @@ describe('R5: worker shell environment injection', () => {
           plan,
         },
       })
+      contributor = provider.workerEnvContributor()
       const handle = await provider.start({
         cwd,
         prompt: [],
@@ -953,15 +917,14 @@ describe('R5: worker shell environment injection', () => {
 describe('R6: ShellEnvRegistry.collect contract and trace hygiene', () => {
   it('passes a complete tool execution to collect()', async () => {
     const seen: any[] = []
-    const merged = await resolveShellEnvironment({
-      shellEnv: {
-        collect(execution) {
+    const merged = resolveShellEnvironment({
+      register: () => () => {},
+      collect(execution) {
           seen.push(execution)
           return {
             DSH_LAYERFS_TRACE_STEP: String(execution.rootCallId ?? execution.callId),
             DSH_LAYERFS_PROJECT: 'p',
           }
-        },
       },
     }, { session: { header: { id: 'parent-1' } } })
     assert.equal(seen.length, 1)
@@ -969,16 +932,6 @@ describe('R6: ShellEnvRegistry.collect contract and trace hygiene', () => {
     assert.equal(seen[0].rootCallId, 'auto-research-env')
     assert.equal(merged.DSH_LAYERFS_TRACE_STEP, 'auto-research-env')
     assert.notEqual(merged.DSH_LAYERFS_TRACE_STEP, 'undefined')
-  })
-
-  it('still merges resolve(), snapshot(), env and contributors', async () => {
-    const service = {
-      env: { A: '1' },
-      async resolve(execution: any) { return { B: execution.callId === 'auto-research-env' ? '2' : 'wrong' } },
-      snapshot() { return { C: '3' } },
-      contributors: [{ env: { D: '4' } }],
-    }
-    assert.deepEqual(await resolveShellEnvironment({ shellEnv: service }), { A: '1', B: '2', C: '3', D: '4' })
   })
 
   it('strips transient SDK trace keys from a copied session environment', () => {
@@ -1005,7 +958,8 @@ describe('R6: ShellEnvRegistry.collect contract and trace hygiene', () => {
       await withTemp(async root => {
         const { provider, cwd } = await providerFixture(root, {
           shellEnv: {
-            async resolve() {
+            register: () => () => {},
+            collect() {
               return {
                 DSH_LAYERFS_TRACE: '/tmp/parent-trace.jsonl',
                 DSH_LAYERFS_TRACE_STEP: 'parent-step',
@@ -1102,7 +1056,7 @@ describe('R8: the runner lock precedes every artifact write', () => {
         await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
         return { output: [], stopReason: 'completed' }
       })
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents, logger: { info() {}, warn() {} } },
         config: {
           workerProvider: 'worker',
@@ -1133,54 +1087,49 @@ describe('R8: the runner lock precedes every artifact write', () => {
 })
 
 describe('R9: recursive delegation is refused', () => {
-  it('rejects a call whose parent is already a subagent', async () => {
+  it('rejects a call from inside a checkout that carries the worker marker', async () => {
     await withTemp(async root => {
       const { cwd, provider } = await providerFixture(root)
+      const branch = join(root, 'branch')
+      await mkdir(join(branch, '.auto-research-methods'), { recursive: true })
+      await writeFile(join(branch, '.auto-research-methods', 'WORKER.json'), '{}\n')
+      await mkdir(join(branch, 'src'), { recursive: true })
+      await assert.rejects(
+        provider.start({ cwd: join(branch, 'src'), prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }),
+        /cannot be called recursively by a worker subagent/,
+      )
+      // The coordinator's own checkout carries no marker and is not refused for it.
+      const handle = await provider.start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal })
+      await handle.result
+      await handle.dispose()
+    })
+  })
+
+  it('rejects a call from a live worker child session', async () => {
+    await withTemp(async root => {
+      const { cwd, provider } = await providerFixture(root)
+      const registration = provider.workerEnvs.register({ id: 'w', checkout: join(root, 'elsewhere'), childSessionId: 'child-1' })
       await assert.rejects(
         provider.start({
           cwd,
           prompt: [],
-          parent: { id: 'p', session: { header: { id: 'child', origin: 'subagent' } } },
+          parent: { id: 'p', session: { header: { id: 'child-1' } } },
           signal: new AbortController().signal,
         }),
         /cannot be called recursively by a worker subagent/,
       )
-    })
-  })
-
-  it('rejects a call from inside a live worker checkout or a runs/ tree', async () => {
-    await withTemp(async root => {
-      const { cwd, provider } = await providerFixture(root)
-      const registration = provider.workerEnvs.register({ id: 'w', checkout: cwd, env: {} })
-      await assert.rejects(
-        provider.start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }),
-        /cannot be called recursively by a worker subagent/,
-      )
       registration.dispose()
-      const runtime = join(cwd, '.auto-research-methods', 'runs', 'abc', 'round-1', 'workspace')
-      await assert.rejects(
-        provider.start({ cwd: runtime, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }),
-        /cannot be called recursively by a worker subagent/,
-      )
-      assert.equal(isInsideRuntimeRuns(runtime), true)
-      assert.equal(isInsideRuntimeRuns(cwd), false)
     })
   })
 
-  it('tells branch workers not to delegate or edit the plan', async () => {
-    const { DSH_COORDINATOR_ADDENDUM, buildWorkerPrompt } = await import('../lib/policies.js')
-    assert.match(DSH_COORDINATOR_ADDENDUM, /DSH_AUTO_RESEARCH_WORKER=1/)
-    assert.match(DSH_COORDINATOR_ADDENDUM, /never call `subagent_auto_research`/)
-    assert.match(DSH_COORDINATOR_ADDENDUM, /\.auto-research-methods\/plan\.json/)
-    const prompt = buildWorkerPrompt({
-      plan: { worker_prompt: 'Do work.', objective: 'o' },
-      checkout: '/tmp/ar/branch-1',
-      phase: 'continue',
-    })
+  it('tells branch workers where their instructions are', async () => {
+    const { buildWorkerPrompt, skillFile } = await import('../lib/skills.js')
+    const prompt = buildWorkerPrompt({ plan: { worker_prompt: 'Do work.', objective: 'o' }, checkout: '/tmp/ar/branch-1' })
     assert.match(prompt, /Work only in this branch: \/tmp\/ar\/branch-1/)
-    assert.match(prompt, /You are a branch worker/)
-    assert.match(prompt, /Never call subagent_auto_research/)
-    assert.match(prompt, /never modify \.auto-research-methods\/plan\.json/)
+    assert.ok(prompt.includes(skillFile('auto-research-worker')))
+    const skill = await readFile(skillFile('auto-research-worker'), 'utf8')
+    assert.match(skill, /Never call `subagent_auto_research`/)
+    assert.match(skill, /never edit `\.auto-research-methods\/plan\.json`/)
   })
 })
 
@@ -1224,7 +1173,7 @@ describe('R10: transient LayerFS startup failures and stale mounts', () => {
         workspace: {
           async commit(handle: any, message: any) {
             actions.push(['commit', message])
-            throw Object.assign(new Error('branch head moved since mount'), { code: 'headMovedSinceMount' })
+            throw Object.assign(new Error('the head moved and 1 file(s) conflict with this Workspace; markers are written and nothing was committed'), { code: 'Conflict' })
           },
         },
       })
@@ -1248,7 +1197,7 @@ describe('R10: transient LayerFS startup failures and stale mounts', () => {
         workspace: {
           async unmount(handle: any, discard: any) {
             actions.push(['unmount', discard])
-            if (!discard) throw Object.assign(new Error('head moved since mount'), { code: 'headMovedSinceMount' })
+            if (!discard) throw Object.assign(new Error('1 uncommitted change(s); unmount with discard to drop them'), { code: 'Dirty' })
           },
         },
       })
@@ -1302,7 +1251,6 @@ describe('R11: a superseded leader is released in recycle', () => {
       const round1 = runner.rows.find(row => row.id === 'round-1-continue-1')
       assert.ok(initial, 'the baseline is recorded')
       assert.equal(initial._state, null, 'the baseline was released during recycle')
-      assert.equal(initial._released, true)
       assert.ok(round1, 'round 1 recorded its leader')
       assert.equal(round1._state, null, 'round 1 leader was released once round 2 defeated it')
       // Only the final leader is still mounted; releaseAll finishes the batch.
@@ -1392,6 +1340,8 @@ describe('R13: meaningful_gain is validated unconditionally', () => {
     forkAndFlush: false,
     shareContext: false,
     sharingIntervalMinutes: 1,
+    workspaceBackend: 'auto',
+    executor: 'auto',
   }
 
   it('rejects a negative gain even without RSI', () => {
@@ -1482,26 +1432,34 @@ describe('R15: canonical distinct metric values', () => {
   })
 })
 
-describe('R16: the disk check runs for both backends', () => {
-  it('rejects an impossible cohort on a layerfs manager too', async () => {
+describe('R16: the disk check uses the backend estimate', () => {
+  it('counts host copies for staged LayerFS mounts and nothing for direct ones', async () => {
     await withTemp(async root => {
       const workspace = join(root, 'workspace')
       await writeWorkspace(workspace)
-      const manager = {
-        kind: 'layerfs',
-        baseline: async () => ({ id: 'initial', backend: 'layerfs', path: workspace, branch: null }),
-        fork: async () => ({ id: 'x', backend: 'layerfs', path: workspace, branch: null }),
-        commit: async () => {},
-        release: async () => {},
-        retainCompletedState: async () => { throw new Error('unused') },
-        restoreCompletedState: async () => { throw new Error('unused') },
-      }
+      const backend = new LayerFSBackend({
+        client: { branch: { fork: async () => ({}) }, workspace: { mount: async () => ({}) } } as any,
+        output: join(root, 'out'),
+      })
+      const direct = { id: 'p', backend: 'layerfs', path: workspace, branch: 'ar-p', staging: false }
+      const staged = { ...direct, staging: true }
+      assert.equal(await backend.estimateForkBytes(direct, 4), 0)
+      const bytes = await backend.estimateForkBytes(staged, 1)
+      assert.ok(bytes > 0)
+      assert.equal(await backend.estimateForkBytes(staged, 4), bytes * 4)
+      assert.equal(await new SnapshotBackend({ output: join(root, 'out') }).estimateForkBytes(direct, 2), bytes * 2)
+
+      const estimate = { bytes: 0 }
+      const manager = Object.assign(Object.create(snapshotManager({ output: join(root, 'out') })), {
+        estimateForkBytes: async () => estimate.bytes,
+      })
       const runner = new Runner({
         config: {},
         plan: planFor(root),
         workspace,
         output: join(root, 'out'),
         deps: {
+          executor: localExecutor,
           subagents: fakeSubagents(async () => ({ output: [], stopReason: 'completed' })),
           workspaceManager: manager,
           workerProvider: 'worker',
@@ -1509,8 +1467,9 @@ describe('R16: the disk check runs for both backends', () => {
           logger: {},
         },
       })
-      await runner.checkDisk(workspace, 1)
-      await assert.rejects(runner.checkDisk(workspace, Number.MAX_SAFE_INTEGER), /Insufficient space/)
+      await runner.checkDisk(direct, Number.MAX_SAFE_INTEGER)
+      estimate.bytes = Number.MAX_SAFE_INTEGER
+      await assert.rejects(runner.checkDisk(direct, 1), /Insufficient space/)
     })
   })
 })
@@ -1781,7 +1740,7 @@ export class LayerFS {
       [{ rsiTop: 'yes' }, /rsiTop must be a boolean/],
       [{ forkAndFlush: 1 }, /forkAndFlush must be a boolean/],
       [{ shareContext: 'true' }, /shareContext must be a boolean/],
-      [{ workspaceBackend: 'nfs' }, /workspaceBackend must be/],
+      [{ workspaceBackend: '' }, /workspaceBackend must be a non-empty string/],
       [{ providerName: '' }, /providerName must be a non-empty string/],
       [{ planPath: '   ' }, /planPath must be a non-empty string/],
       [{ workerProvider: 7 }, /workerProvider must be a non-empty string/],
@@ -1802,12 +1761,10 @@ export class LayerFS {
     assert.equal(good.value.rounds, 2)
   })
 
-  it('reports the coordinator session id and runtime-run containment helpers', () => {
+  it('reports the coordinator session id', () => {
     assert.equal(sessionIdOf({ session: { header: { id: 's-1' } } }), 's-1')
     assert.equal(sessionIdOf({ session: { header: {} } }), null)
     assert.equal(sessionIdOf(null), null)
-    assert.equal(isInsideRuntimeRuns(join('/tmp', 'repo', '.auto-research-methods', 'runs', 'id')), true)
-    assert.equal(isInsideRuntimeRuns(join('/tmp', 'repo', '.auto-research-methods', 'plan.json')), false)
   })
 })
 
@@ -1866,7 +1823,7 @@ describe('R22: worker environments resolve the assigned checkout, not the copied
           async startActivation() { throw new Error('unused') },
         },
       }
-      const provider = new AutoResearchProvider({ ctx, config: { workerEnv: { DSH_R22: '1' } } })
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(), ctx, config: { workerEnv: { DSH_R22: '1' } } })
       provider.workerEnvs.register({ id: 'branch-1', checkout, parentSessionId: 'coord', childSessionId: 'child-1' })
       const parent = {
         session: {
@@ -2004,59 +1961,123 @@ describe('R24: staged Sandbox mounts stay bidirectional', () => {
     })
   })
 
-  it('folds a committed Sandbox overlay back and lets host edits win', async () => {
+  it('settles a staged branch: unchanged, folded, host, then conflict with both sides in history', async () => {
     await withTemp(async root => {
       const source = join(root, 'source')
       await writeWorkspace(source)
-      const branchFiles: Record<string, string> = {
-        '/state.json': JSON.stringify({ score: 1, metrics: { score: 1 } }, null, 2) + '\n',
-        '/notes.md': '# notes\n',
-      }
-      let statusCalls = 0
+      // The branch as LayerFS holds it; fs.apply writes into it.
+      const branchFiles: Record<string, string> = {}
+      const actions: any[] = []
+      let dirty = false
       const client: any = {
         branch: { async fork() {} },
         workspace: {
           async mount() { return { sandbox: 'r24', path: '/workspaces/r24-reconcile' } },
-          async commit() {},
-          async unmount() {},
-          async status() {
-            statusCalls += 1
-            return { overlay: { entries: 1 }, headMovedSinceMount: true }
+          async commit(_handle: any, message: string) {
+            actions.push(['commit', message])
+            dirty = false
           },
+          async unmount() {},
+          async status() { return { overlay: { entries: dirty ? 1 : 0 }, headMovedSinceMount: dirty } },
         },
         fs: {
           async list(_branch: string, path = '/') {
             if (path !== '/') return []
-            return Object.keys(branchFiles).map(name => ({ name: name.replace(/^\/+/, '') }))
+            return Object.keys(branchFiles).map(name => ({ name: name.slice(1) }))
           },
           async read(_branch: string, name: string) {
             return { text: branchFiles[name] ?? '' }
           },
-          async apply() {},
+          async apply(_branch: string, changes: any[], message: string) {
+            actions.push(['apply', changes.filter(change => change.op !== 'mkdir').map(change => `${change.op} ${change.path}`), message])
+            for (const change of changes) {
+              if (change.op === 'write') branchFiles[change.path] = String(change.content)
+              if (change.op === 'rm') delete branchFiles[change.path]
+            }
+          },
         },
         async close() {},
       }
       const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'r24b' })
       const state = await backend.baseline(source, 'initial')
-      // A worker edits inside /workspaces/<n>; the host copy has not changed.
-      branchFiles['/state.json'] = JSON.stringify({ score: 9, metrics: { score: 9 } }, null, 2) + '\n'
+      const launch = async () => { state.prelaunchInventory = await inventory(state.path) }
+      const score = (value: number) => JSON.stringify({ score: value, metrics: { score: value } }, null, 2) + '\n'
+
+      await launch()
+      assert.deepEqual(await backend.reconcile(state), { outcome: 'unchanged', conflicts: [] })
+
+      // A worker edits inside /workspaces/<n> only.
+      await launch()
+      branchFiles['/state.json'] = score(9)
       delete branchFiles['/notes.md']
-      await backend.reconcile(state)
-      assert.match(await readFile(join(state.path, 'state.json'), 'utf8'), /"score": 9/)
+      dirty = true
+      assert.deepEqual(await backend.reconcile(state), { outcome: 'folded', conflicts: [] })
+      assert.equal(await readFile(join(state.path, 'state.json'), 'utf8'), score(9))
       await assert.rejects(stat(join(state.path, 'notes.md')), { code: 'ENOENT' })
 
-      // Host edits take precedence: reconcile must not touch them.
-      await writeFile(join(state.path, 'state.json'), JSON.stringify({ score: 3, metrics: { score: 3 } }, null, 2) + '\n')
-      const callsBefore = statusCalls
-      await backend.reconcile(state)
-      assert.equal(statusCalls, callsBefore)
-      assert.match(await readFile(join(state.path, 'state.json'), 'utf8'), /"score": 3/)
+      // A worker edits the host copy only; commit() publishes it.
+      await launch()
+      await writeFile(join(state.path, 'state.json'), score(3))
+      // fs.apply cannot write a symlink: it stays on the host copy only.
+      await symlink('state.json', join(state.path, 'current.json'))
+      assert.deepEqual(await backend.reconcile(state), { outcome: 'host', conflicts: [] })
+      await backend.commit(state)
+      assert.equal(branchFiles['/state.json'], score(3))
+      assert.equal(branchFiles['/current.json'], undefined)
+      assert.deepEqual(state.skippedFiles, ['current.json'])
+
+      // Both views change; state.json changes on both sides.
+      await launch()
+      actions.length = 0
+      await writeFile(join(state.path, 'state.json'), score(4))
+      await writeFile(join(state.path, 'host.md'), 'host\n')
+      branchFiles['/state.json'] = score(5)
+      branchFiles['/sandbox.md'] = 'sandbox\n'
+      dirty = true
+      assert.deepEqual(await backend.reconcile(state), { outcome: 'conflict', conflicts: ['state.json'] })
+      // The host copy is left as the worker wrote it.
+      assert.equal(await readFile(join(state.path, 'state.json'), 'utf8'), score(4))
+      await backend.commit(state, { message: 'auto-research: rejected initial' })
+      // The Sandbox overlay was committed first, then the host diff published.
+      assert.deepEqual(actions[0], ['commit', 'auto-research: sandbox initial'])
+      const apply = actions.find(action => action[0] === 'apply')
+      assert.deepEqual(apply[1], ['write /host.md', 'write /state.json'])
+      assert.equal(branchFiles['/state.json'], score(4))
+      assert.equal(branchFiles['/sandbox.md'], 'sandbox\n')
+    })
+  })
+
+  it('fails loud and keeps the mount when the Sandbox overlay cannot be committed', async () => {
+    await withTemp(async root => {
+      const source = join(root, 'source')
+      await writeWorkspace(source)
+      const unmounts: boolean[] = []
+      let refuse = false
+      const client: any = {
+        branch: { async fork() {} },
+        workspace: {
+          async mount() { return { sandbox: 'r24c', path: '/workspaces/r24c' } },
+          async commit() {
+            if (refuse) throw Object.assign(new Error('1 file(s) still contain conflict markers; nothing committed'), { code: 'Conflict' })
+          },
+          async unmount(_handle: any, discard: boolean) { unmounts.push(discard) },
+          async status() { return { overlay: { entries: 1 }, headMovedSinceMount: true } },
+        },
+        fs: { async list() { return [] }, async read() { return { text: '' } }, async apply() {} },
+        async close() {},
+      }
+      const backend = new LayerFSBackend({ client, output: join(root, 'out'), runId: 'r24c', retryBaseDelayMs: 1 })
+      const state = await backend.baseline(source, 'initial')
+      unmounts.length = 0
+      refuse = true
+      await assert.rejects(backend.reconcile(state), /conflict markers/)
+      assert.deepEqual(unmounts, [], 'the uncommitted overlay is not discarded')
     })
   })
 
   it('calls reconcile after the worker activation and before evaluation', async () => {
     await withTemp(async root => {
-      const base = await createWorkspaceManager({ output: join(root, 'out'), runId: 'run', env: {} })
+      const base = snapshotManager({ output: join(root, 'out'), runId: 'run', env: {} })
       const reconciles: string[] = []
       const manager: any = {
         kind: base.kind,
@@ -2069,8 +2090,9 @@ describe('R24: staged Sandbox mounts stay bidirectional', () => {
         restoreCompletedState: (...args: any[]) => base.restoreCompletedState(args[0], args[1]),
         async reconcile(state: any) {
           reconciles.push(state.path)
-          await base.reconcile(state)
+          return base.reconcile(state)
         },
+        estimateForkBytes: (...args: any[]) => base.estimateForkBytes(args[0], args[1]),
         close: () => base.close(),
       }
       const worker = async (spec: any) => {
@@ -2138,8 +2160,8 @@ describe('R25: a resumed epoch failure keeps its own dirty workspace', () => {
       assert.equal(parent._ownsState, false)
       assert.equal(runner.abandoned.length, 1)
       assert.equal(runner.abandoned[0]!._ownsState, true)
-      assert.equal(runner.abandoned[0]!._released, true)
-      assert.equal(runner.releasedStates.has(state), true)
+      assert.equal(runner.abandoned[0]!._state, null)
+      assert.equal(runner.states.get(state)?.released, true)
       assert.ok(commits.includes('auto-research: unverified epoch-2'))
       assert.equal(commits.some(message => /retained epoch-1/.test(message)), false)
       assert.deepEqual(releases, [false])
@@ -2240,7 +2262,7 @@ describe('R27: concurrent LayerFS environment leases stay isolated', () => {
 })
 
 describe('R28: worker environment declarations and config validation', () => {
-  it('never declares reserved, LayerFS, secret, or non-string keys', () => {
+  it('declares configured DSH_* keys except reserved, LayerFS and non-string ones', () => {
     const declared = declaredWorkerEnvKeys({
       DSH_HOME: '/home',
       DSH_SHELL: 'zsh',
@@ -2256,10 +2278,13 @@ describe('R28: worker environment declarations and config validation', () => {
       OTHER: 'x',
     })
     for (const reserved of DSH_RESERVED_ENV_KEYS) assert.equal(Object.hasOwn(declared, reserved), false, reserved)
-    for (const name of ['DSH_LAYERFS_HOME', 'DSH_API_TOKEN', 'DSH_KEY', 'DSH_PASSWORD', 'DSH_NUM', 'OTHER']) {
+    for (const name of ['DSH_LAYERFS_HOME', 'DSH_NUM', 'OTHER']) {
       assert.equal(Object.hasOwn(declared, name), false, name)
     }
-    assert.equal(Object.hasOwn(declared, 'DSH_GOOD'), true)
+    // workerEnv passes through as configured, secret-looking names included.
+    for (const name of ['DSH_GOOD', 'DSH_API_TOKEN', 'DSH_KEY', 'DSH_PASSWORD']) {
+      assert.equal(Object.hasOwn(declared, name), true, name)
+    }
     assert.equal(Object.hasOwn(declared, 'DSH_AUTO_RESEARCH_WORKER'), true)
     assert.equal(Object.hasOwn(declaredWorkerEnvKeys(null), 'DSH_GOOD'), false)
     assert.equal(Object.hasOwn(declaredWorkerEnvKeys([] as any), 'DSH_GOOD'), false)
@@ -2394,7 +2419,7 @@ describe('R30: evidence must be normalized and present before evaluation', () =>
       await writeWorkspace(workspace)
       const evaluatorPath = join(root, 'evaluator.mjs')
       await writeFile(evaluatorPath, 'process.exit(0)\n')
-      const evaluator = new FrozenEvaluator({ plan: { evaluator: evaluatorPath } as any, output: join(root, 'out') })
+      const evaluator = new FrozenEvaluator({ executor: localExecutor, plan: { evaluator: evaluatorPath } as any, output: join(root, 'out') })
       const before = await inventory(workspace)
       for (const evidence of [
         ['ghost.json'],
@@ -2434,6 +2459,7 @@ describe('R31: provider RESULT.json writes are atomic', () => {
       const ctx: any = {
         subagents: {
           list: () => ['worker'],
+          getProvider: () => undefined,
           registerProvider() {},
           async startActivation() {
             return { childId: 'unused', result: Promise.resolve({ output: [], stopReason: 'completed' }), async dispose() {} }
@@ -2441,7 +2467,7 @@ describe('R31: provider RESULT.json writes are atomic', () => {
         },
         logger: { info() {}, warn() {} },
       }
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx,
         config: {
           planPath: join(root, 'plan.json'),
@@ -2529,13 +2555,14 @@ describe('R33: post-re-audit edge cases (NEW-01..NEW-03)', () => {
       const backend = new LayerFSBackend({ client, project: 'proj', output: join(root, 'out'), runId: 'r33' })
       const base = await backend.baseline(source, 'initial')
       const child = await backend.fork(base, 'round-1-continue-1')
-      // Simulate Runner.branch() writing .auto-research-methods-handoff.md before launch
-      await writeFile(join(child.path, '.auto-research-methods-handoff.md'), 'handoff notes\n')
+      // Simulate Runner.branch() writing .auto-research-methods/HANDOFF.md before launch
+      await mkdir(join(child.path, '.auto-research-methods'), { recursive: true })
+      await writeFile(join(child.path, '.auto-research-methods', 'HANDOFF.md'), 'handoff notes\n')
       child.prelaunchInventory = await inventory(child.path)
       await backend.reconcile(child)
       const after = JSON.parse(await readFile(join(child.path, 'state.json'), 'utf8'))
       assert.equal(after.score, 9)
-      assert.equal(await readFile(join(child.path, '.auto-research-methods-handoff.md'), 'utf8'), 'handoff notes\n')
+      assert.equal(await readFile(join(child.path, '.auto-research-methods', 'HANDOFF.md'), 'utf8'), 'handoff notes\n')
     })
   })
 

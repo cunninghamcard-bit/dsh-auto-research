@@ -8,11 +8,9 @@
 
 import { randomUUID } from 'node:crypto'
 import * as fsp from 'node:fs/promises'
-import { isAbsolute, join, resolve, sep } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import {
-  LayerFSWorkspaceFactory,
-  SnapshotWorkspaceFactory,
-  createWorkspaceManager,
+  WorkspaceManager,
   inventory,
   isContained,
   jsonEqual,
@@ -23,24 +21,32 @@ import {
   withoutLayerfsTrace,
   writeJsonAtomic,
 } from './layerfs-workspace.js'
+import type { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from './registry.js'
+import { insideWorkerCheckout } from './skills.js'
 import { FrozenEvaluator } from './evaluator.js'
-import { ResearchStoppedError, Runner, resolveWorkerAgentOptions } from './runner.js'
+import {
+  ResearchStoppedError,
+  Runner,
+  normalizeOptions,
+  resolveWorkerAgentOptions,
+  validatePlan,
+} from './runner.js'
+import type { Frontier } from './runner.js'
 import type {
-  AutoResearchService,
   Config,
   ContentBlock,
   LayerFSBinding,
   LayerFSSettings,
+  PlanOptions,
   PluginContext,
+  ProviderContext,
   ResearchPlanInput,
   ResolvedConfig,
   SubagentProvider,
   SubagentResult,
   SubagentRun,
   SubagentStartRequest,
-  SubprocessServiceLike,
   WorkerAgentOptions,
-  WorkspaceBackendFactory,
   WorkspaceState,
 } from './types.js'
 
@@ -77,12 +83,8 @@ export function resolveConfig(input: unknown = {}): ResolvedConfig {
       throw new Error(`${key} must be a boolean`)
     }
   }
-  if (config.workspaceBackend !== undefined
-    && config.workspaceBackend !== 'auto'
-    && config.workspaceBackend !== 'layerfs'
-    && config.workspaceBackend !== 'snapshot') {
-    throw new Error("workspaceBackend must be 'auto', 'layerfs' or 'snapshot'")
-  }
+  if (config.workspaceBackend !== undefined) requireNonEmptyString(config.workspaceBackend, 'workspaceBackend')
+  if (config.executor !== undefined) requireNonEmptyString(config.executor, 'executor')
   for (const key of ['providerName', 'planPath', 'workerProvider'] as const) {
     if (config[key] !== undefined) requireNonEmptyString(config[key], key)
   }
@@ -122,6 +124,7 @@ export function resolveConfig(input: unknown = {}): ResolvedConfig {
   }
   if (config.workerAgentOptions !== undefined) resolved.workerAgentOptions = config.workerAgentOptions
   if (config.workspaceBackend !== undefined) resolved.workspaceBackend = config.workspaceBackend
+  if (config.executor !== undefined) resolved.executor = config.executor
   if (config.layerfs !== undefined) resolved.layerfs = config.layerfs
   if (config.plan !== undefined) resolved.plan = config.plan
   return resolved
@@ -145,59 +148,10 @@ function requireNonEmptyString(value: unknown, name: string): void {
   }
 }
 
-/** Extract the standalone user text from a `ContentBlock[]` or string. */
-export function extractPromptText(prompt: unknown): string {
-  if (typeof prompt === 'string') return prompt
-  if (!Array.isArray(prompt)) return ''
-  return (prompt as unknown[])
-    .map(block => {
-      if (typeof block === 'string') return block
-      if (!block || typeof block !== 'object') return ''
-      const record = block as Record<string, unknown>
-      if (record.type === 'text' && typeof record.text === 'string') return record.text
-      if (typeof record.text === 'string') return record.text
-      return ''
-    })
-    .filter(Boolean)
-    .join('\n')
-}
-
 function looksLikePlan(value: unknown): value is ResearchPlanInput {
   return Boolean(value) && typeof value === 'object'
     && typeof (value as ResearchPlanInput).objective === 'string'
     && typeof (value as ResearchPlanInput).evaluator === 'string'
-}
-
-/**
- * Find a plan object embedded in a delegation prompt: a fenced JSON block, a
- * `PLAN_JSON:` line, or a prompt that is itself the JSON object.
- */
-export function parsePlanFromPrompt(text: string): ResearchPlanInput | null {
-  if (typeof text !== 'string' || text.trim() === '') return null
-  const fenced = /```(?:json)?\s*([\s\S]*?)```/gi
-  for (const match of text.matchAll(fenced)) {
-    try {
-      const value = JSON.parse(match[1] as string)
-      if (looksLikePlan(value)) return value
-    } catch {
-      // Try the next block.
-    }
-  }
-  const marker = /PLAN_JSON:\s*(\{[\s\S]*\})\s*$/m.exec(text)
-  if (marker) {
-    try {
-      const value = JSON.parse(marker[1] as string)
-      if (looksLikePlan(value)) return value
-    } catch {
-      // Fall through to the whole-prompt attempt.
-    }
-  }
-  try {
-    const value = JSON.parse(text.trim())
-    return looksLikePlan(value) ? value : null
-  } catch {
-    return null
-  }
 }
 
 async function readJson(path: string): Promise<unknown> {
@@ -213,40 +167,25 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-/**
- * Resolve the plan from config, the plan file, or the delegation prompt.
- */
+/** The plan from `config.plan`, else the file at `config.planPath`. */
 export async function resolvePlan({
   cwd,
   config,
-  promptText,
 }: {
   cwd: string
   config: ResolvedConfig
-  promptText: string
 }): Promise<{ plan: ResearchPlanInput; source: string }> {
-  if (config.plan && typeof config.plan === 'object') {
-    return { plan: { ...config.plan }, source: 'config' }
+  if (config.plan) return { plan: { ...config.plan }, source: 'config' }
+  const planPath = resolve(cwd, config.planPath)
+  let value: unknown
+  try {
+    value = await readJson(planPath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error(`No research plan: write ${planPath}`)
+    throw error
   }
-  const planPath = isAbsolute(config.planPath) ? config.planPath : resolve(cwd, config.planPath)
-  if (await pathExists(planPath)) {
-    const value = await readJson(planPath)
-    if (!looksLikePlan(value)) throw new Error(`Research plan is incomplete: ${planPath}`)
-    return { plan: value, source: planPath }
-  }
-  if (config.planPath === '.auto-research-methods/plan.json') {
-    const fallbackPath = resolve(cwd, 'auto-research.json')
-    if (await pathExists(fallbackPath)) {
-      const value = await readJson(fallbackPath)
-      if (!looksLikePlan(value)) throw new Error(`Research plan is incomplete: ${fallbackPath}`)
-      return { plan: value, source: fallbackPath }
-    }
-  }
-  const embedded = parsePlanFromPrompt(promptText)
-  if (embedded) return { plan: embedded, source: 'prompt' }
-  throw new Error(
-    `No research plan: write ${config.planPath} (or include a PLAN_JSON object in the delegation prompt)`,
-  )
+  if (!looksLikePlan(value)) throw new Error(`Research plan is incomplete: ${planPath}`)
+  return { plan: value, source: planPath }
 }
 
 function truncateDiagnostic(text: unknown): string {
@@ -323,7 +262,6 @@ export interface RunnerLock {
 }
 
 function processAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false
   try {
     process.kill(pid, 0)
     return true
@@ -333,154 +271,43 @@ function processAlive(pid: number): boolean {
 }
 
 /**
- * Refuse a runtime root that is a symlink escaping the workspace.
- *
- * `.auto-research-methods` holds every branch artifact and the runner lock, so
- * a planted symlink would redirect those writes outside the assigned
- * checkout. A missing runtime root is fine (it is created later).
- */
-export async function assertRuntimeRootContained(
-  workspaceRoot: string,
-  runtimeRoot: string,
-): Promise<void> {
-  let stats: Awaited<ReturnType<typeof fsp.lstat>>
-  try {
-    stats = await fsp.lstat(runtimeRoot)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return
-    throw error
-  }
-  if (!stats.isSymbolicLink()) {
-    if (!stats.isDirectory()) {
-      throw new Error(`Auto-research runtime root is not a directory: ${runtimeRoot}`)
-    }
-    return
-  }
-  let realRoot: string
-  let realRuntime: string
-  try {
-    [realRoot, realRuntime] = await Promise.all([fsp.realpath(workspaceRoot), fsp.realpath(runtimeRoot)])
-  } catch (error) {
-    throw new Error(
-      `Auto-research runtime root is an unresolvable symlink: ${runtimeRoot} (${(error as Error).message})`,
-    )
-  }
-  if (!isContained(realRoot, realRuntime)) {
-    throw new Error(
-      `Auto-research runtime root is a symlink escaping the workspace: ${runtimeRoot} -> ${realRuntime}`,
-    )
-  }
-}
-
-/** A lock file that stayed unparsable this recently is still being written. */
-const LOCK_WRITE_GRACE_MS = 2000
-
-/**
- * Acquire `<runtimeRoot>/runner.lock` so two `subagent_auto_research`
- * invocations on one checkout fail loud instead of racing on `LATEST.json`.
- *
- * The payload is written to a unique sibling first and then hard-linked into
- * place, so a lock file is never observable empty or half-written. A stale
- * lock is reclaimed only when its owning PID is gone; an unparsable lock that
- * is younger than {@link LOCK_WRITE_GRACE_MS} is treated as live rather than
- * unlinked, which closes the remaining creation window.
+ * Acquire `<runtimeRoot>/runner.lock` so two batches on one checkout fail
+ * loud instead of racing on `LATEST.json`. The lock is created with `wx`; an
+ * existing lock whose pid is gone is removed and the create retried once.
  */
 export async function acquireRunnerLock(
   runtimeRoot: string,
   runId: string,
-  {
-    cwd = runtimeRoot,
-    pid = process.pid,
-    alive = processAlive,
-    now = Date.now,
-    writeGraceMs = LOCK_WRITE_GRACE_MS,
-  }: {
+  { cwd = runtimeRoot, pid = process.pid, alive = processAlive }: {
     cwd?: string
     pid?: number
     alive?: (pid: number) => boolean
-    now?: () => number
-    writeGraceMs?: number
   } = {},
 ): Promise<RunnerLock> {
   await fsp.mkdir(runtimeRoot, { recursive: true })
   const path = join(runtimeRoot, 'runner.lock')
-  const info = { pid, runId, cwd, started_at: new Date(now()).toISOString() }
-  const payload = JSON.stringify(info, null, 2) + '\n'
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const temporary = join(runtimeRoot, `.runner.lock.${pid}.${randomUUID()}`)
+  const info = { pid, runId, cwd, started_at: new Date().toISOString() }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      await fsp.writeFile(temporary, payload, { mode: 0o600 })
-      // link() is atomic and refuses an existing target, so the visible lock is
-      // always the complete payload.
-      await fsp.link(temporary, path)
-      let released = false
-      return {
-        path,
-        info,
-        release: async () => {
-          if (released) return
-          released = true
-          try {
-            const saved = JSON.parse(await fsp.readFile(path, 'utf8')) as { pid?: unknown; runId?: unknown }
-            if (saved.pid === pid && saved.runId === runId) await fsp.unlink(path)
-          } catch {
-            // Already unlocked or replaced by a newer owner.
-          }
-        },
-      }
+      await fsp.writeFile(path, JSON.stringify(info, null, 2) + '\n', { flag: 'wx', mode: 0o600 })
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
-      let saved: { pid?: unknown; runId?: unknown; started_at?: unknown } | null = null
-      let readable = true
-      try {
-        saved = JSON.parse(await fsp.readFile(path, 'utf8')) as { pid?: unknown; runId?: unknown }
-      } catch {
-        saved = null
-        readable = false
+      const owner = Number.parseInt(/"pid":\s*(\d+)/.exec(await fsp.readFile(path, 'utf8'))?.[1] ?? '', 10)
+      if (Number.isNaN(owner) || alive(owner)) {
+        throw new Error(`Another auto-research batch is already running for this checkout: ${path} (pid ${Number.isNaN(owner) ? 'unknown' : owner}; delete the file if no batch is running)`)
       }
-      const owner = typeof saved?.pid === 'number' ? saved.pid : null
-      if (owner !== null && alive(owner)) {
-        throw new Error(
-          `Another auto-research batch is already running for this checkout: ${path} (pid ${owner}, run ${String(saved?.runId ?? 'unknown')})`,
-        )
-      }
-      if (owner === null) {
-        // Either a writer that has not finished or a corrupt lock. Only a lock
-        // old enough to be certainly abandoned may be removed.
-        const stats = await fsp.stat(path).catch(() => null)
-        if (stats && now() - stats.mtimeMs < writeGraceMs) {
-          throw new Error(
-            `Another auto-research batch is starting for this checkout: ${path}${readable ? '' : ' (lock still being written)'}`,
-          )
-        }
-      }
-      // Stale lock: reclaim atomically by moving to a unique stale path and
-      // verifying its owner is still dead before deleting.
-      const stalePath = join(runtimeRoot, `.runner.lock.stale.${pid}.${randomUUID()}`)
-      try {
-        await fsp.rename(path, stalePath)
-        let movedSaved: { pid?: unknown } | null = null
-        try {
-          movedSaved = JSON.parse(await fsp.readFile(stalePath, 'utf8')) as { pid?: unknown }
-        } catch {
-          movedSaved = null
-        }
-        const movedOwner = typeof movedSaved?.pid === 'number' ? movedSaved.pid : null
-        if (movedOwner !== null && movedOwner !== owner && alive(movedOwner)) {
-          await fsp.link(stalePath, path).catch(() => {})
-          await fsp.unlink(stalePath).catch(() => {})
-          throw new Error(
-            `Another auto-research batch is already running for this checkout: ${path} (pid ${movedOwner})`,
-          )
-        }
-        await fsp.unlink(stalePath).catch(() => {})
-      } catch (reclaimErr) {
-        if (reclaimErr instanceof Error && reclaimErr.message.startsWith('Another auto-research batch')) {
-          throw reclaimErr
-        }
-      }
-    } finally {
-      await fsp.unlink(temporary).catch(() => {})
+      await fsp.rm(path, { force: true })
+      continue
+    }
+    let released = false
+    return {
+      path,
+      info,
+      release: async () => {
+        if (released) return
+        released = true
+        await fsp.rm(path, { force: true })
+      },
     }
   }
   throw new Error(`Could not acquire the auto-research runner lock: ${path}`)
@@ -528,6 +355,8 @@ export interface WorkerEnvRegistration {
 export class WorkerEnvRegistry {
   private readonly entries = new Map<number, WorkerEnvEntry>()
   private nextKey = 1
+  /** Called whenever a worker starts or stops (the skill catalog depends on it). */
+  onChange: (() => void) | null = null
   private readonly resolveCwd: ((session: unknown, agent: unknown) => string | null) | null
 
   constructor(options: {
@@ -544,6 +373,14 @@ export class WorkerEnvRegistry {
   /** @returns every checkout that currently has a live worker. */
   checkouts(): string[] {
     return [...this.entries.values()].map(entry => entry.checkout)
+  }
+
+  /** Whether `sessionId` is the child session of a live worker. */
+  hasChildSession(sessionId: string): boolean {
+    for (const entry of this.entries.values()) {
+      if (entry.childSessionId === sessionId) return true
+    }
+    return false
   }
 
   /** Whether `path` is one of the live worker checkouts (or inside it). */
@@ -579,6 +416,7 @@ export class WorkerEnvRegistry {
       env: { ...env },
     }
     this.entries.set(key, entry)
+    this.onChange?.()
     let disposed = false
     return {
       id,
@@ -591,6 +429,7 @@ export class WorkerEnvRegistry {
         if (disposed) return
         disposed = true
         this.entries.delete(key)
+        this.onChange?.()
       },
     }
   }
@@ -691,13 +530,6 @@ export function sessionIdOf(agent: unknown): string | null {
   return typeof header?.id === 'string' && header.id.length > 0 ? header.id : null
 }
 
-/** Whether `path` sits inside a `.auto-research-methods/runs/` runtime tree. */
-export function isInsideRuntimeRuns(path: string): boolean {
-  const parts = resolve(path).split(sep)
-  const index = parts.lastIndexOf('.auto-research-methods')
-  return index >= 0 && parts[index + 1] === 'runs'
-}
-
 /** One-line description for each environment key this plugin owns. */
 const WORKER_KEY_DESCRIPTIONS: Record<(typeof AUTO_RESEARCH_ENV_KEYS)[number], string> = {
   DSH_AUTO_RESEARCH_WORKER: '1 inside an auto-research branch worker; absent for the coordinator',
@@ -714,9 +546,6 @@ export const DSH_RESERVED_ENV_KEYS = new Set([
   'DSH_PROFILE',
   'DSH_PROFILE_DIR',
 ])
-
-/** Secret-looking names are filtered from prompts, receipts and registries. */
-const SECRET_ENV_KEY = /(token|key|secret|password|credential)/i
 
 /**
  * The `DSH_*` keys the `auto-research` contributor declares.
@@ -740,67 +569,33 @@ export function declaredWorkerEnvKeys(
     if (!REGISTRY_KEY.test(name)
       || name.startsWith('DSH_LAYERFS_')
       || DSH_RESERVED_ENV_KEYS.has(name)
-      || SECRET_ENV_KEY.test(name)
       || Object.hasOwn(keys, name)) continue
     keys[name] = { description: 'Configured auto-research worker environment value' }
   }
   return keys
 }
 
-/**
- * Concrete registry implementation of `ctx.autoResearch` (`AutoResearchService`).
- *
- * Pre-seeded with `[LayerFSWorkspaceFactory, SnapshotWorkspaceFactory]`, while
- * allowing workspace backend plugins (`layerfsWorkspacePlugin`,
- * `snapshotWorkspacePlugin`, or custom workspace plugins) to register or
- * override backends.
- */
-export class AutoResearchServiceImpl implements AutoResearchService {
-  private readonly backends: WorkspaceBackendFactory[] = [
-    new LayerFSWorkspaceFactory(),
-    new SnapshotWorkspaceFactory(),
-  ]
-
-  registerWorkspaceBackend(factory: WorkspaceBackendFactory): () => void {
-    const existingIndex = this.backends.findIndex(item => item.name === factory.name)
-    if (existingIndex >= 0) {
-      this.backends[existingIndex] = factory
-    } else {
-      // Custom backends registered by plugins take priority before snapshot fallback.
-      const snapshotIndex = this.backends.findIndex(item => item.name === 'snapshot')
-      if (snapshotIndex >= 0) this.backends.splice(snapshotIndex, 0, factory)
-      else this.backends.push(factory)
-    }
-    let disposed = false
-    return () => {
-      if (disposed) return
-      disposed = true
-      const idx = this.backends.indexOf(factory)
-      if (idx >= 0) this.backends.splice(idx, 1)
-    }
-  }
-
-  getWorkspaceBackend(name: string): WorkspaceBackendFactory | undefined {
-    return this.backends.find(item => item.name === name)
-  }
-
-  listWorkspaceBackends(): WorkspaceBackendFactory[] {
-    return [...this.backends]
-  }
+export interface ProviderOptions {
+  ctx: ProviderContext
+  config?: Config
+  workspaces: ResearchWorkspaceRegistry
+  executors: ResearchExecutorRegistry
 }
 
 /** One provider instance, normally created by the Cordis plugin entry. */
 export class AutoResearchProvider implements SubagentProvider {
-  readonly ctx: PluginContext
+  readonly ctx: ProviderContext
   readonly config: ResolvedConfig
   readonly name: string
   readonly capabilities: Record<string, unknown>
   readonly inheritsParentContext: boolean
-  /** Capability registry exposed on `ctx.autoResearch`. */
-  readonly service: AutoResearchService
+  /** Workspace backends registered by `ctx.researchWorkspace` plugins. */
+  readonly workspaces: ResearchWorkspaceRegistry
+  /** Evaluator executors registered by `ctx.researchExecutor` plugins. */
+  readonly executors: ResearchExecutorRegistry
   /** Branch environments of the workers that are running right now. */
   readonly workerEnvs = new WorkerEnvRegistry({
-    resolveCwd: session => this.sessionWorkingDirectory(session),
+    resolveCwd: session => session ? this.ctx.workingDirectory?.get(session as never) ?? null : null,
   })
   /**
    * `DSH_*` keys the shell contributor may return.
@@ -811,117 +606,17 @@ export class AutoResearchProvider implements SubagentProvider {
    * session and a second owner is a hard registration error.
    */
   readonly workerEnvKeys: Readonly<Record<string, { description: string }>>
-  /** Batches whose runner is still alive (used to reject recursive delegation). */
-  activeBatches = 0
-  private disposeShellEnv: (() => void) | null = null
 
-  constructor({ ctx, config = {} }: { ctx: PluginContext; config?: Config }) {
+  constructor({ ctx, config = {}, workspaces, executors }: ProviderOptions) {
     if (!ctx) throw new Error('AutoResearchProvider requires a plugin context')
     this.ctx = ctx
     this.config = resolveConfig(config)
     this.name = this.config.providerName
     this.capabilities = NO_START_CAPABILITIES
     this.inheritsParentContext = false
-    this.service = this.autoResearchService() ?? new AutoResearchServiceImpl()
+    this.workspaces = workspaces
+    this.executors = executors
     this.workerEnvKeys = declaredWorkerEnvKeys(this.config.workerEnv)
-    this.installShellEnvContributor()
-  }
-
-  /** The `ctx.subprocess` service (`@deepseek-ai/dsh-subprocess`), read safely. */
-  private subprocessService(context: unknown = this.ctx): SubprocessServiceLike | undefined {
-    const holder = context as { get?: (name: string) => unknown; subprocess?: unknown } | null | undefined
-    if (!holder) return undefined
-    if (typeof holder.get === 'function') {
-      try {
-        const value = holder.get('subprocess')
-        if (value) return value as SubprocessServiceLike
-      } catch {
-        // The service is not injected in this host; try the property fallback.
-      }
-    }
-    try {
-      return holder.subprocess as SubprocessServiceLike | undefined
-    } catch {
-      return undefined
-    }
-  }
-
-  /** Existing `ctx.autoResearch` service if already provided on `ctx`. */
-  private autoResearchService(context: unknown = this.ctx): AutoResearchService | undefined {
-    const holder = context as { get?: (name: string) => unknown; autoResearch?: unknown } | null | undefined
-    if (!holder) return undefined
-    if (typeof holder.get === 'function') {
-      try {
-        const value = holder.get('autoResearch')
-        if (value) return value as AutoResearchService
-      } catch {
-        // Not registered via ctx.get.
-      }
-    }
-    try {
-      return holder.autoResearch as AutoResearchService | undefined
-    } catch {
-      return undefined
-    }
-  }
-
-  /** Release the shell-env registration (the Cordis fiber normally owns it). */
-  dispose(): void {
-    this.disposeShellEnv?.()
-    this.disposeShellEnv = null
-  }
-
-  /** The `ctx.shellEnv` service, read without tripping Cordis's inject guard. */
-  private shellEnvService(context: unknown = this.ctx): PluginContext['shellEnv'] {
-    const holder = context as { get?: (name: string) => unknown; shellEnv?: unknown } | null | undefined
-    if (!holder) return undefined
-    if (typeof holder.get === 'function') {
-      try {
-        const value = holder.get('shellEnv')
-        if (value) return value as PluginContext['shellEnv']
-      } catch {
-        // The service is not injected in this host; try the property fallback.
-      }
-    }
-    try {
-      return holder.shellEnv as PluginContext['shellEnv']
-    } catch {
-      return undefined
-    }
-  }
-
-  /**
-   * Register the branch `shellEnv` contributor once a `dsh` shell registry is
-   * available. The registry may be injected after this provider is built, so
-   * `ctx.inject` is used when the service is not there yet.
-   */
-  private installShellEnvContributor(): void {
-    const install = (service: PluginContext['shellEnv'] | null | undefined): void => {
-      if (!service || typeof service.register !== 'function' || this.disposeShellEnv) return
-      try {
-        this.disposeShellEnv = service.register(this.workerEnvContributor())
-      } catch (error) {
-        // A host that refuses the registration still runs; workers then rely on
-        // the documented prompt environment only.
-        this.ctx.logger?.warn?.(`[auto-research] shellEnv contributor unavailable: ${(error as Error).message}`)
-      }
-    }
-    const existing = this.shellEnvService()
-    if (existing) {
-      install(existing)
-      return
-    }
-    const inject = (this.ctx as { inject?: unknown }).inject
-    if (typeof inject !== 'function') return
-    try {
-      ;(inject as (names: string[], callback: (child: unknown) => void) => unknown).call(
-        this.ctx,
-        ['shellEnv'],
-        child => install(this.shellEnvService(child)),
-      )
-    } catch {
-      // shellEnv is optional for this plugin.
-    }
   }
 
   /** The contributor handed to `ctx.shellEnv.register`. */
@@ -952,35 +647,6 @@ export class AutoResearchProvider implements SubagentProvider {
     return allowed
   }
 
-  private providerInfo(name: string): {
-    inheritsParentContext?: boolean
-    name?: string
-    capabilities?: { agentOptions?: unknown; [key: string]: unknown }
-  } | null {
-    const service = this.ctx.subagents
-    const registry = service.providers
-    if (registry && typeof registry === 'object') {
-      const entry = registry instanceof Map ? registry.get(name) : (registry as Record<string, SubagentProvider>)[name]
-      if (entry && typeof entry === 'object') return entry
-    }
-    for (const method of ['getProvider', 'get', 'describe'] as const) {
-      const fn = service[method]
-      if (typeof fn === 'function') {
-        try {
-          const value = fn.call(service, name) as {
-            inheritsParentContext?: boolean
-            name?: string
-            capabilities?: { agentOptions?: unknown; [key: string]: unknown }
-          } | null | undefined
-          if (value && typeof value === 'object') return value
-        } catch {
-          // Fall through to the next introspection hook.
-        }
-      }
-    }
-    return null
-  }
-
   private isRecursiveWorker(name: string): boolean {
     return name === this.name || name === 'auto-research'
   }
@@ -989,54 +655,15 @@ export class AutoResearchProvider implements SubagentProvider {
    * Refuse `subagent_auto_research` from a branch worker.
    *
    * A worker already owns one branch of a running batch: delegating another
-   * batch from inside it would recurse forever, race the runner lock of its own
-   * checkout, and corrupt `plan.json`. A delegation whose cwd is a live worker
-   * checkout or any `runs/` runtime tree is rejected the same way.
+   * batch from inside it would recurse and race the runner lock. Two signals,
+   * either sufficient: the cwd is inside a checkout carrying the runner's
+   * `.auto-research-methods/WORKER.json` marker, or the caller's session is a
+   * live worker's child session.
    */
   private assertNotRecursive(request: SubagentStartRequest, cwd: string): void {
-    const parent = request.parent as
-      | { session?: { header?: { origin?: unknown } } }
-      | null
-      | undefined
-    const origin = parent?.session?.header?.origin
-    // The real harness copies the coordinator's header (and cwd) onto a worker
-    // session and records the assigned checkout as a working-directory change,
-    // so the resolution below is what actually identifies a live worker.
-    const resolved = this.workerEnvs.resolve({ agent: request.parent, session: parent?.session, cwd })
-    if (resolved.DSH_AUTO_RESEARCH_WORKER === '1'
-      || origin === 'subagent'
-      || this.workerEnvs.ownsCheckout(cwd)
-      || isInsideRuntimeRuns(cwd)) {
+    const sessionId = sessionIdOf(request.parent)
+    if (insideWorkerCheckout(cwd) || (sessionId !== null && this.workerEnvs.hasChildSession(sessionId))) {
       throw new Error('subagent_auto_research cannot be called recursively by a worker subagent')
-    }
-  }
-
-  /**
-   * The assigned checkout of one session, when the host exposes
-   * `ctx.workingDirectory.get(session)`.
-   */
-  private sessionWorkingDirectory(session: unknown): string | null {
-    let value: unknown
-    const context = this.ctx as (PluginContext & { get?: (name: string) => unknown }) | undefined
-    try {
-      if (typeof context?.get === 'function') value = context.get('workingDirectory')
-    } catch {
-      value = undefined
-    }
-    if (!value) {
-      try {
-        value = context?.workingDirectory
-      } catch {
-        value = undefined
-      }
-    }
-    const get = (value as { get?: unknown } | null | undefined)?.get
-    if (typeof get !== 'function') return null
-    try {
-      const cwd = get.call(value, session)
-      return typeof cwd === 'string' && cwd.length > 0 ? cwd : null
-    } catch {
-      return null
     }
   }
 
@@ -1046,7 +673,7 @@ export class AutoResearchProvider implements SubagentProvider {
    * providers are preferred over in-process context-inheriting providers such as `fork`.
    */
   workerProviderName(planOverride?: unknown, preferAgentOptions = false): string {
-    const names = typeof this.ctx.subagents?.list === 'function' ? this.ctx.subagents.list() : []
+    const names = this.ctx.subagents.list()
     const configured = this.config.workerProvider
     if (configured !== undefined) {
       if (!names.includes(configured)) {
@@ -1061,20 +688,18 @@ export class AutoResearchProvider implements SubagentProvider {
       if (this.isRecursiveWorker(planRequested)) {
         throw new Error('auto-research cannot delegate to itself as a worker')
       }
-      if (names.includes(planRequested)) {
-        return planRequested
+      if (!names.includes(planRequested)) {
+        throw new Error(`plan workerProvider "${planRequested}" is not registered (available: ${names.join(', ') || 'none'})`)
       }
-      this.ctx.logger?.warn?.(
-        `[auto-research] plan requested workerProvider "${planRequested}" which is not registered (available: ${names.join(', ') || 'none'}); falling back to configured/default provider`,
-      )
+      return planRequested
     }
     if (configured !== undefined) return configured
     const candidates = names.filter(name => !this.isRecursiveWorker(name))
     if (candidates.length === 0) throw new Error('auto-research requires at least one other registered subagent provider')
-    const external = candidates.filter(name => this.providerInfo(name)?.inheritsParentContext !== true)
+    const external = candidates.filter(name => this.ctx.subagents.getProvider(name)?.inheritsParentContext !== true)
     const basePool = external.length > 0 ? external : candidates
     const optionCapable = preferAgentOptions
-      ? basePool.filter(name => (this.providerInfo(name)?.capabilities as { agentOptions?: unknown } | undefined)?.agentOptions === true)
+      ? basePool.filter(name => this.ctx.subagents.getProvider(name)?.capabilities.agentOptions === true)
       : []
     const pool = optionCapable.length > 0 ? optionCapable : basePool
     for (const preferred of PREFERRED_WORKERS) {
@@ -1089,105 +714,39 @@ export class AutoResearchProvider implements SubagentProvider {
    * model ID or display name (e.g. `glm-5.3-flash` or `GLM Flash`) without
    * hardcoding the internal provider adapter ID.
    */
+  /**
+   * Resolve the worker model against the live `ctx.llm` catalog: an exact,
+   * case-insensitive match of a model `id` or `name`, in the named provider,
+   * else the parent's provider first, then every other provider.
+   */
   private async resolveLiveWorkerAgentOptions(
     rawOptions: WorkerAgentOptions | null,
     parent: unknown,
   ): Promise<WorkerAgentOptions | null> {
     if (!rawOptions) return null
     const resolved: WorkerAgentOptions = { ...rawOptions }
-    const parentRecord = parent && typeof parent === 'object'
-      ? parent as {
-        options?: { provider?: unknown; model?: unknown }
-        session?: { requestHeader?: () => { config?: { provider?: unknown; model?: unknown } } | undefined }
+    const parentConfig = (parent as {
+      session?: { requestHeader?: () => { config?: { provider?: unknown } } | undefined }
+    } | null)?.session?.requestHeader?.()?.config
+    const parentProvider = typeof parentConfig?.provider === 'string' && parentConfig.provider.length > 0
+      ? parentConfig.provider
+      : undefined
+    const llm = this.ctx.llm
+    if (typeof resolved.model === 'string' && resolved.model.length > 0 && llm) {
+      const target = resolved.model.trim().toLowerCase()
+      const providers = resolved.provider
+        ? [resolved.provider]
+        : [...new Set([parentProvider, ...llm.listProviders().map(provider => provider.id)].filter((id): id is string => Boolean(id)))]
+      const candidates: string[] = []
+      for (const providerId of providers) {
+        const models = await llm.listModels(providerId)
+        const match = models.find(model => model.id.toLowerCase() === target || model.name?.toLowerCase() === target)
+        if (match) return { ...resolved, provider: providerId, model: match.id }
+        candidates.push(...models.map(model => `${providerId}/${model.id}`))
       }
-      : null
-    let headerConfig: { provider?: unknown; model?: unknown } | undefined
-    try {
-      headerConfig = parentRecord?.session?.requestHeader?.()?.config
-    } catch {
-      headerConfig = undefined
+      throw new Error(`worker model "${resolved.model}" matches no model id or name (candidates: ${candidates.slice(0, 20).join(', ') || 'none'})`)
     }
-    const parentProvider = typeof headerConfig?.provider === 'string' && headerConfig.provider.length > 0
-      ? headerConfig.provider
-      : typeof parentRecord?.options?.provider === 'string' && parentRecord.options.provider.length > 0
-        ? parentRecord.options.provider
-        : undefined
-
-    if (resolved.provider === undefined && typeof resolved.model === 'string' && resolved.model.includes('/')) {
-      const slashIndex = resolved.model.indexOf('/')
-      const prefix = resolved.model.slice(0, slashIndex).trim()
-      const suffix = resolved.model.slice(slashIndex + 1).trim()
-      if (prefix.length > 0 && suffix.length > 0) {
-        resolved.provider = prefix
-        resolved.model = suffix
-      }
-    }
-
-    const context = this.ctx as (PluginContext & { get?: (name: string) => unknown; llm?: unknown }) | undefined
-    type LlmServiceLike = {
-      listProviders?: () => Array<{ id: string; name?: string }>
-      listModels?: (providerId: string) => Promise<Array<{ id: string; name?: string }>>
-    }
-    let llmService: LlmServiceLike | null = null
-    try {
-      const candidate = typeof context?.get === 'function' ? context.get('llm') : context?.llm
-      if (candidate && typeof candidate === 'object') {
-        llmService = candidate as LlmServiceLike
-      }
-    } catch {
-      llmService = null
-    }
-
-    if (typeof resolved.model === 'string' && resolved.model.length > 0 && llmService) {
-      const targetModel = resolved.model.trim()
-      const targetLower = targetModel.toLowerCase()
-      const targetTokens = targetLower.split(/[^a-z0-9]+/).filter(Boolean)
-      const providerIds: string[] = []
-      if (resolved.provider) {
-        providerIds.push(resolved.provider)
-      } else {
-        if (parentProvider) providerIds.push(parentProvider)
-        try {
-          for (const p of llmService.listProviders?.() ?? []) {
-            if (typeof p?.id === 'string' && p.id.length > 0 && !providerIds.includes(p.id)) {
-              providerIds.push(p.id)
-            }
-          }
-        } catch {
-          // Ignore provider listing errors and fall back to parentProvider.
-        }
-      }
-
-      let matched: { provider: string; model: string } | null = null
-      for (const providerId of providerIds) {
-        let models: Array<{ id: string; name?: string }> = []
-        try {
-          models = (await llmService.listModels?.(providerId)) ?? []
-        } catch {
-          models = []
-        }
-        const exact = models.find(m => m.id === targetModel)
-          ?? models.find(m => m.id.toLowerCase() === targetLower || m.name?.toLowerCase() === targetLower)
-          ?? (targetTokens.length > 0
-            ? models.find(m => {
-              const haystack = `${m.id} ${m.name ?? ''}`.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean)
-              return targetTokens.every(tok => haystack.includes(tok))
-            })
-            : undefined)
-        if (exact) {
-          matched = { provider: providerId, model: exact.id }
-          break
-        }
-      }
-      if (matched) {
-        resolved.provider = matched.provider
-        resolved.model = matched.model
-      }
-    }
-
-    if (resolved.provider === undefined && parentProvider !== undefined) {
-      resolved.provider = parentProvider
-    }
+    if (resolved.provider === undefined && parentProvider !== undefined) resolved.provider = parentProvider
     return resolved
   }
 
@@ -1203,18 +762,17 @@ export class AutoResearchProvider implements SubagentProvider {
     if (!stat?.isDirectory()) throw new Error('auto-research child cwd is not an accessible directory: ' + cwd)
     if (!request.parent) throw new Error('auto-research requires the exact live parent agent')
 
-    const promptText = extractPromptText(request.prompt)
-    const { plan, source } = await resolvePlan({ cwd, config: this.config, promptText })
+    const { plan, source } = await resolvePlan({ cwd, config: this.config })
     if (typeof plan.evaluator !== 'string') throw new Error('Plan requires an evaluator script')
     if (!isAbsolute(plan.evaluator)) plan.evaluator = resolve(cwd, plan.evaluator)
     const evaluatorPath = plan.evaluator
     if (typeof evaluatorPath !== 'string') throw new Error('Plan requires an evaluator script')
     const evaluatorStat = await fsp.stat(evaluatorPath).catch(() => null)
     if (!evaluatorStat?.isFile()) throw new Error('Research plan evaluator does not exist: ' + evaluatorPath)
+    // Validate the complete plan before any lock, run directory or mount exists.
+    const options = normalizeOptions(this.config, plan)
+    validatePlan(plan, options)
 
-    const planOptionsRecord = plan.options && typeof plan.options === 'object'
-      ? plan.options as Record<string, unknown>
-      : {}
     const workerAgentOptions: WorkerAgentOptions | null = await this.resolveLiveWorkerAgentOptions(
       resolveWorkerAgentOptions(
         this.config,
@@ -1223,31 +781,23 @@ export class AutoResearchProvider implements SubagentProvider {
       ),
       request.parent,
     )
-    const planWorkerProvider = plan.workerProvider ?? plan.worker_provider ?? planOptionsRecord.workerProvider
-    const workerProvider = this.workerProviderName(planWorkerProvider, Boolean(workerAgentOptions))
+    const workerProvider = this.workerProviderName((plan.options as PlanOptions | undefined)?.workerProvider, Boolean(workerAgentOptions))
     const workspaceRoot = await selectPlanWorkspace(cwd, plan as { workspace?: unknown })
     const runtimeRoot = join(workspaceRoot, '.auto-research-methods')
-    await assertRuntimeRootContained(workspaceRoot, runtimeRoot)
-    await assertRuntimeRootContained(workspaceRoot, join(runtimeRoot, 'runs'))
     const seed = resolve(workspaceRoot) !== resolve(cwd)
-    if (seed) {
-      await assertRuntimeRootContained(cwd, join(cwd, '.auto-research-methods'))
-    }
     const runId = randomUUID()
     const output = join(runtimeRoot, 'runs', runId)
     // Take the checkout lock before creating anything: a concurrent batch on
     // the same checkout must fail without leaving an orphan `runs/<runId>`
     // directory or overwriting `SEED.json`.
     const lock = await acquireRunnerLock(runtimeRoot, runId, { cwd })
-    this.activeBatches += 1
-    let manager: Awaited<ReturnType<typeof createWorkspaceManager>> | null = null
+    let manager: WorkspaceManager | null = null
     let initialState: WorkspaceState | null = null
     let runner: Runner | null = null
     let released = false
     const releaseLock = async (): Promise<void> => {
       if (released) return
       released = true
-      this.activeBatches = Math.max(0, this.activeBatches - 1)
       await lock.release()
     }
     try {
@@ -1264,10 +814,10 @@ export class AutoResearchProvider implements SubagentProvider {
       const originalManifest = await inventory(workspaceRoot)
       const selectionFile = join(runtimeRoot, 'LATEST.json')
 
-      const shellEnv = await resolveShellEnvironment(this.ctx, request.parent)
+      const shellEnv = resolveShellEnvironment(this.ctx.shellEnv, request.parent)
       const env: NodeJS.ProcessEnv & Record<string, unknown> = { ...process.env, ...shellEnv }
       const explicitLayerfs = this.config.layerfs
-      const snapshotForced = explicitLayerfs === false || this.config.workspaceBackend === 'snapshot'
+      const snapshotForced = explicitLayerfs === false || options.workspaceBackend === 'snapshot'
       const layerfsConfig = !snapshotForced && explicitLayerfs && typeof explicitLayerfs === 'object' ? explicitLayerfs : null
       const layerfsSettings: LayerFSSettings | null = layerfsConfig?.client
         ? null
@@ -1277,16 +827,16 @@ export class AutoResearchProvider implements SubagentProvider {
       const layerfsEnv = snapshotForced
         ? {}
         : withoutLayerfsTrace(layerfsEnvironment(env, layerfsSettings, explicitLayerfs))
-      manager = await createWorkspaceManager({
+      manager = new WorkspaceManager(await this.workspaces.select(options.workspaceBackend, {
         output,
         runId,
         config: this.config,
         env,
         ...(layerfsConfig?.client ? { layerfs: layerfsConfig } : {}),
-        backends: this.service.listWorkspaceBackends(),
-      })
+      }), { output })
 
       let sourceWorkspace = workspaceRoot
+      let frontier: Frontier | null = null
       if (await pathExists(selectionFile)) {
         let latest = null
         try {
@@ -1294,6 +844,7 @@ export class AutoResearchProvider implements SubagentProvider {
         } catch {
           throw new Error(`Previous run selection is not valid JSON: ${selectionFile}`)
         }
+        frontier = (latest?.frontier as Frontier | undefined) ?? null
         if (latest?.original_manifest && !jsonEqual(latest.original_manifest, originalManifest)) {
           throw new Error('Original workspace changed since the last method run. Select/reconcile the intended starting workspace before continuing; all branches preserved.')
         }
@@ -1354,7 +905,7 @@ export class AutoResearchProvider implements SubagentProvider {
         output,
         env: evaluatorEnv,
         logger: this.ctx.logger ?? null,
-        subprocess: this.subprocessService() ?? null,
+        executor: await this.executors.select(options.executor, { config: this.config, plan }),
       })
       runner = new Runner({
         config: publicConfig(this.config),
@@ -1363,6 +914,7 @@ export class AutoResearchProvider implements SubagentProvider {
         output,
         originalManifest,
         selectionFile,
+        frontier,
         deps: {
           subagents: this.ctx.subagents,
           workspaceManager: manager,
@@ -1470,6 +1022,6 @@ export class AutoResearchProvider implements SubagentProvider {
 }
 
 /** @returns a provider for the Cordis entry point. */
-export function createProvider(options: { ctx: PluginContext; config?: Config }): AutoResearchProvider {
+export function createProvider(options: ProviderOptions): AutoResearchProvider {
   return new AutoResearchProvider(options)
 }

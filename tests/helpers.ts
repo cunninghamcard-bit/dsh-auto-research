@@ -1,6 +1,12 @@
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { ResearchExecutorRegistry, ResearchWorkspaceRegistry } from '../lib/registry.js'
+import { LocalExecutor, LocalExecutorFactory } from '../lib/local.js'
+import { LayerFSWorkspaceFactory } from '../lib/layerfs.js'
+import { SnapshotWorkspaceFactory } from '../lib/snapshot.js'
+import { SnapshotBackend, WorkspaceManager } from '../lib/layerfs-workspace.js'
 
 /** Create a temporary directory inside the OS temp root. */
 export async function tempDir(prefix = 'dsh-auto-research-'): Promise<string> {
@@ -44,20 +50,35 @@ export function fakeClock(start = 1000): FakeClock {
  * The structural host surface is intentionally loose (`any`) here: tests build
  * partial Cordis contexts and assert on the recorded calls.
  */
+/** The worker's `.auto-research-methods/BRANCH.json`, or null outside a branch checkout. */
+export function readBranch(cwd: string | undefined): any {
+  const file = cwd ? join(cwd, '.auto-research-methods', 'BRANCH.json') : ''
+  return file && existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : null
+}
+
 export function fakeSubagents(
   handler: (spec: any, index: number) => any,
   names: string[] = ['worker'],
 ): {
   calls: any[]
   list: () => string[]
+  getProvider: (name: string) => any
+  registerProvider: () => () => void
   startActivation: (spec: any) => Promise<any>
 } {
   const calls: any[] = []
   return {
     calls,
     list: () => [...names],
-    async startActivation(spec: any) {
+    getProvider: (name: string) => names.includes(name)
+      ? { name, inheritsParentContext: false, capabilities: { agentOptions: true } }
+      : undefined,
+    registerProvider: () => () => {},
+    async startActivation(input: any) {
       const index = calls.length
+      // The branch parameters are removed when the activation ends, so each
+      // call keeps the BRANCH.json its worker saw.
+      const spec = { ...input, branch: readBranch(input.request?.cwd) }
       calls.push(spec)
       let value: any
       try {
@@ -140,3 +161,52 @@ export async function writeWorkspace(
 export async function setState(root: string, state: Record<string, unknown>): Promise<void> {
   await writeFile(join(root, 'state.json'), JSON.stringify(state, null, 2) + '\n')
 }
+
+/** The registry the recommended profile builds: LayerFS first, snapshot fallback. */
+export function testWorkspaces(): ResearchWorkspaceRegistry {
+  const registry = new ResearchWorkspaceRegistry()
+  registry.register(new LayerFSWorkspaceFactory())
+  registry.register(new SnapshotWorkspaceFactory())
+  return registry
+}
+
+/** A snapshot-backed workspace manager for runner-level tests. */
+export function snapshotManager({ output, runId = 'run' }: { output: string; runId?: string; env?: unknown }): WorkspaceManager {
+  return new WorkspaceManager(new SnapshotBackend({ output, runId }), { output })
+}
+
+/**
+ * The Cordis surface the plugin entries use: `provide` puts a service on the
+ * context, `effect` collects disposers, and `dispose()` unloads like a fiber.
+ */
+export function fakePluginContext(services: Record<string, unknown> = {}): any {
+  const disposers: Array<() => void> = []
+  const ctx: any = {
+    ...services,
+    // Runs the callback now when every dependency is present, like Cordis.
+    inject(deps: string[], callback: (inner: any) => void) {
+      if (deps.every(dep => ctx[dep])) callback(ctx)
+    },
+    provide(name: string, value: unknown) {
+      ctx[name] = value
+      return () => { delete ctx[name] }
+    },
+    effect(callback: () => () => void) {
+      disposers.push(callback())
+    },
+    dispose() {
+      while (disposers.length > 0) disposers.pop()!()
+    },
+  }
+  return ctx
+}
+
+/** The registry the recommended profile builds for evaluators: local only. */
+export function testExecutors(): ResearchExecutorRegistry {
+  const registry = new ResearchExecutorRegistry()
+  registry.register(new LocalExecutorFactory())
+  return registry
+}
+
+/** The executor runner-level tests evaluate with. */
+export const localExecutor = new LocalExecutor()

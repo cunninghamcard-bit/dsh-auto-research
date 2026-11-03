@@ -5,14 +5,13 @@ import { join } from 'node:path'
 import {
   AutoResearchProvider,
   NO_START_CAPABILITIES,
-  extractPromptText,
-  parsePlanFromPrompt,
   resolveConfig,
   resolvePlan,
 } from '../lib/provider.js'
-import { Config, apply, coordinatorPolicy, name as pluginName, inject } from '../lib/index.js'
+import { Config, apply, name as pluginName, inject } from '../lib/index.js'
 import { ResearchStoppedError } from '../lib/runner.js'
-import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
+import { ResearchWorkspaceRegistry } from '../lib/registry.js'
+import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, testWorkspaces, fakePluginContext, testExecutors } from './helpers.ts'
 
 function planObject(root: string, extra: Record<string, any> = {}): any {
   return {
@@ -48,7 +47,7 @@ async function fixture(root: string, {
     await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
     return { output: [], stopReason: 'completed' }
   }), ['worker'])
-  const provider = new AutoResearchProvider({
+  const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
     ctx: { subagents, logger: { info() {}, warn() {} } },
     config: {
       workerProvider: 'worker',
@@ -92,44 +91,22 @@ function fakeLayerfs(root: string, actions: any[]) {
   }
 }
 
-describe('provider parsing helpers', () => {
-  it('extracts text blocks from prompt content', () => {
-    assert.equal(extractPromptText('plain'), 'plain')
-    assert.equal(extractPromptText([{ type: 'text', text: 'a' }, { type: 'text', text: 'b' }]), 'a\nb')
-    assert.equal(extractPromptText([{ type: 'image' }]), '')
-    assert.equal(extractPromptText(null), '')
-  })
-
-  it('finds a plan in a fenced block, a PLAN_JSON line, or a bare object', () => {
-    const plan = { objective: 'o', evaluator: 'e' }
-    assert.deepEqual(parsePlanFromPrompt('```json\n' + JSON.stringify(plan) + '\n```'), plan)
-    assert.deepEqual(parsePlanFromPrompt('hello\nPLAN_JSON: ' + JSON.stringify(plan)), plan)
-    assert.deepEqual(parsePlanFromPrompt(JSON.stringify(plan)), plan)
-    assert.equal(parsePlanFromPrompt('no plan here'), null)
-    assert.equal(parsePlanFromPrompt('```json\n{"objective":"o"}\n```'), null)
-  })
-
-  it('prefers config, then the plan file, then the prompt', async () => {
+describe('plan source', () => {
+  it('reads config.plan, else the plan file, else fails', async () => {
     await withTemp(async root => {
       const config = { plan: { objective: 'o', evaluator: 'e' }, planPath: '.auto-research-methods/plan.json' } as any
-      assert.equal((await resolvePlan({ cwd: root, config, promptText: '' })).source, 'config')
+      assert.equal((await resolvePlan({ cwd: root, config })).source, 'config')
     })
     await withTemp(async root => {
       await mkdir(join(root, '.auto-research-methods'), { recursive: true })
       await writeFile(join(root, '.auto-research-methods', 'plan.json'), JSON.stringify({ objective: 'o', evaluator: 'e' }))
-      const result = await resolvePlan({ cwd: root, config: { planPath: '.auto-research-methods/plan.json' } as any, promptText: '' })
+      const result = await resolvePlan({ cwd: root, config: { planPath: '.auto-research-methods/plan.json' } as any })
       assert.equal(result.source.endsWith('plan.json'), true)
     })
     await withTemp(async root => {
-      const result = await resolvePlan({
-        cwd: root,
-        config: { planPath: '.auto-research-methods/plan.json' } as any,
-        promptText: '```json\n{"objective":"o","evaluator":"e"}\n```',
-      })
-      assert.equal(result.source, 'prompt')
-    })
-    await withTemp(async root => {
-      await assert.rejects(resolvePlan({ cwd: root, config: { planPath: 'none.json' } as any, promptText: '' }), /No research plan/)
+      await writeFile(join(root, 'plan.json'), JSON.stringify({ objective: 'o' }))
+      await assert.rejects(resolvePlan({ cwd: root, config: { planPath: 'plan.json' } as any }), /incomplete/)
+      await assert.rejects(resolvePlan({ cwd: root, config: { planPath: 'none.json' } as any }), /No research plan/)
     })
   })
 })
@@ -142,45 +119,70 @@ describe('plugin entry', () => {
     assert.equal(resolveConfig({}).rounds, 1)
   })
 
-  it('registers the provider and the coordinator prompt section', () => {
+  it('registers the provider and the packaged skills, without a system prompt section', async () => {
     const registered: any[] = []
-    const sections: any[] = []
-    const ctx: any = {
+    const skillFactories: any[] = []
+    const ctx = fakePluginContext({
       subagents: {
-        registerProvider(provider: any) { registered.push(provider) },
+        registerProvider(provider: any) { registered.push(provider); return () => {} },
       },
-      systemPrompt: {
-        getSectionOrder(name: any) { return name === 'PLAN_POLICY' ? 500 : 999 },
-        section(section: any) { sections.push(section) },
-      },
-    }
+      skills: { registerProvider(factory: any) { skillFactories.push(factory) } },
+    })
     apply(ctx, { branches: 2, rsiTop: false })
+    // The core provides the backend registry and registers no backend itself.
+    assert.ok(ctx.researchWorkspace instanceof ResearchWorkspaceRegistry)
+    assert.deepEqual(ctx.researchWorkspace.list(), [])
     assert.equal(pluginName, 'dsh-auto-research')
-    assert.deepEqual(inject, ['subagents', 'systemPrompt'])
+    assert.deepEqual(inject, ['subagents', 'skills'])
     assert.equal(registered.length, 1)
     assert.equal(registered[0].name, 'auto-research')
     assert.equal(registered[0].inheritsParentContext, false)
     assert.equal(registered[0].capabilities, NO_START_CAPABILITIES)
-    assert.equal(sections.length, 1)
-    assert.equal(sections[0].name, 'auto-research:coordinator')
-    assert.equal(sections[0].order, 500)
-    assert.equal(sections[0].interpolate, false)
-    assert.match(sections[0].text, /You are the coordinator/)
-    assert.match(sections[0].text, /RESEARCH_STATUS: continue/)
-    assert.match(coordinatorPolicy(), /Collaborative evidence sharing/)
+    assert.equal(skillFactories.length, 1)
+    let invalidated = 0
+    const skills = skillFactories[0]({ invalidate: () => { invalidated += 1 }, signal: new AbortController().signal })
+    assert.deepEqual((await skills.list({ cwd: '/repo' })).map((entry: any) => entry.name), ['auto-research'])
+    // A live worker checkout switches the catalog and invalidates it on start and stop.
+    const lease = registered[0].workerEnvs.register({ id: 'b', checkout: '/work/branch' })
+    assert.deepEqual((await skills.list({ cwd: '/work/branch/src' })).map((entry: any) => entry.name), ['auto-research-worker'])
+    lease.dispose()
+    assert.equal(invalidated, 2)
+    ctx.dispose()
   })
 
-  it('falls back to a numeric order when the host lacks getSectionOrder', () => {
-    const sections: any[] = []
-    apply({
-      subagents: { registerProvider() {} },
-      systemPrompt: { section(section: any) { sections.push(section) } },
-    } as any, {})
-    assert.equal(sections[0].order, 500)
+  it('registers the branch shellEnv contributor while ctx.shellEnv exists', () => {
+    const contributors: any[] = []
+    let released = 0
+    const shellEnv = {
+      register(contributor: any) { contributors.push(contributor); return () => { released += 1 } },
+      collect: () => ({}),
+    }
+    const ctx = fakePluginContext({
+      subagents: { registerProvider: () => () => {} },
+      skills: { registerProvider() {} },
+      shellEnv,
+    })
+    apply(ctx, {})
+    assert.deepEqual(contributors.map(item => item.name), ['auto-research'])
+    ctx.dispose()
+    assert.equal(released, 1)
   })
 })
 
 describe('AutoResearchProvider', () => {
+  it('rejects an invalid plan before taking the lock or creating a run', async () => {
+    await withTemp(async root => {
+      const { cwd, provider, subagents } = await fixture(root, { plan: { worker_prompt: '' } })
+      await assert.rejects(provider.start({
+        cwd,
+        prompt: [{ type: 'text', text: 'start the batch' }],
+        parent: { id: 'parent' },
+      }), /Plan requires a worker_prompt/)
+      assert.deepEqual((await readdir(join(cwd, '.auto-research-methods'))).sort(), ['plan.json'])
+      assert.equal(subagents.calls.length, 0)
+    })
+  })
+
   it('runs one batch from a plan file and settles through result', async () => {
     await withTemp(async root => {
       const { cwd, provider, subagents } = await fixture(root)
@@ -205,35 +207,11 @@ describe('AutoResearchProvider', () => {
     })
   })
 
-  it('accepts a plan embedded in the delegation prompt', async () => {
-    await withTemp(async root => {
-      const cwd = join(root, 'repo')
-      await writeWorkspace(cwd, { score: 1, metrics: { score: 1 } })
-      await writeStateEvaluator(join(cwd, 'evaluator.mjs'))
-      const plan = { ...planObject(cwd), evaluator: 'evaluator.mjs' }
-      const subagents = fakeSubagents(async spec => {
-        await setState(spec.request.cwd, { score: 5, metrics: { score: 5 } })
-        return { output: [], stopReason: 'completed' }
-      }, ['worker'])
-      const provider = new AutoResearchProvider({ ctx: { subagents, logger: {} }, config: { workerProvider: 'worker' } })
-      const handle = await provider.start({
-        cwd,
-        prompt: [{ type: 'text', text: 'Plan:\n```json\n' + JSON.stringify(plan) + '\n```' }],
-        parent: { id: 'parent' },
-        signal: new AbortController().signal,
-      })
-      const result = await handle.result
-      assert.equal(result.stopReason, 'completed')
-      assert.match((result.output as any)[0].text, /score: 5/)
-      await handle.dispose()
-    })
-  })
-
   it('rejects setup errors before publication', async () => {
     await withTemp(async root => {
       const cwd = join(root, 'repo')
       await writeWorkspace(cwd, { score: 1, metrics: { score: 1 } })
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents: fakeSubagents(async () => ({ stopReason: 'completed' }), ['worker']) },
         config: { workerProvider: 'worker' },
       })
@@ -266,7 +244,7 @@ describe('AutoResearchProvider', () => {
       await writeFile(join(cwd, '.auto-research-methods', 'plan.json'), JSON.stringify({
         ...planObject(cwd), evaluator: join(cwd, 'missing.mjs'),
       }))
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents: fakeSubagents(async () => ({ stopReason: 'completed' }), ['worker']) },
         config: { workerProvider: 'worker' },
       })
@@ -274,7 +252,7 @@ describe('AutoResearchProvider', () => {
     })
     await withTemp(async root => {
       const { cwd } = await fixture(root)
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents: fakeSubagents(async () => ({ stopReason: 'completed' }), ['worker']) },
         config: { workerProvider: 'worker', branches: 1 },
       })
@@ -282,7 +260,7 @@ describe('AutoResearchProvider', () => {
     })
     await withTemp(async root => {
       const { cwd } = await fixture(root)
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents: { list: () => ['auto-research'], startActivation() {} } } as any,
         config: { workerProvider: 'auto-research' },
       })
@@ -290,7 +268,7 @@ describe('AutoResearchProvider', () => {
     })
     await withTemp(async root => {
       const { cwd } = await fixture(root)
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents: { list: () => ['auto-research'], startActivation() {} } } as any,
         config: {},
       })
@@ -298,11 +276,49 @@ describe('AutoResearchProvider', () => {
     })
     await withTemp(async root => {
       const { cwd } = await fixture(root)
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents: { list: () => ['worker'], startActivation() {} } } as any,
         config: { workerProvider: 'missing' },
       })
       await assert.rejects(provider.start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }), /not registered/)
+    })
+  })
+
+  it('resolves the worker model by exact id or name and refuses an unregistered plan workerProvider', async () => {
+    await withTemp(async root => {
+      const { cwd } = await fixture(root)
+      const llm = {
+        listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }, { id: 'openai', name: 'OpenAI' }],
+        listModels: async (provider: string) => provider === 'deepseek'
+          ? [{ id: 'deepseek-chat', name: 'DeepSeek Chat' }]
+          : [{ id: 'gpt-5', name: 'GPT 5' }],
+      }
+      const calls: any[] = []
+      const subagents = fakeSubagents(async (spec: any) => {
+        calls.push(spec)
+        await setState(spec.request.cwd, { score: 2, metrics: { score: 2 } })
+        return { output: [], stopReason: 'completed' }
+      }, ['worker'])
+      const start = (config: any) => new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
+        ctx: { subagents, llm },
+        config: { workerProvider: 'worker', branches: 2, ...config },
+      }).start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal })
+      const run = await start({ workerModel: 'deepseek chat' })
+      assert.equal((await run.result).stopReason, 'completed')
+      const launch = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'runs', (await readdir(join(cwd, '.auto-research-methods', 'runs')))[0]!, 'round-1-continue-1', 'LAUNCH.json'), 'utf8'))
+      assert.deepEqual(launch.worker_agent_options, { provider: 'deepseek', model: 'deepseek-chat' })
+      await run.dispose()
+      // A token subset is not a name: "chat" alone matched before.
+      await assert.rejects(start({ workerModel: 'chat' }), /worker model "chat" matches no model id or name \(candidates: deepseek\/deepseek-chat, openai\/gpt-5\)/)
+    })
+    await withTemp(async root => {
+      const { cwd } = await fixture(root)
+      await writeFile(join(cwd, '.auto-research-methods', 'plan.json'), JSON.stringify({ ...planObject(cwd), options: { workerProvider: 'missing' } }))
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
+        ctx: { subagents: { list: () => ['worker'], startActivation() {} } } as any,
+        config: {},
+      })
+      await assert.rejects(provider.start({ cwd, prompt: [], parent: { id: 'p' }, signal: new AbortController().signal }), /plan workerProvider "missing" is not registered/)
     })
   })
 
@@ -395,33 +411,5 @@ describe('AutoResearchProvider', () => {
         signal: new AbortController().signal,
       }), /Original workspace changed/)
     })
-  })
-
-  it('exposes ctx.autoResearch service interface for workspace backend plugins', async () => {
-    const ctx: any = {
-      subagents: { registerProvider() {} },
-      systemPrompt: { section() {} },
-    }
-    apply(ctx, {})
-    assert.ok(ctx.autoResearch)
-    assert.deepEqual(
-      ctx.autoResearch.listWorkspaceBackends().map((b: any) => b.name),
-      ['layerfs', 'snapshot'],
-    )
-    const customBackend = {
-      name: 'custom-backend',
-      async create() { return null },
-    }
-    const disposeBackend = ctx.autoResearch.registerWorkspaceBackend(customBackend)
-    assert.deepEqual(
-      ctx.autoResearch.listWorkspaceBackends().map((b: any) => b.name),
-      ['layerfs', 'custom-backend', 'snapshot'],
-    )
-    assert.equal(ctx.autoResearch.getWorkspaceBackend('custom-backend')?.name, 'custom-backend')
-    disposeBackend()
-    assert.deepEqual(
-      ctx.autoResearch.listWorkspaceBackends().map((b: any) => b.name),
-      ['layerfs', 'snapshot'],
-    )
   })
 })

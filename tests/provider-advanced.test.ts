@@ -6,7 +6,7 @@ import {
   AutoResearchProvider,
   acquireRunnerLock,
 } from '../lib/provider.js'
-import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace } from './helpers.ts'
+import { fakeSubagents, setState, withTemp, writeStateEvaluator, writeWorkspace, testWorkspaces, testExecutors } from './helpers.ts'
 
 function planObject(root: string, extra: Record<string, any> = {}): any {
   return {
@@ -50,7 +50,7 @@ async function fixture(root: string, {
   }))
   const ctx: any = { subagents, logger: { info() {}, warn() {} } }
   if (shellEnv) ctx.shellEnv = shellEnv
-  const provider = new AutoResearchProvider({
+  const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
     ctx,
     config: {
       workerProvider: 'worker',
@@ -118,7 +118,8 @@ describe('P0: LayerFS environment from ctx.shellEnv', () => {
         const sdk = join(root, 'sdk.mjs')
         await writeFile(sdk, sdkModule(mounts))
         const shellEnv = {
-          async resolve() {
+          register: () => () => {},
+          collect() {
             return {
               DSH_LAYERFS_PROJECT: 'shell-project',
               DSH_LAYERFS_SDK: sdk,
@@ -137,9 +138,9 @@ describe('P0: LayerFS environment from ctx.shellEnv', () => {
         const result = await handle.result
         assert.equal(result.stopReason, 'completed')
         assert.equal(subagents.calls.length, 1)
-        const prompt = subagents.calls[0].request.prompt[0].text
-        assert.match(prompt, /"DSH_LAYERFS_PROJECT":"shell-project"/)
-        assert.match(prompt, /"DSH_LAYERFS_IMAGE":"image:test"/)
+        const environment = subagents.calls[0].branch.environment
+        assert.ok(environment.includes('DSH_LAYERFS_PROJECT'))
+        assert.ok(environment.includes('DSH_LAYERFS_IMAGE'))
         const latest = JSON.parse(await readFile(join(cwd, '.auto-research-methods', 'LATEST.json'), 'utf8'))
         assert.match(latest.leader_branch, /^ar-/)
         const runs = await readdir(join(cwd, '.auto-research-methods', 'runs'))
@@ -188,7 +189,7 @@ describe('P0/P1: leader adoption, seed runtime, and cancellation artifacts', () 
         await setState(spec.request.cwd, { score: 3, metrics: { score: 3 } })
         return { output: [], stopReason: 'completed' }
       })
-      const provider = new AutoResearchProvider({
+      const provider = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
         ctx: { subagents, logger: {} },
         config: { workerProvider: 'worker', branches: 2, explorationMinutes: 0.5, exploitationMinutes: 0.5 },
       })
@@ -294,32 +295,32 @@ describe('P1: checkout lock and worker selection', () => {
     const ctx: any = {
       subagents: {
         list: () => ['fork', 'claude-code', 'codex'],
-        get: (name: string) => providers[name],
+        getProvider: (name: string) => providers[name],
       },
     }
-    assert.equal(new AutoResearchProvider({ ctx, config: {} }).workerProviderName(), 'claude-code')
-    const getter = new AutoResearchProvider({
+    assert.equal(new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(), ctx, config: {} }).workerProviderName(), 'claude-code')
+    const getter = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
       ctx: { subagents: { list: () => ['fork', 'acp'], getProvider: (name: string) => providers[name] } } as any,
       config: {},
     })
     assert.equal(getter.workerProviderName(), 'acp')
 
-    const onlyFork = new AutoResearchProvider({
-      ctx: { subagents: { list: () => ['fork'], get: (name: string) => providers[name] } } as any,
+    const onlyFork = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
+      ctx: { subagents: { list: () => ['fork'], getProvider: (name: string) => providers[name] } } as any,
       config: {},
     })
     assert.equal(onlyFork.workerProviderName(), 'fork')
 
-    const recursive = new AutoResearchProvider({
-      ctx: { subagents: { list: () => ['auto-research', 'fork'], describe: (name: string) => providers[name] } } as any,
+    const recursive = new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
+      ctx: { subagents: { list: () => ['auto-research', 'fork'], getProvider: (name: string) => providers[name] } } as any,
       config: {},
     })
     assert.equal(recursive.workerProviderName(), 'fork')
-    assert.throws(() => new AutoResearchProvider({
+    assert.throws(() => new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
       ctx: { subagents: { list: () => ['auto-research'] } } as any,
       config: { workerProvider: 'auto-research' },
     }).workerProviderName(), /cannot delegate to itself/)
-    assert.throws(() => new AutoResearchProvider({
+    assert.throws(() => new AutoResearchProvider({ workspaces: testWorkspaces(), executors: testExecutors(),
       ctx: { subagents: { list: () => ['auto-research'] } } as any,
       config: {},
     }).workerProviderName(), /at least one other/)

@@ -10,23 +10,45 @@
  */
 import { jsonDigest, publicRow } from './layerfs-workspace.js';
 import { buildZeroSynthesisContext } from './protocols.js';
-import type { BatchResult, Clock, Config, EvaluationResult, MetricDiagnostic, MetricView, Phase, ProviderOutcome, ResearchOptions, ResearchPlan, ResearchPlanInput, RunnerDeps, SharedCheckpoint, SubagentResult, TrajectoryRow, WorkerAgentOptions, WorkspaceState } from './types.js';
+import type { BatchResult, Clock, Config, EvaluationResult, MetricDiagnostic, MetricView, Phase, ResearchOptions, ResearchPlan, ResearchPlanInput, RunnerDeps, SharedCheckpoint, SubagentResult, TrajectoryRow, WorkerAgentOptions, WorkspaceState } from './types.js';
 /** Raised when a batch is stopped by the caller; artifacts are retained. */
 export declare class ResearchStoppedError extends Error {
     constructor(message?: string);
 }
 declare const DEFAULT_CLOCK: Clock;
+/**
+ * Stall state carried across batches in `LATEST.json`.
+ *
+ * The coordinator delegates one batch at a time, so a per-batch clock would
+ * never reach `stall_seconds` with `rounds: 1`. Only phase work time counts;
+ * the time between batches does not.
+ */
+export interface Frontier {
+    evaluator_sha256: string | null;
+    anchor_score: string | null;
+    stalled_work_seconds: number;
+}
+/** One row of {@link Runner.states}. */
+export interface StateEntry {
+    id: string;
+    parent: string | null;
+    workspace: string;
+    active: boolean;
+    released: boolean;
+}
 /** Merge plan-level option overrides over plugin configuration. */
 export declare function normalizeOptions(config?: Config, plan?: ResearchPlanInput): ResearchOptions;
-/** Merge config-level, plan-level, and request-level child LLM selection options. */
+/**
+ * Merge the child LLM selection: the request's `agentOptions`, then
+ * `plan.options`, then the plugin configuration. Within a layer,
+ * `workerAgentOptions` wins over the single `worker*` fields.
+ */
 export declare function resolveWorkerAgentOptions(config?: Config, plan?: ResearchPlanInput, override?: WorkerAgentOptions | null): WorkerAgentOptions | null;
 /**
  * Validate the model-written plan against the execution contract and return
  * normalized defaults. Values are never replaced with repository heuristics.
  */
 export declare function validatePlan(plan: unknown, options: ResearchOptions): ResearchPlan;
-/** Port of `provider_outcome`: transport diagnostics are not turn failures. */
-export declare function providerOutcome(events: unknown[] | undefined, rc: number | null, timedOut: boolean): ProviderOutcome;
 /** Extract assistant text from a provider `output` value. */
 export declare function outputText(output: SubagentResult['output']): string;
 interface PeerSlot {
@@ -72,33 +94,31 @@ export declare class Runner {
     readonly selections: Array<Record<string, unknown>>;
     peerBundle: string | null;
     readonly peerSlots: Record<string, PeerSlot>;
-    bestTime: number;
+    /** Phase work seconds since the last meaningful gain, across batches. */
+    stalledWorkSeconds: number;
+    readonly savedFrontier: Frontier | null;
     anchor: number | null;
     cancelled: boolean;
     readonly abort: AbortController;
     timedOutRows: TrajectoryRow[];
     readonly abandoned: TrajectoryRow[];
-    readonly activeStates: Map<WorkspaceState, {
-        id: string;
-        parent: string | null;
-        workspace: string;
-    }>;
-    /** Every state a backend created, from the moment it was returned. */
-    readonly trackedStates: Map<WorkspaceState, {
-        id: string;
-        parent: string | null;
-        workspace: string;
-    }>;
-    readonly releasedStates: Set<WorkspaceState>;
+    /**
+     * Every state a backend created or this batch adopted, from the moment it
+     * was returned. `active` marks a branch whose worker is still running (or a
+     * stopped branch the result must still report); `released` is set once the
+     * backend confirmed the unmount.
+     */
+    readonly states: Map<WorkspaceState, StateEntry>;
     readonly workerGraceMs: number;
     private managerClosed;
-    constructor({ config, plan, workspace, output, originalManifest, selectionFile, deps, }: {
+    constructor({ config, plan, workspace, output, originalManifest, selectionFile, frontier, deps, }: {
         config?: Config;
         plan: unknown;
         workspace: string;
         output: string;
         originalManifest?: Record<string, string> | null;
         selectionFile?: string | null;
+        frontier?: Frontier | null;
         deps: RunnerDeps;
     });
     now(): number;
@@ -112,8 +132,9 @@ export declare class Runner {
     /** Whether the configured worker provider accepts `request.agentOptions`. */
     private workerProviderAcceptsAgentOptions;
     signalForWork(): AbortSignal;
-    /** Remember a created state so a failed sibling or cohort cannot leak it. */
-    private trackState;
+    /** The table entry of `state`, created on first sight. */
+    private track;
+    private isReleased;
     /**
      * Record rows in the dashboard exactly once.
      *
@@ -125,26 +146,24 @@ export declare class Runner {
     /** Clear the row handles that point at a state whose release succeeded. */
     private markReleased;
     /**
-     * Release one state. The handle is retained when the backend refuses, so a
-     * later `releaseAll()` can retry and `pendingWorkspaces()` still reports it.
+     * Commit `state` with `message`, then release it. A refused commit is
+     * logged and the release still runs; a refused release keeps the handle, so
+     * `releaseAll()` retries it and `pendingWorkspaces()` still reports it.
      */
-    private releaseTracked;
+    private commitAndRelease;
     /**
-     * Await a worker activation, but never past a short grace after its signal
-     * aborts. A provider that ignores abort gets disposed and the batch moves on.
+     * Await a worker activation, then dispose it. One `workerGraceMs` window,
+     * opened by the abort (or by the result when there was none), bounds both
+     * the result and the disposal: a provider that ignores abort is left behind.
      */
-    private awaitActivationResult;
-    /** Wait for a disposal, but do not let a stuck provider hold the batch. */
-    private disposeWithin;
+    private awaitActivation;
     metricDiagnostics(): MetricDiagnostic[];
     dashboard(): Record<string, unknown>;
-    checkDisk(workspace: string, count: number): Promise<void>;
+    checkDisk(parent: WorkspaceState, count: number): Promise<void>;
     views(count: number): MetricView[];
     /** Run all branches; one unexpected rejection aborts its siblings. */
     private runBranches;
     run(): Promise<BatchResult>;
-    /** Persist the honest cancellation artifact (idempotent). */
-    writeStoppedResult(): Promise<Record<string, unknown>>;
     /** Live branches that have not been committed/unmounted yet. */
     pendingWorkspaces(): Array<Record<string, unknown>>;
     private runBatch;
@@ -179,8 +198,6 @@ export declare class Runner {
      * never completed is treated as unverified. No state is released twice.
      */
     recycle(candidates: TrajectoryRow[], leader: TrajectoryRow, previous?: TrajectoryRow): Promise<void>;
-    /** Commit and release the state of a leader that lost the selection. */
-    private releaseSuperseded;
     finish(leader: TrajectoryRow, reason?: string, pending?: TrajectoryRow[] | null): Promise<BatchResult>;
     /** Release every mounted workspace at the end of a batch. */
     releaseAll(): Promise<void>;

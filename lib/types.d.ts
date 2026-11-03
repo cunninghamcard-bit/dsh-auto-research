@@ -51,6 +51,10 @@ export interface ResearchOptions {
     forkAndFlush: boolean;
     shareContext: boolean;
     sharingIntervalMinutes: number;
+    /** Registered workspace backend name, or `auto` for priority order. */
+    workspaceBackend: string;
+    /** Registered executor name for the frozen evaluator, or `auto`. */
+    executor: string;
 }
 /** Subset of {@link ResearchOptions} a plan may override. */
 export type PlanOptions = Partial<ResearchOptions> & {
@@ -84,20 +88,8 @@ export interface ResearchPlanInput {
     meaningful_gain?: unknown;
     workspace?: unknown;
     evaluator_interpreter?: unknown;
-    options?: unknown;
-    branches?: unknown;
-    parallelism?: unknown;
-    rounds?: unknown;
-    workerProvider?: unknown;
-    worker_provider?: unknown;
-    workerLlmProvider?: unknown;
-    worker_llm_provider?: unknown;
-    workerModel?: unknown;
-    worker_model?: unknown;
-    workerReasoningEffort?: unknown;
-    worker_reasoning_effort?: unknown;
-    workerAgentOptions?: unknown;
-    worker_agent_options?: unknown;
+    /** Per-batch overrides of the plugin configuration. */
+    options?: PlanOptions;
     [key: string]: unknown;
 }
 /** Validated, normalized plan used by the runner. */
@@ -193,13 +185,14 @@ export interface TrajectoryRow {
     /** Internal live handles; never serialized by `publicRow`. */
     _state?: WorkspaceState | null;
     _ownsState?: boolean;
-    _released?: boolean;
 }
 /** One completed-state checkpoint on disk. */
 export interface CompletedState {
     row: TrajectoryRow;
     files: Record<string, string>;
     modes: Record<string, number>;
+    /** Symlinks by path -> link text; absent in checkpoints from older versions. */
+    links?: Record<string, string>;
 }
 /** Result of one complete batch. */
 export interface BatchResult {
@@ -266,67 +259,83 @@ export interface SubagentStartRequest {
     agentOptions?: WorkerAgentOptions;
     [key: string]: unknown;
 }
-/** `ctx.subagents` service surface. */
+/** `ctx.subagents` (`SubagentRuntime`) surface this bundle uses. */
 export interface SubagentsService {
-    list?: () => string[];
-    registerProvider?: (provider: SubagentProvider) => void;
+    list: () => string[];
+    getProvider: (name: string) => SubagentProvider | undefined;
+    registerProvider: (provider: SubagentProvider) => () => void;
     startActivation: (spec: SubagentActivationSpec) => Promise<SubagentRun>;
-    get?: (name: string) => SubagentProvider | null | undefined;
-    getProvider?: (name: string) => SubagentProvider | null | undefined;
-    providers?: Map<string, SubagentProvider> | Record<string, SubagentProvider>;
-    describe?: (name: string) => {
-        name?: string;
-        inheritsParentContext?: boolean;
-    } | null | undefined;
-    [key: string]: unknown;
 }
-/** `ctx.shellEnv` contributors differ across host versions; stay structural. */
+/** `ctx.shellEnv` (`ShellEnvRegistry`) surface this bundle uses. */
 export interface ShellEnvService {
-    resolve?: (options: {
+    /** Register a contributor; returns the disposer. */
+    register: (contributor: {
+        name: string;
+        variables: Readonly<Record<string, {
+            description: string;
+        }>>;
+        resolve: (execution: unknown) => Record<string, string>;
+    }) => () => void;
+    /** The `DSH_*` environment for one shell execution. */
+    collect: (execution: {
         agent?: unknown;
-    }) => Promise<Record<string, unknown>> | Record<string, unknown>;
-    snapshot?: (options?: {
-        agent?: unknown;
-    }) => Promise<Record<string, unknown>> | Record<string, unknown>;
-    /** `dsh` `ShellEnvRegistry.collect(execution)` (the real contributor API). */
-    collect?: (execution: {
-        agent?: unknown;
-        [key: string]: unknown;
-    }) => Record<string, unknown>;
-    get?: (key: string) => unknown;
-    env?: Record<string, unknown>;
-    contributors?: unknown;
-    sources?: unknown;
-    [key: string]: unknown;
+        callId: string;
+        rootCallId?: string;
+    }) => Readonly<Record<string, string>>;
 }
-/** Cordis context subset consumed by the plugin. */
-export interface PluginContext {
+/** `ctx.skills` (`@deepseek-ai/dsh-skill`) registration surface. */
+export interface SkillsService {
+    registerProvider: (factory: (control: {
+        invalidate: () => void;
+        signal: AbortSignal;
+    }) => {
+        name: string;
+        list: (options: {
+            cwd?: string;
+            signal?: AbortSignal;
+        }) => Promise<unknown>;
+        get: (candidate: never, options: {
+            cwd?: string;
+            signal?: AbortSignal;
+        }) => Promise<unknown>;
+    }) => unknown;
+}
+/**
+ * The host services the provider reads. The core plugin fills the optional
+ * ones from `ctx.inject` sub-fibers while those services exist.
+ */
+export interface ProviderContext {
     subagents: SubagentsService;
-    systemPrompt?: {
-        getSectionOrder?: (name: string) => number | null | undefined;
-        section: (section: {
-            name: string;
-            order: number;
-            interpolate: boolean;
-            text: string;
-        }) => unknown;
-    };
+    skills?: SkillsService;
     shellEnv?: ShellEnvService;
-    /** `dsh` `ctx.workingDirectory` service (per-session assigned checkout). */
+    /** `dsh` `ctx.workingDirectory` (`WorkingDirectoryService.get(session)`). */
     workingDirectory?: {
-        get?: (session: unknown) => unknown;
-        set?: (session: unknown, cwd: string) => unknown;
+        get: (session: never) => string;
+    };
+    /** `dsh` `ctx.llm` catalog, used to resolve a worker model by id or name. */
+    llm?: {
+        listProviders: () => Array<{
+            id: string;
+            name?: string;
+        }>;
+        listModels: (providerId: string) => Promise<Array<{
+            id: string;
+            name?: string;
+        }>>;
     };
     /** `dsh` `ctx.subprocess` service (`@deepseek-ai/dsh-subprocess`). */
     subprocess?: SubprocessServiceLike;
-    /** `dsh-auto-research` capability registry service (`ctx.autoResearch`). */
-    autoResearch?: AutoResearchService;
+    /** Workspace backend registry provided by the core plugin. */
+    researchWorkspace?: ResearchWorkspaceService;
+    /** Executor registry provided by the core plugin. */
+    researchExecutor?: ResearchExecutorService;
     logger?: Logger;
-    get?: (name: string) => unknown;
-    provide?: (name: string) => void;
-    inject?: (deps: string[], callback: (ctx: PluginContext) => void) => unknown;
-    effect?: (callback: () => () => void) => unknown;
-    [key: string]: unknown;
+}
+/** Cordis context subset the plugin entries use. */
+export interface PluginContext extends ProviderContext {
+    provide: (name: string, value: unknown) => unknown;
+    effect: (callback: () => () => void) => unknown;
+    inject: (deps: string[], callback: (ctx: PluginContext) => void) => unknown;
 }
 /** Minimal logger used by the runner and provider. */
 export interface Logger {
@@ -384,8 +393,10 @@ export interface Config {
     forkAndFlush?: boolean;
     shareContext?: boolean;
     sharingIntervalMinutes?: number;
-    /** Explicit workspace backend choice; `auto` is the default resolution. */
-    workspaceBackend?: 'auto' | 'layerfs' | 'snapshot';
+    /** Registered workspace backend name; `auto` (the default) picks by priority. */
+    workspaceBackend?: string;
+    /** Registered executor name; `auto` (the default) picks by priority. */
+    executor?: string;
     layerfs?: LayerFSBinding | false | null;
     workerEnv?: Record<string, unknown>;
     plan?: ResearchPlanInput;
@@ -409,7 +420,8 @@ export interface ResolvedConfig {
     forkAndFlush: boolean;
     shareContext: boolean;
     sharingIntervalMinutes: number;
-    workspaceBackend?: 'auto' | 'layerfs' | 'snapshot';
+    workspaceBackend?: string;
+    executor?: string;
     layerfs?: LayerFSBinding | false | null;
     workerEnv: Record<string, unknown>;
     plan?: ResearchPlanInput;
@@ -525,6 +537,8 @@ export interface RunnerDeps {
     subagents: SubagentsService;
     workspaceManager: WorkspaceManagerLike;
     evaluator?: EvaluatorLike;
+    /** Executor for the evaluator the runner builds when `evaluator` is absent. */
+    executor?: ExecutorBackend;
     initialState?: WorkspaceState;
     parent?: unknown;
     /** Runtime session id of the coordinator, used to match worker shell calls. */
@@ -555,9 +569,22 @@ export interface WorkspaceManagerLike {
     }) => Promise<void>;
     retainCompletedState: (row: TrajectoryRow) => Promise<string>;
     restoreCompletedState: (checkpoint: string, failedRow: TrajectoryRow) => Promise<TrajectoryRow>;
-    /** Fold changes made inside a live Sandbox mount back into the host copy. */
-    reconcile?: (state: WorkspaceState) => Promise<void>;
+    /** Settle a live Sandbox mount against its host copy before evaluation. */
+    reconcile: (state: WorkspaceState) => Promise<Reconciliation>;
+    /** Bytes `count` forks of `parent` will add to the run's filesystem. */
+    estimateForkBytes: (parent: WorkspaceState, count: number) => Promise<number>;
     close?: () => Promise<void>;
+}
+/**
+ * How a branch's two writable views compared after its worker returned:
+ * `unchanged`, `folded` (Sandbox only, folded into the host copy), `host`
+ * (host copy only), or `conflict` (both; `conflicts` lists the paths both
+ * changed).
+ */
+export type ReconcileOutcome = 'unchanged' | 'host' | 'folded' | 'conflict';
+export interface Reconciliation {
+    outcome: ReconcileOutcome;
+    conflicts: string[];
 }
 /** Structural contract for `dsh`'s `ctx.subprocess` (`@deepseek-ai/dsh-subprocess`). */
 export interface SubprocessServiceLike {
@@ -610,7 +637,7 @@ export interface WorkspaceBackend {
         sync?: boolean;
     }) => Promise<WorkspaceState>;
     fork: (parent: WorkspaceState, id: string) => Promise<WorkspaceState>;
-    reconcile?: (state: WorkspaceState) => Promise<void>;
+    reconcile?: (state: WorkspaceState) => Promise<Reconciliation>;
     commit: (state: WorkspaceState, options?: {
         message?: string;
     }) => Promise<void>;
@@ -620,6 +647,8 @@ export interface WorkspaceBackend {
     }) => Promise<void>;
     retainCompletedState: (row: TrajectoryRow) => Promise<string>;
     restoreCompletedState: (checkpoint: string, failedRow: TrajectoryRow) => Promise<TrajectoryRow>;
+    /** Bytes `count` forks of `parent` will add to the run's filesystem. */
+    estimateForkBytes: (parent: WorkspaceState, count: number) => Promise<number>;
     close?: () => Promise<void>;
 }
 /** Options passed to a {@link WorkspaceBackendFactory} when creating a backend for a batch. */
@@ -633,14 +662,62 @@ export interface WorkspaceBackendCreateOptions {
 /** Pluggable factory that constructs a {@link WorkspaceBackend} when applicable. */
 export interface WorkspaceBackendFactory {
     readonly name: string;
+    /** Higher priorities are tried first when `workspaceBackend` is `auto`. */
+    readonly priority: number;
+    /** Return null when this backend does not apply to the batch. */
     create: (options: WorkspaceBackendCreateOptions) => Promise<WorkspaceBackend | null>;
 }
-/**
- * Service Definition for `ctx.autoResearch`: registry of workspace-backend plugins.
- */
-export interface AutoResearchService {
-    registerWorkspaceBackend: (factory: WorkspaceBackendFactory) => () => void;
-    getWorkspaceBackend: (name: string) => WorkspaceBackendFactory | undefined;
-    listWorkspaceBackends: () => WorkspaceBackendFactory[];
+/** One run of the frozen evaluator, as `FrozenEvaluator` prepared it. */
+export interface FrozenEvaluationRequest {
+    /** The frozen evaluator copy and its SHA-256. */
+    script: string;
+    sha256: string;
+    /** The candidate workspace. */
+    workspace: string;
+    /** Local command line: interpreter, script, workspace. */
+    argv: string[];
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    timeoutMs: number;
+    signal?: AbortSignal;
+    /** Where the run's stdout and stderr are kept. */
+    stdoutPath: string;
+    stderrPath: string;
+}
+/** What one evaluator run returned; `FrozenEvaluator` verifies and parses it. */
+export interface EvaluatorProcessResult {
+    code: number | null;
+    timedOut: boolean;
+    aborted: boolean;
+    stdout: string;
+    stderr: string;
+    error?: Error;
+}
+/** Where the frozen evaluator runs. */
+export interface ExecutorBackend {
+    readonly name: string;
+    evaluate: (request: FrozenEvaluationRequest) => Promise<EvaluatorProcessResult>;
+}
+export interface ExecutorBackendCreateOptions {
+    config: Config;
+    plan: ResearchPlanInput;
+}
+/** Pluggable factory that constructs an {@link ExecutorBackend} when applicable. */
+export interface ExecutorBackendFactory {
+    readonly name: string;
+    /** Higher priorities are tried first when `executor` is `auto`. */
+    readonly priority: number;
+    /** Return null when this executor does not apply to the batch. */
+    create: (options: ExecutorBackendCreateOptions) => Promise<ExecutorBackend | null>;
+}
+/** `ctx.researchExecutor`: where executor plugins register. */
+export interface ResearchExecutorService {
+    register: (factory: ExecutorBackendFactory) => () => void;
+    list: () => ExecutorBackendFactory[];
+}
+/** `ctx.researchWorkspace`: where workspace backend plugins register. */
+export interface ResearchWorkspaceService {
+    register: (factory: WorkspaceBackendFactory) => () => void;
+    list: () => WorkspaceBackendFactory[];
 }
 //# sourceMappingURL=types.d.ts.map
